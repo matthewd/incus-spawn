@@ -112,6 +112,10 @@ public final class Environment {
         return home().resolve(".cache/incus-spawn/npm");
     }
 
+    public static Path rubyGemsCacheDir() {
+        return home().resolve(".cache/incus-spawn/rubygems");
+    }
+
     public static Path lockDir() {
         return RuntimeConstants.WORKER_POOL.instanceLockDir(
                 stateDir(), home().resolve(".cache/incus-spawn/locks"));

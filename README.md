@@ -814,13 +814,15 @@ actions:
 
 ## Caching
 
-The proxy and build system cache artifacts on the host, shared across all templates and branches. Only immutable, content-addressed artifacts are cached — mutable data (Maven SNAPSHOTs, repository metadata, version listings) always passes through uncached. Every artifact is verified against its content digest or upstream checksum before being committed to the cache; mismatches are discarded and re-fetched.
+The proxy and build system cache artifacts on the host, shared across all templates and branches. Only immutable or version-pinned payload paths are cached; mutable data such as Maven SNAPSHOTs, repository metadata, and version listings passes through uncached. When an upstream content digest is available, the payload is verified before the cache publishes it.
 
 Proxy caches (from container traffic):
 
 - **Container image layers** — OCI blobs from Docker Hub, GHCR, and Quay, keyed by SHA256 content digest
 - **Maven and Gradle artifacts** — release JARs, POMs, and plugins from Maven Central and the Gradle plugin portal
 - **Gradle distributions** — verified against the upstream `.sha256` sidecar
+- **npm tarballs** — verified against the version shasum advertised by the npm registry
+- **RubyGems payloads** — content-addressed and verified against SHA256 checksums observed in complete Compact Index info responses; Compact Index metadata, ranges, and conditional requests remain uncached
 
 Build-time caches:
 

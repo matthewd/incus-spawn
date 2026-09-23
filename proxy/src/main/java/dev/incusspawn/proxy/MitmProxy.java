@@ -48,6 +48,9 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
@@ -70,12 +73,16 @@ public class MitmProxy {
 
     private static final int BUFFER_SIZE = 64 * 1024;
     static final long BB_GATEWAY_MAX_BODY_BYTES = 16L * 1024 * 1024;
+    private static final int MAX_CONCURRENT_RUBYGEMS_FILLS = 8;
+    private static final int MAX_CONCURRENT_RUBYGEMS_INFO_CAPTURES = 8;
+    private static final long RUBYGEMS_FILL_TIMEOUT_MS = 5 * 60 * 1000L;
 
     private static final Set<String> ANTHROPIC_DOMAINS = ProxyConfig.ANTHROPIC_DOMAINS;
     private static final Set<String> REGISTRY_DOMAINS = ProxyConfig.REGISTRY_DOMAINS;
     private static final Set<String> MAVEN_DOMAINS = ProxyConfig.MAVEN_DOMAINS;
     private static final Set<String> GRADLE_DOMAINS = ProxyConfig.GRADLE_DOMAINS;
     private static final Set<String> NPM_DOMAINS = ProxyConfig.NPM_DOMAINS;
+    private static final Set<String> RUBYGEMS_DOMAINS = ProxyConfig.RUBYGEMS_DOMAINS;
 
     // OCI blob URL pattern: /v2/<name>/blobs/sha256:<64-hex-chars>
     // Group 1 = image name (e.g. "library/postgres"), group 2 = digest
@@ -111,6 +118,10 @@ public class MitmProxy {
 
     private static Path npmCacheDir() {
         return Environment.npmCacheDir();
+    }
+
+    private static Path rubyGemsCacheDir() {
+        return Environment.rubyGemsCacheDir();
     }
 
     private static Path m2Repository() {
@@ -160,6 +171,11 @@ public class MitmProxy {
     private final CommandCredentialConfig commandCredentials;
     private final Map<String, CommandCredentialBroker> commandCredentialBrokers =
             new ConcurrentHashMap<>();
+    private final RubyGemsCache rubyGemsCache = new RubyGemsCache();
+    private final Map<String, Future<RubyGemsCache.CacheEntry>> rubyGemFills =
+            new ConcurrentHashMap<>();
+    private final AtomicInteger activeRubyGemFills = new AtomicInteger();
+    private final AtomicInteger activeRubyGemsInfoCaptures = new AtomicInteger();
     private HttpServer mitmServer;
     private HttpServer healthHttpServer;
     private HttpClient upstreamClient;
@@ -222,6 +238,8 @@ public class MitmProxy {
     boolean upstreamWsSsl = true;
     int upstreamApiPort = 443;
     boolean upstreamApiSsl = true;
+    int upstreamRubyGemsPort = 443;
+    boolean upstreamRubyGemsSsl = true;
     boolean upstreamTrustAll = false;
 
     static RelayTarget httpRelayTarget(String domain) {
@@ -752,6 +770,8 @@ public class MitmProxy {
                 " (domains: " + GRADLE_DOMAINS + ")");
         System.out.println("npm cache: " + npmCacheDir() +
                 " (domains: " + NPM_DOMAINS + ")");
+        System.out.println("RubyGems cache: " + rubyGemsCacheDir() +
+                " (domains: " + RUBYGEMS_DOMAINS + ")");
         if (credentials.useVertex()) {
             System.out.println("Vertex AI mode: translating api.anthropic.com requests" +
                     " to " + vertexHost() +
@@ -870,6 +890,8 @@ public class MitmProxy {
                 handleGradleRequest(clientReq, domain);
             } else if (NPM_DOMAINS.contains(domain)) {
                 handleNpmRequest(clientReq, domain);
+            } else if (RUBYGEMS_DOMAINS.contains(domain)) {
+                handleRubyGemsRequest(clientReq, domain);
             } else if (isInterceptedDomain(domain)) {
                 handleApiRequest(clientReq, domain);
             } else {
@@ -2068,6 +2090,473 @@ public class MitmProxy {
             }
         } catch (Exception e) { /* JSON parse error */ }
         return null;
+    }
+
+    // --- RubyGems payload caching ---
+
+    private static final class RubyGemCacheBypassException extends RuntimeException {
+        RubyGemCacheBypassException(String message) { super(message); }
+    }
+
+    private static final class RubyGemIntegrityException extends RuntimeException {
+        RubyGemIntegrityException(String message) { super(message); }
+    }
+
+    /**
+     * Observe complete Compact Index info responses to learn upstream SHA-256 values,
+     * cache only unconditional public gem downloads, and relay every other request
+     * without changing its Range or conditional semantics.
+     */
+    private void handleRubyGemsRequest(HttpServerRequest clientReq, String domain) {
+        var path = clientReq.path();
+        var infoGem = clientReq.method() == HttpMethod.GET
+                && clientReq.query() == null
+                ? RubyGemsCache.infoGemName(path) : null;
+        if (infoGem != null) {
+            relayRubyGemsRequest(clientReq, domain,
+                    rubyGemsCache.beginObservation(domain, infoGem));
+            return;
+        }
+
+        var filename = RubyGemsCache.gemFilename(path);
+        if (!"rubygems.org".equals(domain) || filename == null
+                || !RubyGemsCache.isCacheEligible(
+                        clientReq.method(), path, clientReq.query(), clientReq.headers())) {
+            relayRubyGemsRequest(clientReq, domain, null);
+            return;
+        }
+
+        var digest = rubyGemsCache.digestFor(filename);
+        if (digest == null) {
+            relayRubyGemsRequest(clientReq, domain, null);
+            return;
+        }
+
+        getOrDownloadRubyGem(domain, clientReq.uri(), digest)
+                .onSuccess(entry -> {
+                    if (!rubyGemsCache.isAuthorized(filename, digest)) {
+                        relayRubyGemsRequest(clientReq, domain, null);
+                        return;
+                    }
+                    System.out.println("RubyGems cache served: " + filename
+                            + " (" + formatSize(entry.size()) + ")");
+                    serveRubyGem(clientReq.response(), entry);
+                })
+                .onFailure(error -> {
+                    if (error instanceof RubyGemIntegrityException) {
+                        ProxyLog.warn("RubyGems integrity check failed for " + filename);
+                        sendError(clientReq.response(), 502, "RubyGems integrity check failed");
+                    } else {
+                        relayRubyGemsRequest(clientReq, domain, null);
+                    }
+                });
+    }
+
+    /**
+     * RubyGems-specific transparent relay. The test-only upstream port overrides are
+     * intentionally confined here; production always uses HTTPS port 443.
+     */
+    private void relayRubyGemsRequest(
+            HttpServerRequest clientReq, String domain,
+            RubyGemsCache.Observation infoObservation) {
+        var options = new RequestOptions()
+                .setMethod(clientReq.method())
+                .setHost(domain)
+                .setPort(upstreamRubyGemsPort)
+                .setSsl(upstreamRubyGemsSsl)
+                .setURI(clientReq.uri());
+        var wantsCapture = infoObservation != null
+                && RubyGemsCache.acceptsIdentityEncoding(
+                        clientReq.headers().getAll("Accept-Encoding"));
+        var captureInfo = wantsCapture
+                && activeRubyGemsInfoCaptures.incrementAndGet()
+                        <= MAX_CONCURRENT_RUBYGEMS_INFO_CAPTURES;
+        if (wantsCapture && !captureInfo) activeRubyGemsInfoCaptures.decrementAndGet();
+
+        requestWithAsyncDns(options).onSuccess(upReq -> {
+            copyRequestHeaders(clientReq, upReq, domain);
+            if (captureInfo) upReq.headers().remove("Accept-Encoding");
+
+            sendWithBody(clientReq, upReq).onSuccess(upResp -> {
+                var clientResp = clientReq.response();
+                clientResp.setStatusCode(upResp.statusCode());
+                clientResp.setStatusMessage(upResp.statusMessage());
+                copyResponseHeaders(upResp, clientResp);
+
+                if (captureInfo && rubyGemsInfoResponseIsComplete(upResp)) {
+                    pipeRubyGemsInfoResponse(upResp, clientResp, infoObservation);
+                } else {
+                    if (captureInfo) activeRubyGemsInfoCaptures.decrementAndGet();
+                    if (infoObservation != null) {
+                        rubyGemsCache.observeNonFullResponse(
+                                infoObservation, upResp.statusCode(), upResp.getHeader("ETag"));
+                    }
+                    pipeResponse(upResp, clientResp);
+                }
+            }).onFailure(err -> {
+                if (captureInfo) activeRubyGemsInfoCaptures.decrementAndGet();
+                if (infoObservation != null) rubyGemsCache.invalidate(infoObservation);
+                System.err.println("RubyGems relay upstream error (" + domain + "): "
+                        + err.getMessage());
+                sendError(clientReq.response(), 502, "Upstream error");
+            });
+        }).onFailure(err -> {
+            if (captureInfo) activeRubyGemsInfoCaptures.decrementAndGet();
+            if (infoObservation != null) rubyGemsCache.invalidate(infoObservation);
+            System.err.println("RubyGems relay connect error (" + domain + "): "
+                    + err.getMessage());
+            sendError(clientReq.response(), 502, "Upstream connection failed");
+        });
+    }
+
+    private static boolean rubyGemsInfoResponseIsComplete(HttpClientResponse response) {
+        if (response.statusCode() != 200 || response.getHeader("Content-Range") != null) {
+            return false;
+        }
+        var encoding = response.getHeader("Content-Encoding");
+        if (encoding != null && !encoding.isBlank()
+                && !"identity".equalsIgnoreCase(encoding.strip())) {
+            return false;
+        }
+        var length = responseContentLength(response.headers());
+        return length != -2 && (length < 0 || length <= RubyGemsCache.MAX_INFO_BYTES);
+    }
+
+    /** Relay a full info response while retaining a bounded copy for checksum parsing. */
+    private void pipeRubyGemsInfoResponse(
+            HttpClientResponse upResp, HttpServerResponse clientResp,
+            RubyGemsCache.Observation observation) {
+        upResp.pause();
+        if (upResp.getHeader("Content-Length") == null) clientResp.setChunked(true);
+        var expectedLength = responseContentLength(upResp.headers());
+
+        class InfoRelay {
+            private Buffer captured = Buffer.buffer();
+            private long capturedBytes;
+            private boolean done;
+
+            void handleChunk(Buffer chunk) {
+                if (done) return;
+                capturedBytes += chunk.length();
+                if (captured != null) {
+                    if (capturedBytes <= RubyGemsCache.MAX_INFO_BYTES) {
+                        captured.appendBuffer(chunk);
+                    } else {
+                        captured = null;
+                        rubyGemsCache.invalidate(observation);
+                    }
+                }
+
+                upResp.pause();
+                clientResp.write(chunk)
+                        .onSuccess(ignored -> {
+                            if (!done) upResp.resume();
+                        })
+                        .onFailure(this::fail);
+            }
+
+            void handleEnd() {
+                if (done) return;
+                done = true;
+                if (captured == null
+                        || (expectedLength >= 0 && capturedBytes != expectedLength)) {
+                    activeRubyGemsInfoCaptures.decrementAndGet();
+                    rubyGemsCache.invalidate(observation);
+                    clientResp.end();
+                    return;
+                }
+                var body = captured.getBytes();
+                vertx.<Boolean>executeBlocking(() -> rubyGemsCache.publish(
+                        observation, upResp.getHeader("ETag"), body), false)
+                        .onComplete(result -> {
+                            activeRubyGemsInfoCaptures.decrementAndGet();
+                            if (result.failed() || !Boolean.TRUE.equals(result.result())) {
+                                ProxyLog.warn("Ignored malformed or superseded RubyGems Compact Index info for "
+                                        + observation.key().gemName());
+                            }
+                            clientResp.end();
+                        });
+            }
+
+            void fail(Throwable error) {
+                if (done) return;
+                done = true;
+                activeRubyGemsInfoCaptures.decrementAndGet();
+                rubyGemsCache.invalidate(observation);
+                upResp.request().reset();
+                ProxyLog.warn("RubyGems info relay stream error: " + error.getMessage());
+                sendError(clientResp, 502, "Upstream stream error");
+            }
+        }
+
+        var relay = new InfoRelay();
+        upResp.handler(relay::handleChunk);
+        upResp.endHandler(ignored -> relay.handleEnd());
+        upResp.exceptionHandler(relay::fail);
+        clientResp.exceptionHandler(relay::fail);
+        upResp.resume();
+    }
+
+    private Future<RubyGemsCache.CacheEntry> getOrDownloadRubyGem(
+            String domain, String uri, String digest) {
+        while (true) {
+            var existing = rubyGemFills.get(digest);
+            if (existing != null) return existing;
+
+            var promise = Promise.<RubyGemsCache.CacheEntry>promise();
+            var future = promise.future();
+            existing = rubyGemFills.putIfAbsent(digest, future);
+            if (existing != null) continue;
+
+            if (activeRubyGemFills.incrementAndGet() > MAX_CONCURRENT_RUBYGEMS_FILLS) {
+                activeRubyGemFills.decrementAndGet();
+                rubyGemFills.remove(digest, future);
+                promise.fail(new RubyGemCacheBypassException(
+                        "RubyGems cache fill capacity reached"));
+                return future;
+            }
+
+            vertx.<RubyGemsCache.CacheEntry>executeBlocking(
+                            () -> rubyGemsCache.verifyExisting(rubyGemsCacheDir(), digest), false)
+                    .compose(entry -> entry != null
+                            ? Future.succeededFuture(entry)
+                            : downloadRubyGem(domain, uri, digest))
+                    .andThen(ignored -> activeRubyGemFills.decrementAndGet())
+                    .onComplete(result -> {
+                        rubyGemFills.remove(digest, future);
+                        if (result.succeeded()) promise.complete(result.result());
+                        else promise.fail(result.cause());
+                    });
+            return future;
+        }
+    }
+
+    private Future<RubyGemsCache.CacheEntry> downloadRubyGem(
+            String domain, String uri, String digest) {
+        var promise = Promise.<RubyGemsCache.CacheEntry>promise();
+        new RubyGemDownload(domain, uri, digest, promise).start();
+        return promise.future();
+    }
+
+    private final class RubyGemDownload {
+        private final String domain;
+        private final String uri;
+        private final String digest;
+        private final Promise<RubyGemsCache.CacheEntry> promise;
+        private final AtomicBoolean finishing = new AtomicBoolean();
+        private final AtomicBoolean settled = new AtomicBoolean();
+        private final AtomicLong received = new AtomicLong();
+        private Path tempFile;
+        private Path objectFile;
+        private io.vertx.core.file.AsyncFile output;
+        private HttpClientRequest request;
+        private HttpClientResponse response;
+        private long expectedLength = -1;
+        private long timeoutTimer = -1;
+
+        RubyGemDownload(String domain, String uri, String digest,
+                        Promise<RubyGemsCache.CacheEntry> promise) {
+            this.domain = domain;
+            this.uri = uri;
+            this.digest = digest;
+            this.promise = promise;
+        }
+
+        void start() {
+            timeoutTimer = vertx.setTimer(RUBYGEMS_FILL_TIMEOUT_MS,
+                    ignored -> fail(new RubyGemCacheBypassException(
+                            "RubyGems cache fill timed out")));
+            vertx.<Path>executeBlocking(() -> {
+                objectFile = RubyGemsCache.objectPath(rubyGemsCacheDir(), digest);
+                var tempDir = rubyGemsCacheDir().resolve("tmp");
+                Files.createDirectories(objectFile.getParent());
+                Files.createDirectories(tempDir);
+                return Files.createTempFile(tempDir, "gem-", ".part");
+            }, false).onSuccess(path -> {
+                tempFile = path;
+                if (settled.get()) {
+                    RubyGemsCache.deleteQuietly(path);
+                } else {
+                    openUpstream();
+                }
+            }).onFailure(this::fail);
+        }
+
+        private void openUpstream() {
+            var options = new RequestOptions()
+                    .setMethod(HttpMethod.GET)
+                    .setHost(domain)
+                    .setPort(upstreamRubyGemsPort)
+                    .setSsl(upstreamRubyGemsSsl)
+                    .setURI(uri);
+            requestWithAsyncDns(options).onSuccess(upstreamRequest -> {
+                request = upstreamRequest;
+                if (settled.get()) {
+                    upstreamRequest.reset();
+                    return;
+                }
+                upstreamRequest.putHeader("Host", domain);
+                upstreamRequest.putHeader("Connection", "close");
+                upstreamRequest.putHeader("Accept", "application/octet-stream");
+                upstreamRequest.putHeader("Accept-Encoding", "identity");
+                upstreamRequest.send().onSuccess(this::receiveResponse).onFailure(this::fail);
+            }).onFailure(this::fail);
+        }
+
+        private void receiveResponse(HttpClientResponse upstream) {
+            response = upstream;
+            if (settled.get()) {
+                upstream.request().reset();
+                return;
+            }
+            if (upstream.statusCode() != 200 || upstream.getHeader("Content-Range") != null) {
+                bypass("RubyGems payload response is not a complete 200");
+                return;
+            }
+            var encoding = upstream.getHeader("Content-Encoding");
+            if (encoding != null && !encoding.isBlank()
+                    && !"identity".equalsIgnoreCase(encoding.strip())) {
+                bypass("RubyGems payload response is encoded");
+                return;
+            }
+            expectedLength = responseContentLength(upstream.headers());
+            if (expectedLength == -2 || expectedLength > RubyGemsCache.MAX_GEM_BYTES) {
+                bypass("RubyGems payload has an invalid or excessive Content-Length");
+                return;
+            }
+
+            upstream.pause();
+            vertx.fileSystem().open(tempFile.toString(),
+                    new io.vertx.core.file.OpenOptions().setCreate(true).setWrite(true)
+            ).onSuccess(file -> {
+                output = file;
+                if (settled.get()) {
+                    file.close().onComplete(ignored -> RubyGemsCache.deleteQuietly(tempFile));
+                    return;
+                }
+                streamBody();
+                upstream.resume();
+            }).onFailure(this::fail);
+        }
+
+        private void streamBody() {
+            response.handler(chunk -> {
+                if (settled.get() || finishing.get()) return;
+                var total = received.addAndGet(chunk.length());
+                if (total > RubyGemsCache.MAX_GEM_BYTES) {
+                    bypass("RubyGems payload exceeded the cache size limit");
+                    return;
+                }
+
+                // Admit one chunk at a time. Awaiting each AsyncFile write gives
+                // finish() an exact persisted-byte boundary before close/hash/move.
+                response.pause();
+                output.write(chunk)
+                        .onSuccess(ignored -> {
+                            if (!settled.get() && !finishing.get()) response.resume();
+                        })
+                        .onFailure(this::fail);
+            });
+            response.endHandler(ignored -> finish());
+            response.exceptionHandler(this::fail);
+        }
+
+        private void finish() {
+            if (!finishing.compareAndSet(false, true) || settled.get()) return;
+            output.close().compose(ignored -> vertx.<RubyGemsCache.CacheEntry>executeBlocking(() -> {
+                var actualSize = Files.size(tempFile);
+                if (actualSize != received.get()
+                        || (expectedLength >= 0 && actualSize != expectedLength)) {
+                    throw new RubyGemCacheBypassException(
+                            "RubyGems payload length changed during download");
+                }
+                if (!RubyGemsCache.verifySha256(tempFile, digest)) {
+                    throw new RubyGemIntegrityException("RubyGems SHA-256 mismatch");
+                }
+                Files.move(tempFile, objectFile,
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+                rubyGemsCache.markVerified(digest);
+                return new RubyGemsCache.CacheEntry(objectFile, actualSize);
+            }, false)).onComplete(result -> {
+                cancelTimeout();
+                if (result.succeeded()) {
+                    System.out.println("Cached RubyGem: sha256:"
+                            + digest.substring(0, 12) + "... ("
+                            + formatSize(result.result().size()) + ")");
+                    if (settled.compareAndSet(false, true)) {
+                        promise.complete(result.result());
+                    }
+                } else {
+                    RubyGemsCache.deleteQuietly(tempFile);
+                    if (settled.compareAndSet(false, true)) {
+                        promise.fail(result.cause());
+                    }
+                }
+            });
+        }
+
+        private void bypass(String message) {
+            fail(new RubyGemCacheBypassException(message));
+        }
+
+        private void fail(Throwable error) {
+            if (!settled.compareAndSet(false, true)) return;
+            cancelTimeout();
+            promise.fail(error);
+
+            if (finishing.get()) return;
+            if (request != null) request.reset();
+            var close = output != null ? output.close() : Future.<Void>succeededFuture();
+            close.onComplete(ignored -> vertx.executeBlocking(() -> {
+                RubyGemsCache.deleteQuietly(tempFile);
+                return null;
+            }, false));
+        }
+
+        private void cancelTimeout() {
+            if (timeoutTimer >= 0) {
+                vertx.cancelTimer(timeoutTimer);
+                timeoutTimer = -1;
+            }
+        }
+    }
+
+    private static long responseContentLength(io.vertx.core.MultiMap headers) {
+        var values = headers.getAll("Content-Length");
+        if (values.isEmpty()) return -1;
+        Long length = null;
+        for (var value : values) {
+            for (var item : value.split(",", -1)) {
+                var normalized = item.strip();
+                if (normalized.isEmpty()
+                        || !normalized.chars().allMatch(c -> c >= '0' && c <= '9')) {
+                    return -2;
+                }
+                final long parsed;
+                try {
+                    parsed = Long.parseLong(normalized);
+                } catch (NumberFormatException error) {
+                    return -2;
+                }
+                if (length != null && length != parsed) return -2;
+                length = parsed;
+            }
+        }
+        return length != null ? length : -2;
+    }
+
+    private void serveRubyGem(HttpServerResponse response,
+                              RubyGemsCache.CacheEntry entry) {
+        response.setStatusCode(200);
+        response.putHeader("Content-Type", "application/octet-stream");
+        response.putHeader("Content-Length", String.valueOf(entry.size()));
+        response.sendFile(entry.path().toString()).onFailure(error -> {
+            System.err.println("Failed to serve cached RubyGem: " + error.getMessage());
+            if (!response.ended() && !response.closed()) {
+                sendError(response, 500, "Cache read error");
+            }
+        });
     }
 
     // --- Maven/Gradle artifact caching ---
