@@ -289,9 +289,15 @@ class UnixSocketTransport implements IncusTransport {
 
         int contentLength = -1;
         boolean chunked = false;
+        var headers = new java.util.LinkedHashMap<String, String>();
         String line;
         while (!(line = readLine(in)).isEmpty()) {
-            var lower = line.toLowerCase();
+            var separator = line.indexOf(':');
+            if (separator > 0) {
+                headers.put(line.substring(0, separator).toLowerCase(java.util.Locale.ROOT),
+                        line.substring(separator + 1).strip());
+            }
+            var lower = line.toLowerCase(java.util.Locale.ROOT);
             if (lower.startsWith("content-length:")) {
                 contentLength = Integer.parseInt(lower.substring(15).trim());
             } else if (lower.startsWith("transfer-encoding:") && lower.contains("chunked")) {
@@ -308,7 +314,7 @@ class UnixSocketTransport implements IncusTransport {
             bodyBytes = in.readAllBytes();
         }
 
-        return new RawResponse(statusCode, bodyBytes);
+        return new RawResponse(statusCode, bodyBytes, headers);
     }
 
     /** Send HTTP Upgrade request and consume the 101 response headers. */

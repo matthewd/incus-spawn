@@ -454,6 +454,20 @@ public final class InstanceLifecycle {
         BuildOutput.stepDone();
     }
 
+    public static String awaitToolReadinessQuietly(
+            IncusClient incus, String name, String buildSourceJson) {
+        var buildSource = BuildSource.fromJson(buildSourceJson);
+        if (buildSource == null) return null;
+
+        for (var tool : buildSource.getTools().values()) {
+            if (tool.getReady() == null || tool.getReady().isBlank()) continue;
+            if (!incus.pollUntilReady(name, 30, "sh", "-c", tool.getReady())) {
+                return tool.getName();
+            }
+        }
+        return null;
+    }
+
     public static void awaitToolReadiness(IncusClient incus, String name, String buildSourceJson) {
         var buildSource = BuildSource.fromJson(buildSourceJson);
         if (buildSource == null) return;
@@ -508,17 +522,26 @@ public final class InstanceLifecycle {
      * @param hasSshKeys pre-fetched from stopped container config; null to check live
      */
     public static void injectSshKeyIfAvailable(IncusClient incus, String name, Boolean hasSshKeys) {
+        injectSshKeyIfAvailable(incus, name, hasSshKeys, true);
+    }
+
+    private static void injectSshKeyIfAvailable(
+            IncusClient incus, String name, Boolean hasSshKeys, boolean report) {
         if (hasSshKeys != null) {
             if (!hasSshKeys) return;
         } else {
-            var check = incus.shellExec(name, "test", "-f", "/home/agentuser/.ssh/authorized_keys");
+            var check = incus.shellExec(name, "test", "-f", "/home/agentuser/.ssh/authorized_keys2");
             if (!check.success()) return;
         }
 
         // Ensure managed key infrastructure exists (creates lazily for pre-existing installs)
         try {
             if (!SshKeyManager.exists()) {
-                SshKeyManager.ensureKeyPairExists();
+                if (report) {
+                    SshKeyManager.ensureKeyPairExists();
+                } else {
+                    SshKeyManager.ensureKeyPairExistsQuietly();
+                }
             }
         } catch (Exception ignored) {}
 
@@ -546,7 +569,7 @@ public final class InstanceLifecycle {
         }
 
         if (keys.isEmpty()) {
-            BuildOutput.step("SSH is available but no public key found.");
+            if (report) BuildOutput.step("SSH is available but no public key found.");
             return;
         }
 
@@ -556,7 +579,7 @@ public final class InstanceLifecycle {
                 Files.writeString(tmpKey, String.join("\n", keys) + "\n");
                 // Push with agentuser ownership (uid=1000) and mode 0600 directly,
                 // avoiding a separate chown+chmod exec round trip
-                incus.filePush(tmpKey.toString(), name, "/home/agentuser/.ssh/authorized_keys",
+                incus.filePush(tmpKey.toString(), name, "/home/agentuser/.ssh/authorized_keys2",
                         "1000", "1000", "0600");
             } finally {
                 Files.deleteIfExists(tmpKey);
@@ -564,6 +587,20 @@ public final class InstanceLifecycle {
         } catch (IOException e) {
             System.err.println(BuildOutput.STEP_INDENT + "Warning: failed to inject SSH key: " + e.getMessage());
             return;
+        }
+    }
+
+    /** Configure automation-owned SSH without emitting human output on protocol stdout. */
+    public static void prepareAutomationSsh(
+            IncusClient incus, String name, String automationKey) {
+        if (!hasSshCapability(incus, name)) return;
+        injectSshKeyIfAvailable(incus, name, null, false);
+        try {
+            SshKeyManager.ensureSshConfigInclude();
+            SshKeyManager.addOwnedHostEntry(name, automationKey);
+        } catch (RuntimeException e) {
+            System.err.println(BuildOutput.STEP_INDENT
+                    + "Warning: failed to configure automation SSH: " + e.getMessage());
         }
     }
 

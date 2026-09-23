@@ -183,17 +183,16 @@ class TemplateValidatorTest {
     }
 
     @Test
-    void unknownFieldsIgnored(@TempDir Path dir) throws Exception {
+    void unknownFieldsAreRejected(@TempDir Path dir) throws Exception {
         var file = dir.resolve("test.yaml");
         Files.writeString(file, """
                 name: tpl-test
                 parent: tpl-dev
                 some_future_field: value
-                another_unknown: true
                 """);
         var result = TemplateValidator.validate(file, knownTemplates());
-        assertFalse(result.hasErrors());
-        assertFalse(result.hasWarnings());
+        assertTrue(result.hasErrors());
+        assertTrue(result.errors().stream().anyMatch(e -> e.contains("some_future_field")));
     }
 
     @Test

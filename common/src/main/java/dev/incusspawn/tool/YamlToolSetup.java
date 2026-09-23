@@ -197,7 +197,8 @@ public class YamlToolSetup implements ToolSetup {
 
     private void copyFileViaMount(Path cached, String destination, Container container) throws IOException {
         var absoluteCached = cached.toAbsolutePath();
-        var stagingDir = Files.createTempDirectory(absoluteCached.getParent(), "isx-mount-");
+        var stagingDir = HostResourceSetup.createVmStagingDirectory(
+                absoluteCached.getParent(), "isx-mount-");
         var staged = stagingDir.resolve(absoluteCached.getFileName());
         var deviceName = "dl-file-" + def.getName();
         var mountPath = "/mnt/isx-download-file";
@@ -248,7 +249,7 @@ public class YamlToolSetup implements ToolSetup {
 
     private void extractOnHostAndMountCopy(ToolDef.DownloadEntry dl, Path cached, Container container)
             throws IOException {
-        var extractDir = Files.createTempDirectory("isx-extract-");
+        var extractDir = HostResourceSetup.createVmStagingDirectory(null, "isx-extract-");
         var deviceName = "dl-" + def.getName();
         var mountPath = "/mnt/isx-download";
         try {
@@ -258,7 +259,8 @@ public class YamlToolSetup implements ToolSetup {
             // Remove stale mount point from a previous tool's download so
             // waitForPath detects the new virtio-fs mount, not the leftover dir
             container.exec("rm", "-rf", mountPath);
-            container.addDiskDevice(deviceName, extractDir.toString(), mountPath, true);
+            container.addDiskDevice(deviceName,
+                    HostResourceSetup.translateForVm(extractDir.toString()), mountPath, true);
             container.waitForPath(mountPath);
             container.exec("mkdir", "-p", dl.getExtract());
             container.runQuiet("Failed to copy download for " + def.getName(),

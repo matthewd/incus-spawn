@@ -49,6 +49,106 @@ class BuildCommandTest {
     }
 
     @Test
+    void hardenedPolicyClearsEveryContainerPrivilege() {
+        var incus = mock(IncusClient.class);
+        var cmd = new BuildCommand();
+        cmd.incus = incus;
+
+        cmd.applyContainerSecurityPolicy("test", new ImageDef.Security(false, false, false), false);
+
+        verify(incus).configUnset("test", "security.privileged");
+        verify(incus).configUnset("test", "security.nesting");
+        verify(incus).configUnset("test", "security.syscalls.intercept.setxattr");
+        verify(incus).configUnset("test", "raw.lxc");
+        verify(incus).configUnset("test", "raw.idmap");
+        verify(incus).configUnset("test", "security.idmap.base");
+        verify(incus).configUnset("test", "security.idmap.isolated");
+        verify(incus).configUnset("test", "security.idmap.size");
+        verify(incus).deviceRemove("test", "tun");
+        verify(incus, never()).configSet(anyString(), anyString(), anyString());
+        verify(incus, never()).deviceAdd(anyString(), anyString(), anyString(), any(String[].class));
+        verifyNoMoreInteractions(incus);
+    }
+
+    @Test
+    void optedInPolicyClearsThenRecreatesOnlyDeclaredContainerPrivileges() {
+        var incus = mock(IncusClient.class);
+        var cmd = new BuildCommand();
+        cmd.incus = incus;
+
+        cmd.applyContainerSecurityPolicy("test", new ImageDef.Security(true, true, true), false);
+
+        verify(incus).configUnset("test", "security.privileged");
+        verify(incus).configUnset("test", "security.nesting");
+        verify(incus).configUnset("test", "security.syscalls.intercept.setxattr");
+        verify(incus).configUnset("test", "raw.lxc");
+        verify(incus).configUnset("test", "raw.idmap");
+        verify(incus).configUnset("test", "security.idmap.base");
+        verify(incus).configUnset("test", "security.idmap.isolated");
+        verify(incus).configUnset("test", "security.idmap.size");
+        verify(incus).deviceRemove("test", "tun");
+        verify(incus).configSet("test", "raw.idmap", "both 1000 1000");
+        verify(incus).configSet("test", "security.idmap.size", "165536");
+        verify(incus).configSet("test", "security.nesting", "true");
+        if (dev.incusspawn.Platform.isLinux()) {
+            verify(incus).configSet("test", "security.syscalls.intercept.setxattr", "true");
+        }
+        verify(incus).deviceAdd("test", "tun", "unix-char",
+                "source=/dev/net/tun", "path=/dev/net/tun", "mode=0666");
+        verify(incus).configSet("test", "raw.lxc", "lxc.cap.drop =");
+        verifyNoMoreInteractions(incus);
+    }
+
+    @Test
+    void vmPolicyDoesNotTouchIncusContainerSettings() {
+        var incus = mock(IncusClient.class);
+        var cmd = new BuildCommand();
+        cmd.incus = incus;
+
+        cmd.applyContainerSecurityPolicy("test", new ImageDef.Security(true, true, true), true);
+
+        verifyNoInteractions(incus);
+    }
+
+    @Test
+    void hardenedGuestSecurityScriptScrubsInheritedPrivileges() {
+        var script = BuildCommand.guestSecurityScript(new ImageDef.Security(false, false, false));
+
+        assertTrue(script.startsWith("set -eu\n"));
+        assertTrue(script.contains("test \"$(id -u agentuser)\" -ne 0"));
+        assertTrue(script.contains("rm -f /etc/sudoers.d/agentuser"));
+        assertTrue(script.contains("for group in wheel sudo"));
+        assertTrue(script.contains("sed -i '/^[[:space:]]*agentuser:/d'"));
+        assertTrue(script.contains("rm -f /etc/sysctl.d/99-dev-container.conf"));
+        assertFalse(script.contains("NOPASSWD"));
+        assertFalse(script.contains("agentuser:100000:65536' >>"));
+        assertFalse(script.contains("kernel.perf_event_paranoid = 1"));
+    }
+
+    @Test
+    void guestSecurityFailureAbortsFinalization() {
+        var incus = mock(IncusClient.class);
+        when(incus.shellExec(eq("test"), eq("sh"), eq("-c"), anyString())).thenReturn(FAIL);
+        var cmd = new BuildCommand();
+
+        assertThrows(IncusException.class, () -> cmd.applyGuestSecurityPolicy(
+                new Container(incus, "test"), new ImageDef.Security(false, false, false)));
+    }
+
+    @Test
+    void optedInGuestSecurityScriptRecreatesDeclaredPrivileges() {
+        var script = BuildCommand.guestSecurityScript(new ImageDef.Security(true, true, true));
+
+        assertTrue(script.contains("agentuser ALL=(ALL) NOPASSWD: ALL"));
+        assertTrue(script.contains("agentuser:100000:65536' >> /etc/subuid"));
+        assertTrue(script.contains("agentuser:100000:65536' >> /etc/subgid"));
+        assertTrue(script.contains("net.ipv4.ping_group_range = 0 2147483647"));
+        assertTrue(script.contains("kernel.dmesg_restrict = 0"));
+        assertTrue(script.contains("kernel.perf_event_paranoid = 1"));
+        assertTrue(script.contains("kernel.yama.ptrace_scope = 0"));
+    }
+
+    @Test
     void parseGitHubOwnerRepoWithDotGit() {
         assertEquals("quarkusio/quarkus",
                 BuildCommand.parseGitHubOwnerRepo("https://github.com/quarkusio/quarkus.git"));

@@ -1,6 +1,10 @@
 name: tpl-dev
 description: Podman, GitHub CLI, Starship
 parent: tpl-minimal
+security:
+  sudo: true
+  nested-containers: true
+  permissive-capabilities: true
 tools:
   - tmux
   - starship

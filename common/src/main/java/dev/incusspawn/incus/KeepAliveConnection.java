@@ -163,9 +163,15 @@ final class KeepAliveConnection {
 
         int contentLength = -1;
         boolean chunked = false;
+        var headers = new java.util.LinkedHashMap<String, String>();
         String line;
         while (!(line = requireLine()).isEmpty()) {
-            var lower = line.toLowerCase();
+            var separator = line.indexOf(':');
+            if (separator > 0) {
+                headers.put(line.substring(0, separator).toLowerCase(java.util.Locale.ROOT),
+                        line.substring(separator + 1).strip());
+            }
+            var lower = line.toLowerCase(java.util.Locale.ROOT);
             if (lower.startsWith("content-length:")) {
                 contentLength = Integer.parseInt(lower.substring(15).trim());
             } else if (lower.startsWith("transfer-encoding:") && lower.contains("chunked")) {
@@ -190,7 +196,7 @@ final class KeepAliveConnection {
             body = in.readAllBytes();
             serverWantsClose = true;
         }
-        return new IncusTransport.RawResponse(statusCode, body);
+        return new IncusTransport.RawResponse(statusCode, body, headers);
     }
 
     /** Read a header/status line; returns null only on EOF at the very first byte. */

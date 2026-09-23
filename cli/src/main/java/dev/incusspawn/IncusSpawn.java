@@ -1,6 +1,7 @@
 package dev.incusspawn;
 
 import dev.incusspawn.command.*;
+import dev.incusspawn.config.WorkerPoolSelection;
 import io.quarkus.runtime.QuarkusApplication;
 import io.quarkus.runtime.annotations.QuarkusMain;
 import org.aesh.AeshRuntimeRunner;
@@ -13,6 +14,8 @@ public class IncusSpawn implements QuarkusApplication {
     @Override
     public int run(String... args) {
         try {
+            // Resolve ISX_POOL once, before any command constructs pool-aware services or paths.
+            WorkerPoolSelection.current();
             if (args.length == 0) {
                 return launchTui() ? 0 : 1;
             }
@@ -69,7 +72,7 @@ public class IncusSpawn implements QuarkusApplication {
                 InitCommand.class, BuildCommand.class, ProjectCommand.class,
                 BranchCommand.class, ShellCommand.class, RunCommand.class, ListCommand.class,
                 DestroyCommand.class, UpdateAllCommand.class, ProxyCommand.class,
-                CleanCommand.class, CompletionCommand.class, TemplatesCommand.class,
+                AutomationCommand.class, CleanCommand.class, CompletionCommand.class, TemplatesCommand.class,
                 InstancesCommand.class, GitRemoteHelperCommand.class, SshProxyCommand.class,
                 VmCommand.class, UpdateBaseCommand.class, DoctorCommand.class,
                 AskCommand.class
@@ -91,7 +94,7 @@ public class IncusSpawn implements QuarkusApplication {
                 InitCommand.class, BuildCommand.class, ProjectCommand.class,
                 BranchCommand.class, ShellCommand.class, RunCommand.class, ListCommand.class,
                 DestroyCommand.class, UpdateAllCommand.class, ProxyCommand.class,
-                CleanCommand.class, CompletionCommand.class, TemplatesCommand.class,
+                AutomationCommand.class, CleanCommand.class, CompletionCommand.class, TemplatesCommand.class,
                 InstancesCommand.class, GitRemoteHelperCommand.class, SshProxyCommand.class,
                 UpdateBaseCommand.class, DoctorCommand.class,
                 AskCommand.class

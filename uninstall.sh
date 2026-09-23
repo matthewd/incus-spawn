@@ -74,37 +74,37 @@ fi
 if $IS_MACOS; then
     UID_VAL="$(id -u)"
 
-    # Stop and remove launchd services
-    if [ -f "$LAUNCHD_PROXY_PLIST" ]; then
-        echo "Stopping and removing proxy service..."
-        launchctl bootout "gui/$UID_VAL" "$LAUNCHD_PROXY_PLIST" 2>/dev/null || true
-        rm -f "$LAUNCHD_PROXY_PLIST"
-    fi
+    # Boot out by label even when a stale/missing plist no longer gives launchctl a path.
+    echo "Stopping and removing proxy service..."
+    launchctl bootout "gui/$UID_VAL/dev.incusspawn.proxy" 2>/dev/null || true
+    launchctl bootout "gui/$UID_VAL" "$LAUNCHD_PROXY_PLIST" 2>/dev/null || true
+    rm -f "$LAUNCHD_PROXY_PLIST"
 
-    if [ -f "$LAUNCHD_VM_PLIST" ]; then
-        echo "Stopping and removing VM service..."
-        launchctl bootout "gui/$UID_VAL" "$LAUNCHD_VM_PLIST" 2>/dev/null || true
-        rm -f "$LAUNCHD_VM_PLIST"
-    fi
+    echo "Stopping and removing legacy VM service..."
+    launchctl bootout "gui/$UID_VAL/dev.incusspawn.vm" 2>/dev/null || true
+    launchctl bootout "gui/$UID_VAL" "$LAUNCHD_VM_PLIST" 2>/dev/null || true
+    rm -f "$LAUNCHD_VM_PLIST"
 
-    # Stop any running VM process (verify it's actually vfkit/qemu before killing)
-    if [ -f "$STATE_DIR/vm.pid" ]; then
-        PID="$(cat "$STATE_DIR/vm.pid" 2>/dev/null || true)"
+    # Stop every legacy or named-pool VM process before deleting its state.
+    # Verify process identity so a stale PID file cannot target an unrelated process.
+    for PID_FILE in "$STATE_DIR/vm.pid" "$STATE_DIR"/pools/*/vm.pid; do
+        [ -f "$PID_FILE" ] || continue
+        PID="$(cat "$PID_FILE" 2>/dev/null || true)"
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
             PROC_NAME="$(ps -p "$PID" -o comm= 2>/dev/null || true)"
             case "$PROC_NAME" in
                 *vfkit*|*qemu*)
-                    echo "Stopping VM (pid=$PID, $PROC_NAME)..."
+                    echo "Stopping VM from $PID_FILE (pid=$PID, $PROC_NAME)..."
                     kill "$PID" 2>/dev/null || true
                     sleep 2
                     kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null || true
                     ;;
                 *)
-                    echo "Warning: PID $PID is not a VM process ($PROC_NAME), skipping kill"
+                    echo "Warning: PID $PID from $PID_FILE is not a VM process ($PROC_NAME), skipping kill"
                     ;;
             esac
         fi
-    fi
+    done
 
     # Stop any proxy process on the health port
     lsof -t -i :18080 2>/dev/null | xargs kill 2>/dev/null || true

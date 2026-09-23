@@ -4,8 +4,10 @@ import dev.incusspawn.BuildInfo;
 import dev.incusspawn.Environment;
 import dev.incusspawn.RuntimeServices;
 import dev.incusspawn.proxy.ApiTrafficLog;
+import dev.incusspawn.config.SpawnConfig;
 import dev.incusspawn.proxy.DumpProxy;
 import dev.incusspawn.proxy.ProxyConfig;
+import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.proxy.ProxyHealthCheck;
 import dev.incusspawn.proxy.ProxyService;
 import dev.incusspawn.util.BuildOutput;
@@ -17,6 +19,9 @@ import org.aesh.command.option.Option;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.regex.Pattern;
 
 @CommandDefinition(
         name = "proxy",
@@ -29,6 +34,8 @@ import java.nio.file.Path;
                 ProxyCommand.Status.class,
                 ProxyCommand.Install.class,
                 ProxyCommand.Uninstall.class,
+                ProxyCommand.ConfigureDns.class,
+                ProxyCommand.GitHubToken.class,
                 ProxyCommand.Logs.class,
                 ProxyCommand.Dump.class
         }
@@ -78,7 +85,9 @@ public class ProxyCommand extends BaseCommand {
                                 System.out.println("  Runtime:         " + proxyInfo.runtime());
                             }
                         }
-                        System.out.println("  DNS overrides:   " + (proxyInfo.dnsConfigured() ? "active" : "pending"));
+                        System.out.println("  DNS overrides:   "
+                                + (status == ProxyHealthCheck.ProxyStatus.RUNNING
+                                ? "active for selected appliance" : "pending for selected appliance"));
                         for (var drift : ProxyHealthCheck.checkDrift(proxyInfo)) {
                             System.out.println("  \033[1;33m>>> " + drift + "\033[0m");
                         }
@@ -147,7 +156,7 @@ public class ProxyCommand extends BaseCommand {
 
     @CommandDefinition(
             name = "install",
-            description = "Install the proxy as a systemd user service (auto-starts on boot)",
+            description = "Install the proxy as a user service",
             generateHelp = true
     )
     public static class Install extends BaseCommand {
@@ -156,7 +165,9 @@ public class ProxyCommand extends BaseCommand {
         protected CommandResult doExecute() throws Exception {
             var incus = RuntimeServices.incus();
             if (ProxyService.isActive()) {
-                ProxyService.upgradeIfNeeded();
+                if (!ProxyService.upgradeIfNeeded()) {
+                    return CommandResult.FAILURE;
+                }
                 if (ProxyService.reinstallIfChanged(incus)) {
                     BuildOutput.success("Proxy service restarted with updated binary.");
                 } else {
@@ -178,7 +189,7 @@ public class ProxyCommand extends BaseCommand {
 
     @CommandDefinition(
             name = "uninstall",
-            description = "Stop and remove the systemd proxy service",
+            description = "Stop and remove the proxy user service",
             generateHelp = true
     )
     public static class Uninstall extends BaseCommand {
@@ -190,6 +201,92 @@ public class ProxyCommand extends BaseCommand {
                 ProxyConfig.clearBridgeDns(incus);
             }
             return CommandResult.SUCCESS;
+        }
+    }
+
+    @CommandDefinition(
+            name = "configure-dns",
+            description = "Apply proxy DNS overrides to the selected Incus appliance",
+            generateHelp = true
+    )
+    public static class ConfigureDns extends BaseCommand {
+
+        @Override
+        protected CommandResult doExecute() throws Exception {
+            var incus = RuntimeServices.incus();
+            var domains = ProxyConfig.currentInterceptedDomains();
+            try {
+                return configureDns(incus, domains)
+                        ? CommandResult.SUCCESS : CommandResult.FAILURE;
+            } catch (Exception e) {
+                System.err.println("Could not configure bridge DNS: " + e.getMessage());
+                return CommandResult.FAILURE;
+            }
+        }
+
+        static boolean configureDns(IncusClient incus, Set<String> domains) {
+            ProxyConfig.writeBridgeDns(incus, domains);
+            if (!ProxyConfig.isBridgeDnsComplete(incus, domains)) {
+                System.err.println("Bridge DNS verification failed for the selected appliance.");
+                return false;
+            }
+            ProxyHealthCheck.invalidateCache();
+            System.out.println("DNS overrides configured for the selected appliance: "
+                    + domains.size() + " domains -> " + ProxyConfig.resolveGatewayIp(incus));
+            return true;
+        }
+    }
+
+    @CommandDefinition(
+            name = "github-token",
+            description = "Replace the host-wrapped GitHub token from an environment variable",
+            generateHelp = true
+    )
+    public static class GitHubToken extends BaseCommand {
+        private static final Pattern ENVIRONMENT_NAME =
+                Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
+        private static final Pattern TOKEN = Pattern.compile("[^\\s\\x00]{20,4096}");
+
+        @Option(name = "from-env",
+                description = "Read the token from this host environment variable")
+        String fromEnvironment;
+
+        @Override
+        protected CommandResult doExecute() {
+            final String token;
+            try {
+                token = tokenFromEnvironment(fromEnvironment, System::getenv);
+            } catch (IllegalArgumentException e) {
+                System.err.println(e.getMessage());
+                return CommandResult.FAILURE;
+            }
+            var config = SpawnConfig.load();
+            config.getGithub().setToken(token);
+            config.save();
+            System.out.println("GitHub proxy credential replaced from " + fromEnvironment + ".");
+            System.out.println("The token value was not accepted in argv or printed.");
+            System.out.println("Apply it with: isx proxy restart && isx proxy configure-dns");
+            return CommandResult.SUCCESS;
+        }
+
+        static String tokenFromEnvironment(
+                String name, Function<String, String> environment) {
+            if (name == null || !ENVIRONMENT_NAME.matcher(name).matches()) {
+                throw new IllegalArgumentException(
+                        "--from-env must name a valid environment variable");
+            }
+            var token = environment.apply(name);
+            if (token == null || token.isBlank()) {
+                throw new IllegalArgumentException(
+                        "Host environment variable " + name + " is unset or empty");
+            }
+            token = token.strip();
+            if (!TOKEN.matcher(token).matches()) {
+                throw new IllegalArgumentException(
+                        "Host environment variable " + name
+                                + " is not a bounded single-line token");
+            }
+            return token;
         }
     }
 

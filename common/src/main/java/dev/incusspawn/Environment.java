@@ -113,7 +113,8 @@ public final class Environment {
     }
 
     public static Path lockDir() {
-        return home().resolve(".cache/incus-spawn/locks");
+        return RuntimeConstants.WORKER_POOL.instanceLockDir(
+                stateDir(), home().resolve(".cache/incus-spawn/locks"));
     }
 
     public static Path m2Repository() {
@@ -128,16 +129,25 @@ public final class Environment {
         return home().resolve(".local/bin/isx");
     }
 
+    public static Path stateDir() {
+        return home().resolve(".local/state/incus-spawn");
+    }
+
     public static Path proxyLogFile() {
-        return home().resolve(".local/state/incus-spawn/proxy.log");
+        return stateDir().resolve("proxy.log");
     }
 
     public static Path proxyServiceLogFile() {
-        return vmStateDir().resolve("proxy-service.log");
+        return stateDir().resolve("proxy-service.log");
     }
 
     public static Path proxyLifecycleLogFile() {
-        return home().resolve(".local/state/incus-spawn/proxy-lifecycle.log");
+        return stateDir().resolve("proxy-lifecycle.log");
+    }
+
+    /** macOS host address used by the global launchd proxy, independent of worker-pool state. */
+    public static Path proxyGatewayFile() {
+        return stateDir().resolve("proxy-gateway-ip");
     }
 
     /**
@@ -145,7 +155,7 @@ public final class Environment {
      * to emit from inside the TUI, which owns the terminal.
      */
     public static Path clientLogFile() {
-        return home().resolve(".local/state/incus-spawn/client.log");
+        return stateDir().resolve("client.log");
     }
 
     public static final String PROXY_SERVICE_NAME = "incus-spawn-proxy";
@@ -155,7 +165,7 @@ public final class Environment {
     }
 
     public static Path apiDebugDir() {
-        return home().resolve(".local/state/incus-spawn/api-debug");
+        return stateDir().resolve("api-debug");
     }
 
     /**
@@ -173,10 +183,10 @@ public final class Environment {
         return file;
     }
 
-    // --- VM state paths (under ~/.local/state/incus-spawn/) ---
+    // --- VM state paths (legacy root, or pools/<name>/ for a named worker pool) ---
 
     public static Path vmStateDir() {
-        return home().resolve(".local/state/incus-spawn");
+        return RuntimeConstants.WORKER_POOL.vmStateDir(stateDir());
     }
 
     public static Path vmPidFile() {
@@ -187,8 +197,17 @@ public final class Environment {
         return vmStateDir().resolve("vm.log");
     }
 
+    public static Path vmLaunchLogFile() {
+        return vmStateDir().resolve("vfkit.log");
+    }
+
     public static Path vmRestUriFile() {
         return vmStateDir().resolve("vm.rest-uri");
+    }
+
+    /** Export-plan identity recorded for a running named worker-pool VM. */
+    public static Path vmExportPlanFingerprint() {
+        return vmStateDir().resolve("vm-exports.sha256");
     }
 
     public static Path vmVsockSocket() {

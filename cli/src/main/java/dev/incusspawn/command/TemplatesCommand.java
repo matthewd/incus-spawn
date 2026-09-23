@@ -308,12 +308,18 @@ public class TemplatesCommand extends BaseCommand {
             # description: My custom template
 
             # Parent template to inherit from (packages, tools, repos are additive)
-            # Common parents: tpl-minimal, tpl-dev, tpl-java
+            # Common parents: tpl-minimal, tpl-bb, tpl-dev, tpl-java
             # parent: tpl-dev
 
             # Base image (only for root templates without a parent)
             # Default: images:fedora/44
             # image: images:fedora/44
+
+            # Exact security policy; omitted fields inherit, root defaults are false
+            # security:
+            #   sudo: false
+            #   nested-containers: false
+            #   permissive-capabilities: false
 
             # System packages to install via dnf
             # packages:

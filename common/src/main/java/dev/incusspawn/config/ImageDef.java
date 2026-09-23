@@ -40,7 +40,7 @@ import java.util.function.Consumer;
  * can refuse to build and insist the user disambiguate.
  */
 @RegisterForReflection
-@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonIgnoreProperties(ignoreUnknown = false)
 public class ImageDef {
 
     private static final ObjectMapper YAML = new ObjectMapper(new YAMLFactory())
@@ -51,7 +51,7 @@ public class ImageDef {
     // is unreliable in GraalVM native image, so we enumerate explicitly.
     // Update this list when adding a new built-in image definition.
     public static final List<String> BUILTIN_FILES = List.of(
-            "minimal.yaml", "dev.yaml", "java.yaml"
+            "minimal.yaml", "dev.yaml", "java.yaml", "bb.yaml"
     );
 
     private static final Path PROJECT_IMAGES_DIR = Path.of(".incus-spawn/images");
@@ -125,6 +125,7 @@ public class ImageDef {
     private List<EnvEntry> env = List.of();
     @JsonProperty("default-action")
     private String defaultAction;
+    private Security security = new Security();
 
     @JsonIgnore
     private String source = "unknown";
@@ -169,7 +170,9 @@ public class ImageDef {
     public void setPinned(boolean pinned) { this.pinned = pinned; }
     public String getType() { return type; }
     public void setType(String type) { this.type = type; }
+    @JsonIgnore
     public boolean isVm() { return "vm".equals(type); }
+    @JsonIgnore
     public boolean isKvm() { return "kvm".equals(type); }
     @Deprecated
     public void setVm(boolean vm) { if (vm) this.type = "vm"; }
@@ -181,8 +184,46 @@ public class ImageDef {
     public void setEnv(List<EnvEntry> env) { this.env = env; }
     public String getDefaultAction() { return defaultAction; }
     public void setDefaultAction(String defaultAction) { this.defaultAction = defaultAction; }
+    public Security getSecurity() { return security; }
+    public void setSecurity(Security security) { this.security = security != null ? security : new Security(); }
     public String getSource() { return source; }
     public void setSource(String source) { this.source = source; }
+
+    /**
+     * Declarative privileges for an image. Boxed fields preserve whether a child
+     * explicitly selected a value or should inherit that value from its parent.
+     * Loaded definition sets are normalized to effective, fully specified values.
+     */
+    @RegisterForReflection
+    @JsonIgnoreProperties(ignoreUnknown = false)
+    public static class Security {
+        private Boolean sudo;
+        @JsonProperty("nested-containers")
+        private Boolean nestedContainers;
+        @JsonProperty("permissive-capabilities")
+        private Boolean permissiveCapabilities;
+
+        public Security() {}
+
+        public Security(boolean sudo, boolean nestedContainers, boolean permissiveCapabilities) {
+            this.sudo = sudo;
+            this.nestedContainers = nestedContainers;
+            this.permissiveCapabilities = permissiveCapabilities;
+        }
+
+        public boolean isSudo() { return Boolean.TRUE.equals(sudo); }
+        public void setSudo(boolean sudo) { this.sudo = sudo; }
+        public boolean isNestedContainers() { return Boolean.TRUE.equals(nestedContainers); }
+        public void setNestedContainers(boolean nestedContainers) { this.nestedContainers = nestedContainers; }
+        public boolean isPermissiveCapabilities() { return Boolean.TRUE.equals(permissiveCapabilities); }
+        public void setPermissiveCapabilities(boolean permissiveCapabilities) {
+            this.permissiveCapabilities = permissiveCapabilities;
+        }
+
+        private Boolean declaredSudo() { return sudo; }
+        private Boolean declaredNestedContainers() { return nestedContainers; }
+        private Boolean declaredPermissiveCapabilities() { return permissiveCapabilities; }
+    }
 
     /**
      * Groups the skills catalog repo and skill list under a single {@code skills} key.
@@ -247,7 +288,8 @@ public class ImageDef {
                             }
                             list = items;
                         }
-                        default -> p.skipChildren();
+                        default -> ctxt.reportInputMismatch(SkillsDef.class,
+                                "Unknown field '%s' in skills", field);
                     }
                 }
                 return new SkillsDef(repo, list);
@@ -255,7 +297,7 @@ public class ImageDef {
         }
     }
 
-    @JsonIgnoreProperties(ignoreUnknown = true)
+    @JsonIgnoreProperties(ignoreUnknown = false)
     public static class RepoEntry {
         private String url;
         private String path;
@@ -290,7 +332,7 @@ public class ImageDef {
     }
 
     @RegisterForReflection
-    @JsonIgnoreProperties(ignoreUnknown = true)
+    @JsonIgnoreProperties(ignoreUnknown = false)
     public static class PackageRepo {
         private String type;
         private String name;
@@ -308,7 +350,7 @@ public class ImageDef {
         public void setName(String name) { this.name = name; }
     }
 
-    @JsonIgnoreProperties(ignoreUnknown = true)
+    @JsonIgnoreProperties(ignoreUnknown = false)
     public static class HostResource {
         private String source;
         private String path;
@@ -331,6 +373,18 @@ public class ImageDef {
     }
 
     public String contentFingerprint(Map<String, String> toolFingerprints) {
+        return contentFingerprint(toolFingerprints, security);
+    }
+
+    /**
+     * Fingerprint this definition with its effective inherited security policy.
+     */
+    public String contentFingerprint(Map<String, String> toolFingerprints,
+                                     Map<String, ImageDef> defs) {
+        return contentFingerprint(toolFingerprints, resolveSecurity(this, defs));
+    }
+
+    private String contentFingerprint(Map<String, String> toolFingerprints, Security effectiveSecurity) {
         var sb = new StringBuilder();
         sb.append("image=").append(image).append('\n');
         if (imageUrl != null) sb.append("image_url=").append(imageUrl).append('\n');
@@ -347,6 +401,10 @@ public class ImageDef {
                             .append('=').append(e.getValue()).append('\n'));
         }
         sb.append("parent=").append(parent != null ? parent : "").append('\n');
+        sb.append("security.sudo=").append(effectiveSecurity.isSudo()).append('\n');
+        sb.append("security.nested-containers=").append(effectiveSecurity.isNestedContainers()).append('\n');
+        sb.append("security.permissive-capabilities=")
+                .append(effectiveSecurity.isPermissiveCapabilities()).append('\n');
         packages.stream().sorted().forEach(p -> sb.append("pkg=").append(p).append('\n'));
         for (var t : tools.stream().sorted(java.util.Comparator.comparing(ToolDef.ToolRef::getName)).toList()) {
             sb.append("tool=").append(t.getName());
@@ -452,7 +510,34 @@ public class ImageDef {
         return "vm".equals(resolveType(start, defs));
     }
 
+    /**
+     * Resolve each security field independently through the parent chain. An
+     * unset field on a root definition is false.
+     */
+    public static Security resolveSecurity(ImageDef start, Map<String, ImageDef> defs) {
+        Boolean sudo = null;
+        Boolean nestedContainers = null;
+        Boolean permissiveCapabilities = null;
+        var current = start;
+        var visited = new java.util.HashSet<String>();
+        while (current != null) {
+            var declared = current.security != null ? current.security : new Security();
+            if (sudo == null) sudo = declared.declaredSudo();
+            if (nestedContainers == null) nestedContainers = declared.declaredNestedContainers();
+            if (permissiveCapabilities == null) {
+                permissiveCapabilities = declared.declaredPermissiveCapabilities();
+            }
+            if (sudo != null && nestedContainers != null && permissiveCapabilities != null) break;
+            if (current.isRoot() || current.getParent() == null
+                    || !visited.add(current.getParent())) break;
+            current = defs.get(current.getParent());
+        }
+        return new Security(Boolean.TRUE.equals(sudo), Boolean.TRUE.equals(nestedContainers),
+                Boolean.TRUE.equals(permissiveCapabilities));
+    }
+
     /** Whether this image is built from scratch (no parent). */
+    @JsonIgnore
     public boolean isRoot() {
         return parent == null || parent.isBlank();
     }
@@ -510,6 +595,7 @@ public class ImageDef {
         }
         loadFromDirectory(PROJECT_IMAGES_DIR, defs, warnings);
         inheritTypes(defs.defs());
+        inheritSecurity(defs.defs());
         return defs;
     }
 
@@ -525,6 +611,15 @@ public class ImageDef {
                 }
             }
         }
+    }
+
+    /** Normalize every loaded definition to its exact inherited security policy. */
+    private static void inheritSecurity(Map<String, ImageDef> defs) {
+        var effective = new java.util.IdentityHashMap<ImageDef, Security>();
+        for (var def : defs.values()) {
+            effective.put(def, resolveSecurity(def, defs));
+        }
+        effective.forEach((def, policy) -> def.security = policy);
     }
 
     /**
@@ -573,7 +668,9 @@ public class ImageDef {
                         defs.put(def.getName(), def, source);
                     }
                 } catch (IOException e) {
-                    warnings.accept(YamlErrors.friendly(path.getFileName().toString(), e));
+                    var error = YamlErrors.friendly(path.getFileName().toString(), e);
+                    warnings.accept(error);
+                    defs.addParseError(error);
                 }
             }
         } catch (IOException e) {

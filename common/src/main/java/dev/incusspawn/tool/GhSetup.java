@@ -13,7 +13,7 @@ import static dev.incusspawn.incus.Container.shellQuote;
 
 public class GhSetup implements ToolSetup {
 
-    private static final String PLACEHOLDER_TOKEN = "gho_placeholder";
+    public static final String PLACEHOLDER_TOKEN = "gho_placeholder";
     private static final long[] DEFAULT_RETRY_DELAYS_MS = {500, 500, 500, 500};
     long[] retryDelaysMs = DEFAULT_RETRY_DELAYS_MS;
 
@@ -59,7 +59,9 @@ public class GhSetup implements ToolSetup {
 
     @Override
     public List<EnvEntry> envEntries(java.util.Map<String, String> resolvedParams) {
-        return List.of(EnvEntry.set("GH_TOKEN", PLACEHOLDER_TOKEN));
+        return List.of(
+                EnvEntry.set("GITHUB_TOKEN", PLACEHOLDER_TOKEN),
+                EnvEntry.set("GH_TOKEN", PLACEHOLDER_TOKEN));
     }
 
     @Override

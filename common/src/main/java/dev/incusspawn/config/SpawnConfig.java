@@ -9,6 +9,7 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import dev.incusspawn.Environment;
 import java.nio.file.Files;
@@ -40,7 +41,9 @@ public class SpawnConfig {
     private String incusBridgeGateway = "";
     @JsonProperty("auto-clone-repos")
     private String autoCloneRepos = "";
-    private Map<String, Object> extras = new java.util.LinkedHashMap<>();
+    @JsonProperty("worker-pools")
+    private Map<String, WorkerPoolConfig> workerPools = Map.of();
+    private Map<String, Object> extras = new LinkedHashMap<>();
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class ClaudeConfig {
@@ -149,6 +152,10 @@ public class SpawnConfig {
     public void setIncusBridgeGateway(String incusBridgeGateway) { this.incusBridgeGateway = incusBridgeGateway == null ? "" : incusBridgeGateway; }
     public String getAutoCloneRepos() { return autoCloneRepos; }
     public void setAutoCloneRepos(String autoCloneRepos) { this.autoCloneRepos = autoCloneRepos == null ? "" : autoCloneRepos; }
+    public Map<String, WorkerPoolConfig> getWorkerPools() { return workerPools; }
+    public void setWorkerPools(Map<String, WorkerPoolConfig> workerPools) {
+        this.workerPools = workerPools == null ? Map.of() : workerPools;
+    }
     @JsonAnySetter
     public void setExtra(String key, Object value) { extras.put(key, value); }
 
@@ -232,25 +239,45 @@ public class SpawnConfig {
 
     public static SpawnConfig load() {
         var configFile = configDir().resolve("config.yaml");
-        if (!Files.exists(configFile)) {
+        try {
+            return loadStrict(configFile);
+        } catch (IllegalStateException e) {
+            var level = e.getCause() instanceof IOException ? "Warning: " : "Error: ";
+            System.err.println(level + e.getMessage());
             return new SpawnConfig();
         }
+    }
+
+    /**
+     * Load the global config without the legacy warning-and-default fallback. Worker-pool
+     * selection uses this path so a named process can never silently operate on legacy state.
+     */
+    public static SpawnConfig loadStrict() {
+        return loadStrict(configDir().resolve("config.yaml"));
+    }
+
+    public static SpawnConfig loadStrict(Path configFile) {
+        if (!Files.exists(configFile)) return new SpawnConfig();
         try {
             var config = YAML.readValue(configFile.toFile(), SpawnConfig.class);
             config.validate();
             return config;
         } catch (IOException e) {
-            System.err.println("Warning: " + YamlErrors.friendly("config.yaml", e));
-            return new SpawnConfig();
+            throw new IllegalStateException(YamlErrors.friendly(configFile.getFileName().toString(), e), e);
         } catch (IllegalStateException e) {
-            System.err.println("Error: invalid config: " + e.getMessage());
-            return new SpawnConfig();
+            throw new IllegalStateException("invalid config: " + e.getMessage(), e);
         }
     }
 
     void validate() {
         if (!hostPath.isEmpty() && !hostPaths.isEmpty()) {
             throw new IllegalStateException("Cannot specify both 'host-path' and 'host-paths' in config.yaml");
+        }
+        for (var entry : workerPools.entrySet()) {
+            if (entry.getValue() == null) {
+                throw new IllegalStateException("worker pool '" + entry.getKey() + "' definition is required");
+            }
+            entry.getValue().validateAndFreeze(entry.getKey(), Environment.home());
         }
     }
 

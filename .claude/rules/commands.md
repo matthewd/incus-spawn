@@ -3,11 +3,12 @@ paths:
   - "cli/src/main/java/dev/incusspawn/IncusSpawn*.java"
   - "cli/src/main/java/dev/incusspawn/command/**"
   - "cli/src/main/java/dev/incusspawn/tui/**"
+  - "common/src/main/java/dev/incusspawn/automation/**"
 ---
 
 # Entry Point and Command Structure
 
-`IncusSpawn.java` is the aesh `@CommandDefinition` top command. With no subcommand, it launches the TUI (`ListCommand`). Each subcommand in `command/` is an aesh `@CommandDefinition` with Quarkus DI.
+`IncusSpawn.java` is the aesh `@CommandDefinition` top command. Before help, version, TUI, or subcommand dispatch, it resolves `WorkerPoolSelection.current()` so any set but unsafe/unknown `ISX_POOL` or malformed strict config fails closed before services or state paths are used. Selection is immutable for the process; do not add a command option or in-process pool switch. With no subcommand, it launches the TUI (`ListCommand`). Each subcommand in `command/` is an aesh `@CommandDefinition` with Quarkus DI.
 
 **Platform-specific command tree**: aesh bakes `groupCommands` into the annotation at compile time, so macOS-only commands can't exist on one platform without a second top command. `IncusSpawn` defines two variants -- `IncusSpawnCommand` (macOS, includes the `vm` group) and `IncusSpawnLinuxCommand` (identical minus `vm`) -- and picks one at runtime via `Platform.isMacOS()`. The result: on Linux `isx vm` is an unknown command and never appears in `isx --help` (Incus runs natively there, so there is no appliance VM to manage). `CompletionCommand.stripVmCommand()` keeps the generated shell completions in step by removing the `vm` command on Linux (leaving the unrelated `build --type vm` value untouched). When adding a *shared* command, add it to **both** command lists -- `IncusSpawnCommandTreeTest` fails if they drift (the two lists must be identical except for `vm`). When adding another macOS-only command, add it to `IncusSpawnCommand` only and extend the completion strip.
 
@@ -18,3 +19,7 @@ paths:
 **When to bump `INIT_VERSION`**: increment it when adding a new infrastructure step to init that existing installations need (new dependency, firewall rule, systemd service, config field). A sentinel *older* than `INIT_VERSION` causes `hasBeenInitialized()` to return false, triggering a re-run on the next command. Do NOT bump it for changes that don't affect host configuration (new template features, TUI changes, proxy logic changes).
 
 The comparison is `>=`, not equality: the sentinel is a monotonic floor, so a binary that finds a *newer* sentinel treats itself as initialized rather than concluding init never ran. This matters when two isx builds are installed at once (e.g. `/usr/bin/isx` and `~/.local/bin/isx`) -- under equality the older one both hard-failed the proxy service and re-ran init to write the sentinel back down, ping-ponging with the newer binary. Never renumber `INIT_VERSION` downward.
+
+# Automation Commands
+
+`AutomationCommand` is shared by the macOS and Linux trees. It never invokes interactive init, prompts, or `BuildOutput`. Keep aesh limited to option decoding and stream selection: ownership, idempotency, key-only deletion, exact mount/unmount semantics, reconciliation, and defaults belong in transport-neutral `AutomationService`; one-line lifecycle JSON and synchronized base64 NDJSON exec frames belong in `AutomationProtocol`. Every lifecycle mutation requires a caller key. Mount/unmount must validate all fields, accept only Running/Stopped instances, inspect unexpanded own devices, recheck ownership/state under an ETag-conditional mutation, and never remove by device name alone; lifecycle resources and errors must not disclose attachment paths or raw backend details. Exec must pass the parsed JSON argv directly, forward stdin without logging, and register a shutdown hook against the external cancellation signal.

@@ -3,6 +3,7 @@ package dev.incusspawn.command;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import dev.incusspawn.incus.IncusClient;
+import dev.incusspawn.proxy.ProxyHealthCheck;
 import dev.incusspawn.vm.VmManager;
 import org.junit.jupiter.api.Test;
 
@@ -332,7 +333,25 @@ class DoctorCommandTest {
         }
     }
 
-    // ---- Proxy not-running finding selection ----
+    // ---- Proxy findings ----
+
+    @Test
+    void commandCredentialProblemUsesConfiguredLabelAndNonExecutableRemediation() {
+        var problem = new ProxyHealthCheck.CredentialProblem(
+                "example-gateway", "Example credential gateway", "credential command failed",
+                "Repair host credential access");
+        var info = new ProxyHealthCheck.ProxyInfo(
+                "1.0", "", "", "", false, true,
+                "Example credential gateway: credential command failed", List.of(problem));
+
+        var finding = new DoctorCommand().checkProxyAuth(info);
+
+        assertEquals(DoctorCommand.Status.FAIL, finding.status());
+        assertEquals("Proxy auth (Example credential gateway)", finding.label());
+        assertEquals("credential command failed", finding.detail());
+        assertEquals("Repair host credential access", finding.remediation().description());
+        assertNull(finding.remediation().action());
+    }
 
     @Test
     void proxyNotRunningConfigErrorShowsJournalHint() {

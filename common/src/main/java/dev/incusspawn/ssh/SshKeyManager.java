@@ -30,6 +30,14 @@ public final class SshKeyManager {
      * Generate an ed25519 key pair if one does not already exist.
      */
     public static void ensureKeyPairExists() {
+        ensureKeyPairExists(true);
+    }
+
+    public static void ensureKeyPairExistsQuietly() {
+        ensureKeyPairExists(false);
+    }
+
+    private static void ensureKeyPairExists(boolean report) {
         if (exists()) return;
 
         try {
@@ -43,7 +51,7 @@ public final class SshKeyManager {
             if (Files.exists(Environment.sshKeyFile()) && !Files.exists(Environment.sshPubKeyFile())) {
                 // Private key exists but public key is missing — derive it rather than
                 // regenerating, because containers already have the old public key
-                if (derivePublicKey()) return;
+                if (derivePublicKey(report)) return;
                 // Derivation failed (corrupt/incompatible key) — remove so fresh generation works
                 Files.deleteIfExists(Environment.sshKeyFile());
             }
@@ -72,7 +80,9 @@ public final class SshKeyManager {
             Files.setPosixFilePermissions(Environment.sshPubKeyFile(),
                     PosixFilePermissions.fromString("rw-r--r--"));
 
-            BuildOutput.note("SSH key pair generated at " + Environment.sshDir());
+            if (report) {
+                BuildOutput.note("SSH key pair generated at " + Environment.sshDir());
+            }
         } catch (IOException | InterruptedException e) {
             throw new RuntimeException("Failed to generate SSH key pair: " + e.getMessage(), e);
         }
@@ -82,7 +92,7 @@ public final class SshKeyManager {
      * Derive the public key from an existing private key.
      * @return true if successful
      */
-    private static boolean derivePublicKey() {
+    private static boolean derivePublicKey(boolean report) {
         try {
             var pb = new ProcessBuilder(
                     "ssh-keygen", "-y", "-f", Environment.sshKeyFile().toString());
@@ -98,7 +108,7 @@ public final class SshKeyManager {
             Files.writeString(Environment.sshPubKeyFile(), pubKey + "\n");
             Files.setPosixFilePermissions(Environment.sshPubKeyFile(),
                     PosixFilePermissions.fromString("rw-r--r--"));
-            BuildOutput.note("SSH public key recovered from existing private key.");
+            if (report) BuildOutput.note("SSH public key recovered from existing private key.");
             return true;
         } catch (Exception e) {
             return false;
@@ -170,29 +180,46 @@ public final class SshKeyManager {
      * @return true if the entry was written successfully
      */
     public static boolean addHostEntry(String instanceName) {
-        return addHostEntry(instanceName, null);
+        return addHostEntry(instanceName, null, null);
     }
 
     /**
      * @param hostname optional IP/hostname for clients that don't support ProxyCommand
      */
     public static boolean addHostEntry(String instanceName, String hostname) {
+        return addHostEntry(instanceName, hostname, null);
+    }
+
+    public static boolean addOwnedHostEntry(String instanceName, String automationKey) {
+        return addHostEntry(instanceName, null, automationKey);
+    }
+
+    private static boolean addHostEntry(
+            String instanceName, String hostname, String automationKey) {
         try {
             ensureManagedConfigExists();
             var content = Files.readString(Environment.sshConfigFile());
             var blocks = parseWithoutHostBlocks(content, instanceName);
 
             var isxPath = resolveIsxPath();
+            var pool = System.getenv("ISX_POOL");
+            var proxyCommand = (pool == null || pool.isBlank()
+                    ? ""
+                    : "env ISX_POOL=" + shellQuote(pool) + " ")
+                    + shellQuote(isxPath) + " ssh-proxy " + shellQuote(instanceName)
+                    + (automationKey == null ? "" : " --key " + shellQuote(automationKey));
 
             blocks.add("");
             blocks.add("Host " + instanceName);
             if (hostname != null && !hostname.isEmpty()) {
                 blocks.add("    Hostname " + hostname);
             }
-            blocks.add("    ProxyCommand \"" + isxPath + "\" ssh-proxy " + instanceName);
+            blocks.add("    ProxyCommand " + proxyCommand);
             blocks.add("    User agentuser");
             blocks.add("    IdentityFile ~/.config/incus-spawn/ssh/id_ed25519");
             blocks.add("    IdentitiesOnly yes");
+            blocks.add("    ForwardAgent no");
+            blocks.add("    ClearAllForwardings yes");
             blocks.add("    StrictHostKeyChecking no");
             blocks.add("    UserKnownHostsFile /dev/null");
             blocks.add("");
@@ -258,6 +285,11 @@ public final class SshKeyManager {
     }
 
     private static String resolveIsxPath() {
+        var configured = System.getenv("ISX_EXECUTABLE");
+        if (configured != null && !configured.isBlank()) {
+            var path = Path.of(configured).toAbsolutePath().normalize();
+            if (Files.isExecutable(path)) return path.toString();
+        }
         try {
             var pb = new ProcessBuilder("which", "isx");
             pb.redirectErrorStream(true);
@@ -268,6 +300,13 @@ public final class SshKeyManager {
             }
         } catch (Exception ignored) {}
         return Environment.localBinIsx().toString();
+    }
+
+    private static String shellQuote(String value) {
+        if (value.indexOf('\0') >= 0 || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+            throw new IllegalArgumentException("SSH ProxyCommand value contains a line break or NUL");
+        }
+        return "'" + value.replace("'", "'\\\"'\\\"'") + "'";
     }
 
     private static boolean isSshKeygenAvailable() {

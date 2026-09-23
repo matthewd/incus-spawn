@@ -66,6 +66,32 @@ class CompletionCommandTest {
         assertTrue(linux.contains("container vm kvm"));
     }
 
+    @Test
+    void configureDnsRemainsInEveryCompletion() {
+        for (var shell : CompletionCommand.Shell.values()) {
+            var script = linux(shell);
+            assertTrue(script.contains("configure-dns"),
+                    shell + " must offer per-appliance proxy DNS configuration");
+        }
+    }
+
+    @Test
+    void sharedAutomationSurfaceRemainsInEveryCompletion() {
+        for (var shell : CompletionCommand.Shell.values()) {
+            var script = linux(shell);
+            assertTrue(script.contains("automation"), shell + " must list automation");
+            assertTrue(script.contains("argv-json"), shell + " must complete exact argv input");
+            assertTrue(script.contains("timeout-ms"), shell + " must complete finite timeouts");
+            assertTrue(script.contains("mount"), shell + " must list automation mount");
+            assertTrue(script.contains("unmount"), shell + " must list automation unmount");
+            assertTrue(script.contains("device"), shell + " must complete attachment device names");
+            assertTrue(script.contains("source"), shell + " must complete attachment sources");
+            assertTrue(script.contains("target"), shell + " must complete attachment targets");
+            assertTrue(script.contains("read-only"), shell + " must complete attachment access");
+            assertTrue(script.contains("read-write"), shell + " must complete attachment access");
+        }
+    }
+
     // --- macOS scripts keep vm (and the new resize subcommand) ---
 
     @Test

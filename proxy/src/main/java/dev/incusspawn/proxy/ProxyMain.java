@@ -4,6 +4,7 @@ import dev.incusspawn.BuildInfo;
 import dev.incusspawn.Environment;
 import dev.incusspawn.Platform;
 import dev.incusspawn.config.SpawnConfig;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.vm.VmNetwork;
 import io.quarkus.arc.Arc;
@@ -57,6 +58,17 @@ public class ProxyMain implements QuarkusApplication {
             }
         }
 
+        var detachedMacOsService = Platform.isMacOS()
+                && gatewayIpOption != null && !gatewayIpOption.isBlank();
+        if (!detachedMacOsService) {
+            try {
+                WorkerPoolSelection.current();
+            } catch (IllegalStateException e) {
+                System.err.println("Error: " + e.getMessage());
+                return ProxyService.EXIT_CONFIG;
+            }
+        }
+
         installLogTee();
 
         var incus = new IncusClient();
@@ -68,6 +80,13 @@ public class ProxyMain implements QuarkusApplication {
         var config = SpawnConfig.load();
         var claude = config.getClaude();
         var creds = ProxyCredentials.fromConfig(config);
+        final CommandCredentialConfig commandCredentials;
+        try {
+            commandCredentials = CommandCredentialConfig.loadStrict();
+        } catch (IllegalStateException e) {
+            System.err.println("Error: " + e.getMessage());
+            return ProxyService.EXIT_CONFIG;
+        }
 
         if (claude.isUseVertex()) {
             if (claude.getCloudMlRegion().isBlank() || claude.getVertexProjectId().isBlank()) {
@@ -78,6 +97,10 @@ public class ProxyMain implements QuarkusApplication {
 
         String gatewayIp;
         if (gatewayIpOption != null && !gatewayIpOption.isBlank()) {
+            if (Platform.isMacOS() && !ProxyService.isSafeGatewayIp(gatewayIpOption)) {
+                System.err.println("Error: refusing unsafe macOS proxy gateway IP: " + gatewayIpOption);
+                return ProxyService.EXIT_CONFIG;
+            }
             gatewayIp = gatewayIpOption;
         } else if (Platform.isMacOS()) {
             gatewayIp = VmNetwork.discoverHostBridgeIp();
@@ -121,6 +144,11 @@ public class ProxyMain implements QuarkusApplication {
         if (!toolProxyNames.isEmpty()) {
             System.out.println("  Tool proxies:  " + String.join(", ", toolProxyNames));
         }
+        if (!commandCredentials.rules().isEmpty()) {
+            var labels = commandCredentials.rules().stream()
+                    .map(CommandCredentialConfig.Rule::label).toList();
+            System.out.println("  Command credentials: " + String.join(", ", labels));
+        }
         var unresolved = ToolProxyResolver.findUnresolved(config);
         if (!unresolved.isEmpty()) {
             var unresolvedNames = unresolved.stream()
@@ -134,8 +162,11 @@ public class ProxyMain implements QuarkusApplication {
 
         var healthBindAddress = ProxyHealthCheck.healthAddress(incus);
         var vertx = Arc.container().instance(Vertx.class).get();
-        var proxy = new MitmProxy(vertx, gatewayIp, port, healthPort, healthBindAddress, creds);
-        proxy.setIncusClient(incus);
+        var proxy = new MitmProxy(vertx, gatewayIp, port, healthPort, healthBindAddress,
+                creds, commandCredentials);
+        if (!detachedMacOsService) {
+            proxy.setIncusClient(incus);
+        }
 
         if (debug) {
             try {
@@ -176,7 +207,12 @@ public class ProxyMain implements QuarkusApplication {
 
         var allDomains = proxy.allInterceptedDomains();
         Runnable dnsCallback;
-        if (Platform.isMacOS()) {
+        if (detachedMacOsService) {
+            dnsCallback = () -> {
+                ProxyLog.info("Using install-time per-appliance DNS configuration");
+                proxy.setDnsConfigured(true);
+            };
+        } else if (Platform.isMacOS()) {
             dnsCallback = () -> {
                 try {
                     ProxyConfig.configureBridgeDns(incus, allDomains);

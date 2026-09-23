@@ -18,12 +18,34 @@ public final class ProxyHealthCheck {
         STALE_DNS
     }
 
+    public record CredentialProblem(String id, String label, String detail,
+                                    String remediation) {}
+
     public record ProxyInfo(String version, String gitSha, String runtime, String caFingerprint,
-                            boolean configDrifted, boolean dnsConfigured, String authError) {
+                            boolean configDrifted, boolean dnsConfigured, String authError,
+                            java.util.List<CredentialProblem> commandCredentialProblems) {
+        public ProxyInfo(String version, String gitSha, String runtime, String caFingerprint,
+                         boolean configDrifted, boolean dnsConfigured, String authError) {
+            this(version, gitSha, runtime, caFingerprint, configDrifted, dnsConfigured,
+                    authError, java.util.List.of());
+        }
+
+        public ProxyInfo {
+            commandCredentialProblems = commandCredentialProblems == null
+                    ? java.util.List.of() : java.util.List.copyOf(commandCredentialProblems);
+        }
+
         public boolean isLegacy() { return version == null || version.isEmpty(); }
         public boolean hasAuthError() { return authError != null && !authError.isEmpty(); }
+        public CredentialProblem commandCredentialProblem() {
+            return commandCredentialProblems.isEmpty()
+                    ? null : commandCredentialProblems.getFirst();
+        }
         public String authRemediationHint() {
-            return authError != null && authError.contains("gcloud") ? "gcloud auth login" : "isx init";
+            var commandProblem = commandCredentialProblem();
+            if (commandProblem != null) return commandProblem.remediation();
+            return authError != null && authError.contains("gcloud")
+                    ? "gcloud auth login" : "isx init";
         }
     }
 
@@ -94,19 +116,30 @@ public final class ProxyHealthCheck {
         if (dev.incusspawn.Platform.isMacOS()) {
             var result = checkHealth("127.0.0.1");
             if (result.healthy()) {
-                return result.dnsConfigured() ? ProxyStatus.RUNNING : ProxyStatus.WAITING_FOR_DNS;
+                return selectedBridgeDnsIsCurrent(incus)
+                        ? ProxyStatus.RUNNING : ProxyStatus.WAITING_FOR_DNS;
             }
         }
         var gatewayIp = ProxyConfig.resolveGatewayIp(incus);
         var result = checkHealth(gatewayIp);
         if (result.healthy()) {
-            return result.dnsConfigured() ? ProxyStatus.RUNNING : ProxyStatus.WAITING_FOR_DNS;
+            return selectedBridgeDnsIsCurrent(incus)
+                    ? ProxyStatus.RUNNING : ProxyStatus.WAITING_FOR_DNS;
         }
         var dnsOverrides = ProxyConfig.getDnsOverrides(incus);
         if (!dnsOverrides.isEmpty() && dnsOverrides.contains("address=/")) {
             return ProxyStatus.STALE_DNS;
         }
         return ProxyStatus.NOT_RUNNING;
+    }
+
+    /** The proxy health bit is global; bridge DNS must be checked against this process's pool. */
+    private static boolean selectedBridgeDnsIsCurrent(IncusClient incus) {
+        try {
+            return ProxyConfig.isBridgeDnsComplete(incus, ProxyConfig.currentInterceptedDomains());
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static HealthResult checkHealth(String addr) {
@@ -175,7 +208,8 @@ public final class ProxyHealthCheck {
                     textOrEmpty(node, "caFingerprint"),
                     configDrifted,
                     dnsConfigured,
-                    textOrEmpty(node, "authError"));
+                    textOrEmpty(node, "authError"),
+                    parseCommandCredentialProblems(node));
         } catch (Exception e) {
             return new ProxyInfo("", "", "", "", false, true, "");
         }
@@ -234,10 +268,10 @@ public final class ProxyHealthCheck {
                     + separator;
             case WAITING_FOR_DNS -> separator + "\n"
                     + "\033[1mThe MITM proxy is running but DNS overrides are not\n"
-                    + "yet configured.\033[0m\n\n"
-                    + "The proxy is waiting for the VM to become reachable so it\n"
-                    + "can configure bridge DNS. Containers cannot reach intercepted\n"
-                    + "domains until this completes.\n\n"
+                    + "current on the selected appliance.\033[0m\n\n"
+                    + "Containers cannot reach intercepted domains until the selected\n"
+                    + "bridge has the complete current override set. Configure it with:\n\n"
+                    + "  \033[1misx proxy configure-dns\033[0m\n\n"
                     + "Check VM status:  \033[1misx vm status\033[0m\n"
                     + "Proxy status:     \033[1misx proxy status\033[0m\n"
                     + separator;
@@ -318,7 +352,7 @@ public final class ProxyHealthCheck {
     public static boolean waitForDns(IncusClient incus, java.util.function.Consumer<String> log) {
         var addr = healthAddress(incus);
         var result = checkHealth(addr);
-        if (result.healthy() && result.dnsConfigured()) return true;
+        if (result.healthy() && selectedBridgeDnsIsCurrent(incus)) return true;
         if (!result.healthy()) return false;
         log.accept("Waiting for proxy DNS configuration...");
         for (int i = 0; i < 120; i++) {
@@ -328,13 +362,13 @@ public final class ProxyHealthCheck {
             }
             result = checkHealth(addr);
             if (!result.healthy()) return false;
-            if (result.dnsConfigured()) {
+            if (selectedBridgeDnsIsCurrent(incus)) {
                 invalidateCache();
-                log.accept("Proxy DNS overrides configured.");
+                log.accept("Proxy DNS overrides configured for the selected appliance.");
                 return true;
             }
         }
-        log.accept("Proxy DNS overrides were not configured within 60 seconds.");
+        log.accept("Proxy DNS overrides were not configured for the selected appliance within 60 seconds.");
         return false;
     }
 
@@ -358,6 +392,24 @@ public final class ProxyHealthCheck {
                 System.err.println(sep);
             }
         } catch (Exception ignored) {}
+    }
+
+    private static java.util.List<CredentialProblem> parseCommandCredentialProblems(
+            JsonNode root) {
+        var result = new java.util.ArrayList<CredentialProblem>();
+        var entries = root.path("authProblems").path("commandCredentials");
+        if (!entries.isArray()) return java.util.List.of();
+        for (var entry : entries) {
+            var id = textOrEmpty(entry, "id");
+            var label = textOrEmpty(entry, "label");
+            var detail = textOrEmpty(entry, "detail");
+            var remediation = textOrEmpty(entry, "remediation");
+            if (!id.isEmpty() && !label.isEmpty() && !detail.isEmpty()
+                    && !remediation.isEmpty()) {
+                result.add(new CredentialProblem(id, label, detail, remediation));
+            }
+        }
+        return java.util.List.copyOf(result);
     }
 
     private static String textOrEmpty(JsonNode node, String field) {

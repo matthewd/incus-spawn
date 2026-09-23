@@ -11,6 +11,13 @@ import java.util.List;
 public class PiSetup implements ToolSetup {
 
     static final String DEFAULT_PROVIDER = "anthropic";
+    private static final String[] NPM_INSTALL = {
+            "npm", "install", "-g", "--ignore-scripts", "--loglevel=error",
+            "--fetch-retries=4", "--fetch-retry-factor=2",
+            "--fetch-retry-mintimeout=1000", "--fetch-retry-maxtimeout=15000",
+            "@earendil-works/pi-coding-agent"
+    };
+    long[] retryDelaysMs = {1_000, 3_000, 5_000, 10_000};
     static final String DEFAULT_MODEL = "claude-sonnet-4-6";
 
     @Override
@@ -96,9 +103,33 @@ public class PiSetup implements ToolSetup {
 
     private void installBinary(Container c) {
         BuildOutput.stepStart("Installing Pi coding agent...");
-        c.runQuiet("Failed to install Pi coding agent",
-                "npm", "install", "-g", "--ignore-scripts", "--loglevel=error", "@earendil-works/pi-coding-agent");
+        var result = c.exec(NPM_INSTALL);
+        for (int attempt = 0; !result.success() && isTransientNetworkFailure(result)
+                && attempt < retryDelaysMs.length; attempt++) {
+            BuildOutput.note("npm network failure; retrying Pi install ("
+                    + (attempt + 2) + "/" + (retryDelaysMs.length + 1) + ")");
+            try {
+                Thread.sleep(retryDelaysMs[attempt]);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while retrying Pi installation", e);
+            }
+            result = c.exec(NPM_INSTALL);
+        }
+        result.assertSuccess("Failed to install Pi coding agent");
         BuildOutput.stepDone();
+    }
+
+    static boolean isTransientNetworkFailure(dev.incusspawn.incus.IncusClient.ExecResult result) {
+        var output = (result.stdout() + "\n" + result.stderr()).toLowerCase();
+        return output.contains("econnreset")
+                || output.contains("etimedout")
+                || output.contains("eai_again")
+                || output.contains("enetwork")
+                || output.contains("socket hang up")
+                || output.contains("network aborted")
+                || output.contains("connection reset")
+                || output.contains("connection was closed");
     }
 
     private void configureSettings(Container c, java.util.Map<String, String> resolvedParams) {

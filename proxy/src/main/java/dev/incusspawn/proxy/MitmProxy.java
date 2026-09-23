@@ -69,6 +69,7 @@ import java.util.zip.GZIPInputStream;
 public class MitmProxy {
 
     private static final int BUFFER_SIZE = 64 * 1024;
+    static final long BB_GATEWAY_MAX_BODY_BYTES = 16L * 1024 * 1024;
 
     private static final Set<String> ANTHROPIC_DOMAINS = ProxyConfig.ANTHROPIC_DOMAINS;
     private static final Set<String> REGISTRY_DOMAINS = ProxyConfig.REGISTRY_DOMAINS;
@@ -156,6 +157,9 @@ public class MitmProxy {
     final AtomicReference<VertexTokenEntry> vertexToken = new AtomicReference<>();
 
     private final Vertx vertx;
+    private final CommandCredentialConfig commandCredentials;
+    private final Map<String, CommandCredentialBroker> commandCredentialBrokers =
+            new ConcurrentHashMap<>();
     private HttpServer mitmServer;
     private HttpServer healthHttpServer;
     private HttpClient upstreamClient;
@@ -172,6 +176,9 @@ public class MitmProxy {
     // whether the failure is one it can re-check on its own (gcloud) or one that
     // needs the user to re-run 'isx init' (OAuth).
     private String authErrorHint;
+    record CommandCredentialProblem(CommandCredentialConfig.Rule rule, String detail) {}
+    private final Map<String, CommandCredentialProblem> commandCredentialProblems =
+            new ConcurrentHashMap<>();
     private long authNotificationSentMs;
     private long authRevalidatedMs;
     private boolean authRevalidateInFlight;
@@ -199,12 +206,210 @@ public class MitmProxy {
     }
     private volatile ToolProxyRouting toolRouting = ToolProxyRouting.EMPTY;
     private volatile FileTime configLoadedAt = FileTime.fromMillis(System.currentTimeMillis());
+    private final FileStamp commandConfigLoadedStamp;
     private dev.incusspawn.incus.IncusClient incusClient;
+
+    record RelayTarget(
+            String connectHost,
+            int port,
+            boolean ssl,
+            boolean preserveOriginalHost,
+            boolean injectWebSocketCredentials
+    ) {}
 
     // Overridable for tests: upstream WebSocket connections default to port 443 + TLS
     int upstreamWsPort = 443;
     boolean upstreamWsSsl = true;
+    int upstreamApiPort = 443;
+    boolean upstreamApiSsl = true;
     boolean upstreamTrustAll = false;
+
+    static RelayTarget httpRelayTarget(String domain) {
+        if (ProxyConfig.isBbGatewayDomain(domain)) {
+            return new RelayTarget(ProxyConfig.BB_GATEWAY_HOST, ProxyConfig.BB_GATEWAY_PORT,
+                    false, true, false);
+        }
+        return new RelayTarget(domain, 443, true, false, true);
+    }
+
+    RelayTarget webSocketRelayTarget(String domain) {
+        if (ProxyConfig.isBbGatewayDomain(domain)) {
+            return new RelayTarget(ProxyConfig.BB_GATEWAY_HOST, ProxyConfig.BB_GATEWAY_PORT,
+                    false, true, false);
+        }
+        return new RelayTarget(domain, upstreamWsPort, upstreamWsSsl, false, true);
+    }
+
+    static List<String> inboundWebSocketSubProtocols() {
+        return List.of(ProxyConfig.BB_GATEWAY_SUBPROTOCOL);
+    }
+
+    record GatewayRequestFraming(
+            long contentLength,
+            boolean contentLengthPresent,
+            boolean chunked,
+            int rejectionStatus,
+            String rejectionMessage
+    ) {
+        boolean accepted() {
+            return rejectionStatus == 0;
+        }
+
+        static GatewayRequestFraming accepted(long contentLength,
+                                               boolean contentLengthPresent,
+                                               boolean chunked) {
+            return new GatewayRequestFraming(contentLength, contentLengthPresent,
+                    chunked, 0, null);
+        }
+
+        static GatewayRequestFraming rejected(int status, String message) {
+            return new GatewayRequestFraming(0, false, false, status, message);
+        }
+    }
+
+    /**
+     * Validate and normalize request framing before opening the privileged loopback
+     * relay. Ambiguous HTTP framing must not be interpreted differently by Vert.x
+     * and the bb host daemon.
+     */
+    static GatewayRequestFraming gatewayRequestFraming(io.vertx.core.MultiMap headers) {
+        var contentLengthHeaders = headers.getAll("Content-Length");
+        var transferEncodingHeaders = headers.getAll("Transfer-Encoding");
+        if (!contentLengthHeaders.isEmpty() && !transferEncodingHeaders.isEmpty()) {
+            return GatewayRequestFraming.rejected(400, "Conflicting request framing");
+        }
+
+        if (!transferEncodingHeaders.isEmpty()) {
+            var encodings = new ArrayList<String>();
+            for (var value : transferEncodingHeaders) {
+                for (var encoding : value.split(",", -1)) {
+                    var normalized = encoding.trim();
+                    if (normalized.isEmpty()) {
+                        return GatewayRequestFraming.rejected(400,
+                                "Malformed Transfer-Encoding");
+                    }
+                    encodings.add(normalized);
+                }
+            }
+            if (encodings.size() != 1 || !"chunked".equalsIgnoreCase(encodings.getFirst())) {
+                return GatewayRequestFraming.rejected(400,
+                        "Unsupported Transfer-Encoding");
+            }
+            return GatewayRequestFraming.accepted(0, false, true);
+        }
+
+        if (contentLengthHeaders.isEmpty()) {
+            return GatewayRequestFraming.accepted(0, false, false);
+        }
+
+        Long contentLength = null;
+        for (var value : contentLengthHeaders) {
+            for (var item : value.split(",", -1)) {
+                var normalized = item.trim();
+                if (normalized.isEmpty()
+                        || !normalized.chars().allMatch(c -> c >= '0' && c <= '9')) {
+                    return GatewayRequestFraming.rejected(400, "Malformed Content-Length");
+                }
+                final long parsed;
+                try {
+                    parsed = Long.parseLong(normalized);
+                } catch (NumberFormatException e) {
+                    return GatewayRequestFraming.rejected(400, "Malformed Content-Length");
+                }
+                if (contentLength != null && contentLength != parsed) {
+                    return GatewayRequestFraming.rejected(400,
+                            "Conflicting Content-Length values");
+                }
+                contentLength = parsed;
+            }
+        }
+
+        if (contentLength == null) {
+            return GatewayRequestFraming.rejected(400, "Malformed Content-Length");
+        }
+        if (contentLength > BB_GATEWAY_MAX_BODY_BYTES) {
+            return GatewayRequestFraming.rejected(413, "Request body too large");
+        }
+        return GatewayRequestFraming.accepted(contentLength, true, false);
+    }
+
+    static final class GatewayBodyLimit {
+        private long acceptedBytes;
+
+        boolean tryAccept(int bytes) {
+            if (bytes < 0) throw new IllegalArgumentException("bytes must be non-negative");
+            if (acceptedBytes > BB_GATEWAY_MAX_BODY_BYTES - bytes) return false;
+            acceptedBytes += bytes;
+            return true;
+        }
+
+        long acceptedBytes() {
+            return acceptedBytes;
+        }
+    }
+
+    static String requestLogTarget(String domain, String uri) {
+        if (ProxyConfig.isBbGatewayDomain(domain)) return ProxyConfig.BB_GATEWAY_DOMAIN;
+        return domain + (uri != null ? uri : "");
+    }
+
+    private static String safeRelayError(String domain, Throwable error) {
+        if (ProxyConfig.isBbGatewayDomain(domain)) return "details omitted";
+        var message = error.getMessage();
+        return message != null ? message : error.getClass().getSimpleName();
+    }
+
+    private static String gatewayForwardUri(String path, String query) {
+        var uri = path == null || path.isEmpty() ? "/" : path;
+        return query == null || query.isEmpty() ? uri : uri + "?" + query;
+    }
+
+    private static final class SerializedWebSocketWriter {
+        private final io.vertx.core.http.WebSocketBase destination;
+        private Future<Void> tail = Future.succeededFuture();
+
+        private SerializedWebSocketWriter(io.vertx.core.http.WebSocketBase destination) {
+            this.destination = destination;
+        }
+
+        synchronized Future<Void> writeFrame(io.vertx.core.http.WebSocketFrame frame) {
+            return enqueue(() -> destination.writeFrame(frame));
+        }
+
+        synchronized Future<Void> writePing(Buffer data) {
+            return enqueue(() -> destination.writePing(data));
+        }
+
+        private Future<Void> enqueue(java.util.function.Supplier<Future<Void>> operation) {
+            tail = tail.compose(ignored -> destination.isClosed()
+                    ? Future.failedFuture("WebSocket closed") : operation.get());
+            return tail;
+        }
+
+        boolean isClosed() {
+            return destination.isClosed();
+        }
+    }
+
+    private static void forwardGatewayFrames(
+            io.vertx.core.http.WebSocketBase source,
+            SerializedWebSocketWriter destination,
+            io.vertx.core.Handler<Throwable> failureHandler) {
+        source.frameHandler(frame -> {
+            if (!frame.isText() && !frame.isBinary() && !frame.isContinuation()) return;
+            if (destination.isClosed()) return;
+
+            // Admit one frame at a time. Waiting for the asynchronous write before
+            // resuming the source provides backpressure and keeps continuation
+            // frames serialized with every other data frame in this direction.
+            source.pause();
+            destination.writeFrame(frame)
+                    .onSuccess(ignored -> {
+                        if (!source.isClosed() && !destination.isClosed()) source.resume();
+                    })
+                    .onFailure(failureHandler);
+        });
+    }
 
     void overrideDns(String host, String ip) {
         dns.put(host, DnsEntry.resolved(ip));
@@ -212,14 +417,29 @@ public class MitmProxy {
 
     public MitmProxy(Vertx vertx, String bindAddress, int mitmPort, int healthPort,
                      String healthBindAddress, ProxyCredentials credentials) {
+        this(vertx, bindAddress, mitmPort, healthPort, healthBindAddress, credentials,
+                CommandCredentialConfig.disabled());
+    }
+
+    public MitmProxy(Vertx vertx, String bindAddress, int mitmPort, int healthPort,
+                     String healthBindAddress, ProxyCredentials credentials,
+                     CommandCredentialConfig commandCredentials) {
         this.vertx = vertx;
         this.bindAddress = bindAddress;
         this.healthBindAddress = healthBindAddress;
         this.mitmPort = mitmPort;
         this.healthPort = healthPort;
         this.credentials = credentials;
+        this.commandCredentials = commandCredentials;
+        if (vertx != null) {
+            for (var rule : commandCredentials.rules()) {
+                commandCredentialBrokers.put(rule.id(),
+                        new CommandCredentialBroker(vertx, rule));
+            }
+        }
         applyToolProxies(credentials.toolProxies());
         this.configLoadedAt = FileTime.fromMillis(System.currentTimeMillis());
+        this.commandConfigLoadedStamp = fileStamp(CommandCredentialConfig.configFile());
     }
 
     public void setDnsConfigured(boolean configured) {
@@ -238,6 +458,10 @@ public class MitmProxy {
         this.debugLog = debugLog;
     }
 
+    void setCommandCredentialBroker(String ruleId, CommandCredentialBroker broker) {
+        commandCredentialBrokers.put(ruleId, broker);
+    }
+
     private void applyToolProxies(List<ResolvedToolProxy> proxies) {
         var exact = new java.util.LinkedHashMap<String, ResolvedToolProxy>();
         var wildcards = new ArrayList<Map.Entry<String, ResolvedToolProxy>>();
@@ -248,6 +472,7 @@ public class MitmProxy {
             if (tp.auth() != null && "anthropic".equals(tp.auth().getType())) continue;
 
             var domain = tp.domain();
+            rejectCommandCredentialCollision(domain);
             if (domain.startsWith("*.")) {
                 var suffix = domain.substring(1); // ".example.com"
                 var firstForSuffix = wildcards.stream()
@@ -276,11 +501,27 @@ public class MitmProxy {
         wildcards.sort(Comparator.<Map.Entry<String, ResolvedToolProxy>, Integer>comparing(
                 e -> e.getKey().length()).reversed());
 
+        extraDomains.addAll(commandCredentials.hosts());
         this.toolRouting = new ToolProxyRouting(
                 Map.copyOf(exact),
                 List.copyOf(wildcards),
                 ProxyConfig.interceptedDomains(extraDomains),
                 List.copyOf(suffixSet));
+    }
+
+    private void rejectCommandCredentialCollision(String toolDomain) {
+        if (toolDomain.startsWith("*.")) {
+            var suffix = toolDomain.substring(1);
+            for (var host : commandCredentials.hosts()) {
+                if (host.endsWith(suffix)) {
+                    throw new IllegalStateException("command credential host '" + host
+                            + "' collides with tool proxy route '" + toolDomain + "'");
+                }
+            }
+        } else if (commandCredentials.find(toolDomain) != null) {
+            throw new IllegalStateException("command credential host '" + toolDomain
+                    + "' collides with a tool proxy route");
+        }
     }
 
     ResolvedToolProxy findToolProxy(String domain) {
@@ -312,7 +553,8 @@ public class MitmProxy {
                 ProxyConfig.DEFAULT_MITM_PORT,
                 ProxyConfig.DEFAULT_HEALTH_PORT,
                 gatewayIp,
-                ProxyCredentials.fromConfig(dev.incusspawn.config.SpawnConfig.load()));
+                ProxyCredentials.fromConfig(dev.incusspawn.config.SpawnConfig.load()),
+                CommandCredentialConfig.loadStrict());
     }
 
     // --- Lifecycle ---
@@ -351,16 +593,17 @@ public class MitmProxy {
     /**
      * Reload configuration and certificates from disk. Re-reads {@code config.yaml}
      * for credential changes and re-loads the CA (re-minting leaf certs if the CA key
-     * changed). Thread-safe: in-flight requests complete with the old state; new
-     * connections pick up the new certs and credentials.
+     * changed). Command credential rules are startup-only and remain unchanged.
+     * Thread-safe: in-flight requests complete with the old state; new connections
+     * pick up the new ordinary credentials and certificates.
      */
     public synchronized void reload() {
         ProxyLog.info("Reloading configuration and certificates");
         System.out.println("Reloading configuration...");
         try {
             var newCreds = ProxyCredentials.fromConfig(dev.incusspawn.config.SpawnConfig.load());
-            credentials = newCreds;
             applyToolProxies(newCreds.toolProxies());
+            credentials = newCreds;
             invalidateVertexToken();
             var jksBuffer = buildKeyStoreBuffer();
             if (mitmServer != null) {
@@ -415,7 +658,8 @@ public class MitmProxy {
                 .setIdleTimeoutUnit(TimeUnit.SECONDS)
                 .setAlpnVersions(List.of(HttpVersion.HTTP_1_1))
                 .setMaxWebSocketFrameSize(1024 * 1024)
-                .setMaxWebSocketMessageSize(16 * 1024 * 1024);
+                .setMaxWebSocketMessageSize(16 * 1024 * 1024)
+                .setWebSocketSubProtocols(inboundWebSocketSubProtocols());
 
         // Upstream HTTPS client with connection pooling.
         // GraalVM native images don't embed the build-time trust store reliably
@@ -454,6 +698,10 @@ public class MitmProxy {
         for (int attempt = 1; ; attempt++) {
             mitmServer = vertx.createHttpServer(serverOptions);
             mitmServer.exceptionHandler(err -> {
+                if (isMalformedHttpRequest(err)) {
+                    ProxyLog.warn("Rejected malformed HTTP request");
+                    return;
+                }
                 if (isBenignConnectionError(err)) {
                     // Clients (containers) drop connections abruptly all the time —
                     // process exit, timeouts, TLS aborts. A full stack trace per RST
@@ -464,6 +712,7 @@ public class MitmProxy {
                 System.err.println("MITM server error: " + err.getMessage());
                 err.printStackTrace(System.err);
             });
+            mitmServer.invalidRequestHandler(this::routeInvalidRequest);
             mitmServer.requestHandler(this::routeRequest);
             mitmServer.webSocketHandler(this::routeWebSocket);
             try {
@@ -577,7 +826,29 @@ public class MitmProxy {
         return false;
     }
 
+    private static boolean isMalformedHttpRequest(Throwable err) {
+        Throwable cause = err;
+        while (cause != null) {
+            var className = cause.getClass().getName();
+            if (className.startsWith("io.netty.handler.codec.http.")
+                    || cause instanceof io.netty.handler.codec.TooLongFrameException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
     // --- Request routing ---
+
+    private void routeInvalidRequest(HttpServerRequest clientReq) {
+        var domain = extractDomain(clientReq);
+        if (ProxyConfig.isBbGatewayDomain(domain)) {
+            rejectGatewayRequest(clientReq, 400, "Malformed request framing");
+        } else {
+            HttpServerRequest.DEFAULT_INVALID_REQUEST_HANDLER.handle(clientReq);
+        }
+    }
 
     private void routeRequest(HttpServerRequest clientReq) {
         try {
@@ -587,7 +858,11 @@ public class MitmProxy {
                 return;
             }
 
-            if (REGISTRY_DOMAINS.contains(domain)) {
+            if (ProxyConfig.isBbGatewayDomain(domain)) {
+                relayGatewayRequest(clientReq);
+            } else if (commandCredentials.find(domain) != null) {
+                handleApiRequest(clientReq, domain);
+            } else if (REGISTRY_DOMAINS.contains(domain)) {
                 handleRegistryRequest(clientReq, domain);
             } else if (MAVEN_DOMAINS.contains(domain)) {
                 handleMavenRequest(clientReq, domain);
@@ -604,9 +879,10 @@ public class MitmProxy {
             }
         } catch (Exception e) {
             var domain = extractDomain(clientReq);
-            var path = clientReq.path();
-            System.err.println("Unexpected error handling request to " + domain + path + ": " + e.getMessage());
-            e.printStackTrace(System.err);
+            var target = requestLogTarget(domain, clientReq.path());
+            System.err.println("Unexpected error handling request to " + target + ": "
+                    + safeRelayError(domain, e));
+            if (!ProxyConfig.isBbGatewayDomain(domain)) e.printStackTrace(System.err);
             sendError(clientReq.response(), 502, "Internal proxy error");
         }
     }
@@ -635,28 +911,36 @@ public class MitmProxy {
     }
 
     private void handleWebSocketUpgrade(ServerWebSocket clientWs, String domain) {
+        if (commandCredentials.find(domain) != null) {
+            clientWs.reject(501);
+            return;
+        }
+        var target = webSocketRelayTarget(domain);
+        var bbGateway = ProxyConfig.isBbGatewayDomain(domain);
+        if (bbGateway && hasBrowserWebSocketHeaders(clientWs.headers())) {
+            clientWs.reject(403);
+            return;
+        }
         var wsOptions = new WebSocketConnectOptions()
-                .setHost(domain)
-                .setPort(upstreamWsPort)
-                .setSsl(upstreamWsSsl)
-                .setURI(clientWs.uri());
+                .setHost(target.connectHost())
+                .setPort(target.port())
+                .setSsl(target.ssl())
+                .setAllowOriginHeader(!bbGateway)
+                .setURI(bbGateway
+                        ? gatewayForwardUri(clientWs.path(), clientWs.query())
+                        : clientWs.uri());
 
-        for (var entry : clientWs.headers()) {
-            var key = entry.getKey().toLowerCase(java.util.Locale.ROOT);
-            if (!key.startsWith("sec-websocket") && !key.equals("connection")
-                    && !key.equals("upgrade") && !key.equals("host")) {
-                wsOptions.addHeader(entry.getKey(), entry.getValue());
-            }
+        copyWebSocketHandshake(clientWs.headers(), wsOptions, target);
+        if (bbGateway && wsOptions.getSubProtocols().isEmpty()
+                && clientWs.subProtocol() != null) {
+            // Vert.x removes the negotiated protocol from the exposed handshake
+            // headers, so preserve it explicitly on the loopback leg.
+            wsOptions.addSubProtocol(clientWs.subProtocol());
         }
 
-        var protocols = clientWs.headers().get("Sec-WebSocket-Protocol");
-        if (protocols != null && !protocols.isBlank()) {
-            for (var p : protocols.split(",")) {
-                wsOptions.addSubProtocol(p.trim());
-            }
+        if (target.injectWebSocketCredentials()) {
+            injectWebSocketAuth(wsOptions, domain);
         }
-
-        injectWebSocketAuth(wsOptions, domain);
 
         // Pause the client socket so frames arriving before the upstream
         // connection is ready are buffered, not dropped.
@@ -674,8 +958,22 @@ public class MitmProxy {
             }
 
             if (ProxyLog.isDebugEnabled()) {
-                ProxyLog.debug("WebSocket connected: " + domain + clientWs.uri());
+                ProxyLog.debug("WebSocket connected: "
+                        + requestLogTarget(domain, clientWs.uri()));
             }
+
+            SerializedWebSocketWriter toUpstream = bbGateway
+                    ? new SerializedWebSocketWriter(upstreamWs) : null;
+            SerializedWebSocketWriter toClient = bbGateway
+                    ? new SerializedWebSocketWriter(clientWs) : null;
+            io.vertx.core.Handler<Throwable> gatewayWriteFailure = err -> {
+                if (!isBenignConnectionError(err)) {
+                    System.err.println("WebSocket relay error (" + domain + "): "
+                            + safeRelayError(domain, err));
+                }
+                if (!clientWs.isClosed()) clientWs.close();
+                if (!upstreamWs.isClosed()) upstreamWs.close();
+            };
 
             // Periodic pings on both legs to prevent idle timeouts.
             // Upstream pings prevent NAT/firewall timeouts during long AI
@@ -684,27 +982,42 @@ public class MitmProxy {
             // flows on the client leg (e.g. while the model is reasoning).
             var upstreamPingTimer = vertx.setPeriodic(30_000, id ->  {
                 if (!upstreamWs.isClosed()) {
-                    upstreamWs.writePing(Buffer.buffer("keepalive"));
+                    if (bbGateway) {
+                        toUpstream.writePing(Buffer.buffer("keepalive"))
+                                .onFailure(gatewayWriteFailure);
+                    } else {
+                        upstreamWs.writePing(Buffer.buffer("keepalive"));
+                    }
                 }
             });
             var clientPingTimer = vertx.setPeriodic(30_000, id -> {
                 if (!clientWs.isClosed()) {
-                    clientWs.writePing(Buffer.buffer("keepalive"));
+                    if (bbGateway) {
+                        toClient.writePing(Buffer.buffer("keepalive"))
+                                .onFailure(gatewayWriteFailure);
+                    } else {
+                        clientWs.writePing(Buffer.buffer("keepalive"));
+                    }
                 }
             });
 
-            clientWs.frameHandler(frame -> {
-                if ((frame.isText() || frame.isBinary() || frame.isContinuation())
-                        && !upstreamWs.isClosed()) {
-                    upstreamWs.writeFrame(frame);
-                }
-            });
-            upstreamWs.frameHandler(frame -> {
-                if ((frame.isText() || frame.isBinary() || frame.isContinuation())
-                        && !clientWs.isClosed()) {
-                    clientWs.writeFrame(frame);
-                }
-            });
+            if (bbGateway) {
+                forwardGatewayFrames(clientWs, toUpstream, gatewayWriteFailure);
+                forwardGatewayFrames(upstreamWs, toClient, gatewayWriteFailure);
+            } else {
+                clientWs.frameHandler(frame -> {
+                    if ((frame.isText() || frame.isBinary() || frame.isContinuation())
+                            && !upstreamWs.isClosed()) {
+                        upstreamWs.writeFrame(frame);
+                    }
+                });
+                upstreamWs.frameHandler(frame -> {
+                    if ((frame.isText() || frame.isBinary() || frame.isContinuation())
+                            && !clientWs.isClosed()) {
+                        clientWs.writeFrame(frame);
+                    }
+                });
+            }
 
             clientWs.closeHandler(v -> {
                 vertx.cancelTimer(upstreamPingTimer);
@@ -735,7 +1048,8 @@ public class MitmProxy {
                 vertx.cancelTimer(upstreamPingTimer);
                 vertx.cancelTimer(clientPingTimer);
                 if (!isBenignConnectionError(err)) {
-                    System.err.println("WebSocket client error (" + domain + "): " + err.getMessage());
+                    System.err.println("WebSocket client error (" + domain + "): "
+                            + safeRelayError(domain, err));
                 }
                 if (!upstreamWs.isClosed()) upstreamWs.close();
             });
@@ -743,16 +1057,45 @@ public class MitmProxy {
                 vertx.cancelTimer(upstreamPingTimer);
                 vertx.cancelTimer(clientPingTimer);
                 if (!isBenignConnectionError(err)) {
-                    System.err.println("WebSocket upstream error (" + domain + "): " + err.getMessage());
+                    System.err.println("WebSocket upstream error (" + domain + "): "
+                            + safeRelayError(domain, err));
                 }
                 if (!clientWs.isClosed()) clientWs.close();
             });
 
             clientWs.resume();
         }).onFailure(err -> {
-            System.err.println("WebSocket upstream connect failed (" + domain + "): " + err.getMessage());
+            System.err.println("WebSocket upstream connect failed (" + domain + "): "
+                    + safeRelayError(domain, err));
             if (!clientWs.isClosed()) clientWs.close((short) 1011, "Upstream connection failed");
         });
+    }
+
+    static boolean hasBrowserWebSocketHeaders(io.vertx.core.MultiMap headers) {
+        return headers.contains("Origin") || headers.contains("Sec-Fetch-Site");
+    }
+
+    static void copyWebSocketHandshake(io.vertx.core.MultiMap headers,
+                                       WebSocketConnectOptions options,
+                                       RelayTarget target) {
+        for (var entry : headers) {
+            var key = entry.getKey().toLowerCase(java.util.Locale.ROOT);
+            if (!key.startsWith("sec-websocket") && !key.equals("connection")
+                    && !key.equals("upgrade") && !key.equals("host")) {
+                options.addHeader(entry.getKey(), entry.getValue());
+            }
+        }
+
+        if (target.preserveOriginalHost()) {
+            options.putHeader("Host", headers.get("Host"));
+        }
+
+        var protocols = headers.get("Sec-WebSocket-Protocol");
+        if (protocols != null && !protocols.isBlank()) {
+            for (var protocol : protocols.split(",")) {
+                options.addSubProtocol(protocol.trim());
+            }
+        }
     }
 
     private void injectWebSocketAuth(WebSocketConnectOptions options, String domain) {
@@ -775,21 +1118,100 @@ public class MitmProxy {
         }
     }
 
-    // --- API requests (Anthropic, GitHub) ---
+    // --- API requests (Anthropic, tool proxies, and command credentials) ---
+
+    record CommandCredentialCarriers(boolean bearerAuthorization, boolean rawHeader) {}
+
+    static CommandCredentialCarriers commandCredentialCarriers(
+            CommandCredentialConfig.Rule rule, io.vertx.core.MultiMap headers) {
+        var bearer = rule.carriers().bearer();
+        var authorization = headers.getAll("Authorization");
+        var hasBearer = !authorization.isEmpty();
+        if (hasBearer && (bearer == null || authorization.size() != 1
+                || !("Bearer " + bearer.placeholder()).equals(authorization.getFirst()))) {
+            return null;
+        }
+
+        var raw = rule.carriers().header();
+        var rawValues = raw == null ? List.<String>of() : headers.getAll(raw.name());
+        var hasRaw = !rawValues.isEmpty();
+        if (hasRaw && (rawValues.size() != 1
+                || !raw.placeholder().equals(rawValues.getFirst()))) {
+            return null;
+        }
+        return hasBearer || hasRaw
+                ? new CommandCredentialCarriers(hasBearer, hasRaw) : null;
+    }
 
     private void handleApiRequest(HttpServerRequest clientReq, String domain) {
-        clientReq.body().onSuccess(bodyBuffer -> {
-            try {
-                handleApiRequestWithBody(clientReq, domain, bodyBuffer);
-            } catch (Exception e) {
-                System.err.println("API request error: " + e.getMessage());
-                e.printStackTrace(System.err);
-                sendError(clientReq.response(), 502, "Proxy error");
-            }
-        }).onFailure(err -> {
-            System.err.println("Failed to read API request body: " + err.getMessage());
-            sendError(clientReq.response(), 502, "Proxy error");
+        var commandRule = commandCredentials.find(domain);
+        if (commandRule != null && commandCredentialCarriers(
+                commandRule, clientReq.headers()) == null) {
+            sendCommandCredentialClientError(clientReq.response(), 400);
+            return;
+        }
+        if (commandRule != null
+                && declaredBodyTooLarge(clientReq, commandRule.bodyLimitBytes())) {
+            sendCommandCredentialClientError(clientReq.response(), 413);
+            return;
+        }
+
+        if (commandRule != null) {
+            readBoundedCommandCredentialBody(clientReq, domain, commandRule);
+            return;
+        }
+
+        clientReq.body().onSuccess(bodyBuffer -> handleApiRequestBody(clientReq, domain, bodyBuffer))
+                .onFailure(err -> {
+                    System.err.println("Failed to read API request body: " + err.getMessage());
+                    sendError(clientReq.response(), 502, "Proxy error");
+                });
+    }
+
+    private void readBoundedCommandCredentialBody(HttpServerRequest clientReq, String domain,
+                                                   CommandCredentialConfig.Rule rule) {
+        var body = Buffer.buffer();
+        var rejected = new boolean[1];
+        clientReq.exceptionHandler(error -> {
+            if (rejected[0]) return;
+            rejected[0] = true;
+            System.err.println("Failed to read command-credential request body: "
+                    + error.getMessage());
+            sendCommandCredentialClientError(clientReq.response(), 400);
         });
+        clientReq.handler(chunk -> {
+            if (rejected[0]) return;
+            if (body.length() > rule.bodyLimitBytes() - chunk.length()) {
+                rejected[0] = true;
+                sendCommandCredentialClientError(clientReq.response(), 413);
+                return;
+            }
+            body.appendBuffer(chunk);
+        });
+        clientReq.endHandler(ignored -> {
+            if (!rejected[0]) handleApiRequestBody(clientReq, domain, body);
+        });
+    }
+
+    private void handleApiRequestBody(HttpServerRequest clientReq, String domain,
+                                      Buffer bodyBuffer) {
+        try {
+            handleApiRequestWithBody(clientReq, domain, bodyBuffer);
+        } catch (Exception e) {
+            System.err.println("API request error: " + e.getMessage());
+            e.printStackTrace(System.err);
+            sendError(clientReq.response(), 502, "Proxy error");
+        }
+    }
+
+    private static boolean declaredBodyTooLarge(HttpServerRequest request, int limit) {
+        var contentLength = request.getHeader("Content-Length");
+        if (contentLength == null) return false;
+        try {
+            return Long.parseLong(contentLength) > limit;
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 
     private void handleApiRequestWithBody(HttpServerRequest clientReq, String domain,
@@ -801,7 +1223,7 @@ public class MitmProxy {
         String originalDump = null;
         byte[] originalBody = null;
 
-        if (debugLog != null) {
+        if (debugLog != null && commandCredentials.find(domain) == null) {
             originalDump = dumpRequest(clientReq);
             originalBody = bodyBytes;
         }
@@ -810,7 +1232,8 @@ public class MitmProxy {
         var uri = clientReq.uri();
         var requestOptions = new RequestOptions()
                 .setMethod(clientReq.method())
-                .setPort(443);
+                .setPort(upstreamApiPort)
+                .setSsl(upstreamApiSsl);
 
         if (credentials.useVertex() && ANTHROPIC_DOMAINS.contains(domain) && path != null) {
             if (path.startsWith("/v1/projects/")) {
@@ -838,9 +1261,15 @@ public class MitmProxy {
         }
         requestOptions.setHost(upstreamHost).setURI(uri);
 
-        sendApiRequest(clientReq, requestOptions, upstreamHost, domain,
-                bodyBytes, isVertexRequest, bodyRewritten, false,
-                originalDump, originalBody);
+        var commandRule = commandCredentials.find(domain);
+        if (commandRule != null) {
+            sendCommandCredentialApiRequest(
+                    clientReq, requestOptions, bodyBytes, false, commandRule);
+        } else {
+            sendApiRequest(clientReq, requestOptions, upstreamHost, domain,
+                    bodyBytes, isVertexRequest, bodyRewritten, false,
+                    originalDump, originalBody);
+        }
     }
 
     private Future<HttpClientRequest> requestWithAsyncDns(RequestOptions options) {
@@ -871,6 +1300,91 @@ public class MitmProxy {
         return entry.isValid()
                 ? Future.succeededFuture(entry.ip())
                 : entry.inflight();
+    }
+
+    private void sendCommandCredentialApiRequest(
+            HttpServerRequest clientReq, RequestOptions requestOptions,
+            byte[] bodyBytes, boolean isRetry, CommandCredentialConfig.Rule rule) {
+        var broker = commandCredentialBrokers.get(rule.id());
+        if (broker == null) {
+            setCommandCredentialProblem(rule, "credential broker is unavailable");
+            sendCommandCredentialClientError(clientReq.response(), 502);
+            return;
+        }
+        broker.acquire()
+                .onSuccess(lease -> sendCommandCredentialApiRequestWithLease(
+                        clientReq, requestOptions, bodyBytes, isRetry, rule, broker, lease))
+                .onFailure(error -> {
+                    setCommandCredentialProblem(rule, commandCredentialBrokerProblem(error));
+                    sendCommandCredentialClientError(clientReq.response(), 502);
+                });
+    }
+
+    private void sendCommandCredentialApiRequestWithLease(
+            HttpServerRequest clientReq, RequestOptions requestOptions,
+            byte[] bodyBytes, boolean isRetry, CommandCredentialConfig.Rule rule,
+            CommandCredentialBroker broker, CommandCredentialBroker.Lease lease) {
+        requestWithAsyncDns(new RequestOptions(requestOptions)).onSuccess(upReq -> {
+            copyRequestHeaders(clientReq, upReq, rule.host());
+            var carriers = commandCredentialCarriers(rule, clientReq.headers());
+            if (carriers == null) {
+                sendCommandCredentialClientError(clientReq.response(), 400);
+                return;
+            }
+            if (carriers.bearerAuthorization()) {
+                upReq.putHeader("Authorization", "Bearer " + lease.credential());
+            }
+            if (carriers.rawHeader()) {
+                upReq.putHeader(rule.carriers().header().name(), lease.credential());
+            }
+            upReq.putHeader("Content-Length", String.valueOf(bodyBytes.length));
+
+            upReq.send(Buffer.buffer(bodyBytes)).onSuccess(upResp -> {
+                if (upResp.statusCode() == 401) {
+                    broker.invalidate(lease);
+                    if (!isRetry) {
+                        upResp.body()
+                                .onSuccess(ignored -> sendCommandCredentialApiRequest(
+                                        clientReq, requestOptions, bodyBytes, true, rule))
+                                .onFailure(error -> sendCommandCredentialClientError(
+                                        clientReq.response(), 502));
+                        return;
+                    }
+                    setCommandCredentialProblem(rule,
+                            "upstream rejected the host credential (HTTP 401)");
+                } else if (upResp.statusCode() >= 200 && upResp.statusCode() < 400) {
+                    clearCommandCredentialProblem(rule.id());
+                }
+
+                relayApiResponse(clientReq, upResp, rule.host(), rule.host(),
+                        bodyBytes, false, null, null);
+            }).onFailure(error -> {
+                System.err.println("Upstream send error (" + rule.host()
+                        + "): " + error.getMessage());
+                sendError(clientReq.response(), 502, "Upstream error");
+            });
+        }).onFailure(error -> {
+            System.err.println("Upstream connect error (" + rule.host()
+                    + "): " + error.getMessage());
+            sendError(clientReq.response(), 502, "Upstream connection failed");
+        });
+    }
+
+    private static String commandCredentialBrokerProblem(Throwable error) {
+        var reason = error.getMessage();
+        return reason == null || reason.isBlank() ? "credential command failed" : reason;
+    }
+
+    private void sendCommandCredentialClientError(HttpServerResponse response, int status) {
+        if (response.ended() || response.closed()) return;
+        if (response.headWritten()) {
+            response.reset();
+            return;
+        }
+        response.headers().remove("Content-Encoding");
+        response.putHeader("Cache-Control", "no-store");
+        response.putHeader("Content-Length", "0");
+        response.setStatusCode(status).end();
     }
 
     private void sendApiRequest(HttpServerRequest clientReq, RequestOptions requestOptions,
@@ -931,7 +1445,7 @@ public class MitmProxy {
         clientResp.setStatusMessage(upResp.statusMessage());
         copyResponseHeaders(upResp, clientResp);
 
-        if (debugLog != null) {
+        if (debugLog != null && originalDump != null) {
             upResp.body().onSuccess(respBody -> {
                 var respBytes = respBody.getBytes();
                 var responseDump = dumpResponse(upResp);
@@ -1634,6 +2148,231 @@ public class MitmProxy {
         });
     }
 
+    // --- bb gateway relay ---
+
+    private void relayGatewayRequest(HttpServerRequest clientReq) {
+        clientReq.pause();
+        if (clientReq.getHeader("Host") == null) {
+            rejectGatewayRequest(clientReq, 400, "Missing Host header");
+            return;
+        }
+        if (clientReq.decoderResult().isFailure()) {
+            rejectGatewayRequest(clientReq, 400, "Malformed request framing");
+            return;
+        }
+        var framing = gatewayRequestFraming(clientReq.headers());
+        if (!framing.accepted()) {
+            rejectGatewayRequest(clientReq, framing.rejectionStatus(),
+                    framing.rejectionMessage());
+            return;
+        }
+
+        var options = new RequestOptions()
+                .setMethod(clientReq.method())
+                .setHost(ProxyConfig.BB_GATEWAY_HOST)
+                .setPort(ProxyConfig.BB_GATEWAY_PORT)
+                .setSsl(false)
+                .setServer(SocketAddress.inetSocketAddress(
+                        ProxyConfig.BB_GATEWAY_PORT, ProxyConfig.BB_GATEWAY_HOST))
+                .setURI(gatewayForwardUri(clientReq.path(), clientReq.query()));
+
+        upstreamClient.request(options).onSuccess(upReq -> {
+            copyGatewayRequestHeaders(clientReq, upReq, framing);
+            new GatewayHttpRelay(clientReq, upReq, framing).start();
+        }).onFailure(err -> {
+            ProxyLog.warn("bb gateway connection failed");
+            rejectGatewayRequest(clientReq, 502, "Gateway unavailable");
+        });
+    }
+
+    private static void copyGatewayRequestHeaders(HttpServerRequest clientReq,
+                                                   HttpClientRequest upReq,
+                                                   GatewayRequestFraming framing) {
+        upReq.headers().setAll(clientReq.headers());
+        var connectionHeaders = clientReq.headers().getAll("Connection");
+        for (var value : connectionHeaders) {
+            for (var token : value.split(",")) {
+                upReq.headers().remove(token.trim());
+            }
+        }
+        upReq.headers().remove("Host");
+        upReq.headers().remove("Connection");
+        upReq.headers().remove("Proxy-Connection");
+        upReq.headers().remove("Keep-Alive");
+        upReq.headers().remove("Transfer-Encoding");
+        upReq.headers().remove("TE");
+        upReq.headers().remove("Trailer");
+        upReq.headers().remove("Upgrade");
+        upReq.headers().remove("Content-Length");
+        upReq.putHeader("Host", clientReq.getHeader("Host"));
+        if (framing.contentLengthPresent()) {
+            upReq.putHeader("Content-Length", String.valueOf(framing.contentLength()));
+        } else if (framing.chunked()) {
+            upReq.setChunked(true);
+        }
+    }
+
+    private static boolean isGatewayEventBatch(HttpServerRequest request) {
+        return request.method() == HttpMethod.POST
+                && "/internal/session/events".equals(request.uri());
+    }
+
+    private void rejectGatewayRequest(HttpServerRequest clientReq, int status, String message) {
+        clientReq.pause();
+        clientReq.handler(null);
+        clientReq.endHandler(null);
+        clientReq.exceptionHandler(null);
+        var response = clientReq.response();
+        if (response.ended() || response.closed()) return;
+        if (response.headWritten()) {
+            response.reset();
+            clientReq.connection().close();
+            return;
+        }
+        response.headers().remove("Content-Length");
+        response.headers().remove("Content-Encoding");
+        response.putHeader("Connection", "close");
+        if (status == 413 && isGatewayEventBatch(clientReq)) {
+            response.putHeader("Cache-Control", "no-store");
+            response.putHeader("Content-Type", "application/json");
+            response.setStatusCode(400).end(
+                    "{\"code\":\"invalid_request\","
+                            + "\"message\":\"Event batch exceeds the gateway's 16 MiB request limit.\"}")
+                    .onComplete(ignored -> clientReq.connection().close());
+            return;
+        }
+        response.setStatusCode(status).end(message)
+                .onComplete(ignored -> clientReq.connection().close());
+    }
+
+    private final class GatewayHttpRelay {
+        private final HttpServerRequest clientReq;
+        private final HttpServerResponse clientResp;
+        private final HttpClientRequest upReq;
+        private final GatewayRequestFraming framing;
+        private final GatewayBodyLimit bodyLimit = new GatewayBodyLimit();
+        private boolean failed;
+        private boolean requestEnded;
+        private boolean responseEnded;
+
+        private GatewayHttpRelay(HttpServerRequest clientReq, HttpClientRequest upReq,
+                                 GatewayRequestFraming framing) {
+            this.clientReq = clientReq;
+            this.clientResp = clientReq.response();
+            this.upReq = upReq;
+            this.framing = framing;
+        }
+
+        private void start() {
+            clientResp.closeHandler(ignored -> {
+                if (!responseEnded) abortForClosedClient();
+            });
+            upReq.exceptionHandler(err -> failUpstream("bb gateway request stream failed"));
+            upReq.response()
+                    .onSuccess(this::relayResponse)
+                    .onFailure(err -> failUpstream("bb gateway response failed"));
+
+            clientReq.exceptionHandler(err -> fail(400, "Malformed request body"));
+            clientReq.handler(this::relayRequestChunk);
+            clientReq.endHandler(ignored -> endUpstreamRequest());
+            if (clientReq.isEnded()) {
+                endUpstreamRequest();
+            } else {
+                clientReq.resume();
+            }
+        }
+
+        private void relayRequestChunk(Buffer chunk) {
+            if (failed || requestEnded) return;
+            if (!bodyLimit.tryAccept(chunk.length())) {
+                fail(413, "Request body too large");
+                return;
+            }
+
+            upReq.write(chunk).onFailure(err ->
+                    failUpstream("bb gateway request write failed"));
+            if (upReq.writeQueueFull()) {
+                clientReq.pause();
+                upReq.drainHandler(ignored -> {
+                    if (!failed && !requestEnded) clientReq.resume();
+                });
+            }
+        }
+
+        private void endUpstreamRequest() {
+            if (failed || requestEnded) return;
+            if (framing.contentLengthPresent()
+                    && bodyLimit.acceptedBytes() != framing.contentLength()) {
+                fail(400, "Malformed request body");
+                return;
+            }
+            requestEnded = true;
+            upReq.end().onFailure(err -> failUpstream("bb gateway request end failed"));
+        }
+
+        private void relayResponse(HttpClientResponse upResp) {
+            if (failed) {
+                upResp.request().reset();
+                return;
+            }
+            upResp.pause();
+            clientResp.setStatusCode(upResp.statusCode());
+            clientResp.setStatusMessage(upResp.statusMessage());
+            copyResponseHeaders(upResp, clientResp);
+
+            var status = upResp.statusCode();
+            var bodyAllowed = clientReq.method() != HttpMethod.HEAD
+                    && status != 204 && status != 304
+                    && (status < 100 || status >= 200);
+            if (upResp.getHeader("Content-Length") == null && bodyAllowed) {
+                clientResp.setChunked(true);
+            }
+
+            clientResp.exceptionHandler(err -> abortForClosedClient());
+            upResp.exceptionHandler(err -> failUpstream("bb gateway response stream failed"));
+            upResp.handler(chunk -> {
+                if (failed) return;
+                clientResp.write(chunk).onFailure(err -> abortForClosedClient());
+                if (clientResp.writeQueueFull()) {
+                    upResp.pause();
+                    clientResp.drainHandler(ignored -> {
+                        if (!failed && !responseEnded) upResp.resume();
+                    });
+                }
+            });
+            upResp.endHandler(ignored -> {
+                if (failed || responseEnded) return;
+                responseEnded = true;
+                clientResp.end().onFailure(err -> {
+                    upReq.reset();
+                    clientReq.pause();
+                });
+            });
+            upResp.resume();
+        }
+
+        private void failUpstream(String logMessage) {
+            if (failed) return;
+            ProxyLog.warn(logMessage);
+            fail(502, "Gateway relay failed");
+        }
+
+        private void abortForClosedClient() {
+            if (failed) return;
+            failed = true;
+            clientReq.pause();
+            upReq.reset();
+        }
+
+        private void fail(int status, String responseMessage) {
+            if (failed) return;
+            failed = true;
+            clientReq.pause();
+            upReq.reset();
+            rejectGatewayRequest(clientReq, status, responseMessage);
+        }
+    }
+
     // --- Generic relay (non-cacheable) ---
 
     /** Relay a non-cacheable request transparently to upstream. */
@@ -1648,14 +2387,23 @@ public class MitmProxy {
      */
     private void relayRequest(HttpServerRequest clientReq, String domain,
                                java.util.function.Consumer<HttpClientResponse> responseCallback) {
+        if (ProxyConfig.isBbGatewayDomain(domain)) {
+            relayGatewayRequest(clientReq);
+            return;
+        }
+        var target = httpRelayTarget(domain);
         var options = new RequestOptions()
                 .setMethod(clientReq.method())
-                .setHost(domain)
-                .setPort(443)
+                .setHost(target.connectHost())
+                .setPort(target.port())
+                .setSsl(target.ssl())
                 .setURI(clientReq.uri());
 
         requestWithAsyncDns(options).onSuccess(upReq -> {
-            copyRequestHeaders(clientReq, upReq, domain);
+            var hostHeader = target.preserveOriginalHost()
+                    ? clientReq.getHeader("Host") : domain;
+            copyRequestHeaders(clientReq, upReq,
+                    hostHeader != null ? hostHeader : domain);
 
             sendWithBody(clientReq, upReq).onSuccess(upResp -> {
                 if (responseCallback != null) {
@@ -1925,6 +2673,19 @@ public class MitmProxy {
         }
     }
 
+    void setCommandCredentialProblem(CommandCredentialConfig.Rule rule, String problem) {
+        var detail = authDetail(problem, "credential injection failed");
+        var previous = commandCredentialProblems.put(rule.id(),
+                new CommandCredentialProblem(rule, detail));
+        if (previous == null) {
+            System.err.println(rule.label() + ": " + detail);
+        }
+    }
+
+    void clearCommandCredentialProblem(String ruleId) {
+        commandCredentialProblems.remove(ruleId);
+    }
+
     /**
      * Record a failure found by the health-endpoint re-check.
      * <p>
@@ -2157,23 +2918,62 @@ public class MitmProxy {
 
     private void sendHealthResponse(HttpServerRequest req) {
         var info = BuildInfo.instance();
-        var err = authError;
+        var commandProblems = commandCredentialProblems.values().stream()
+                .sorted(Comparator.comparing(problem -> problem.rule().id()))
+                .toList();
+        var firstCommandProblem = commandProblems.isEmpty() ? null : commandProblems.getFirst();
+        var err = firstCommandProblem != null
+                ? firstCommandProblem.rule().label() + ": " + firstCommandProblem.detail()
+                : authError;
         var configDrifted = hasConfigChangedSinceLoad();
-        var body = "{\"status\":\"ok\""
-                + ",\"version\":\"" + info.version() + "\""
-                + ",\"gitSha\":\"" + info.gitSha() + "\""
-                + ",\"runtime\":\"" + escapeJson(info.runtime()) + "\""
-                + ",\"caFingerprint\":\"" + caFingerprint + "\""
-                + ",\"configDrifted\":" + configDrifted
-                + ",\"dnsConfigured\":" + dnsConfigured
-                + (err != null ? ",\"authError\":\"" + escapeJson(err) + "\"" : "")
-                + "}";
+        var body = new StringBuilder("{\"status\":\"ok\"")
+                .append(",\"version\":\"").append(info.version()).append("\"")
+                .append(",\"gitSha\":\"").append(info.gitSha()).append("\"")
+                .append(",\"runtime\":\"").append(escapeJson(info.runtime())).append("\"")
+                .append(",\"caFingerprint\":\"").append(caFingerprint).append("\"")
+                .append(",\"configDrifted\":").append(configDrifted)
+                .append(",\"dnsConfigured\":").append(dnsConfigured);
+        if (err != null) {
+            body.append(",\"authError\":\"").append(escapeJson(err)).append("\"");
+        }
+        if (!commandProblems.isEmpty()) {
+            body.append(",\"authProblems\":{\"commandCredentials\":[");
+            for (int i = 0; i < commandProblems.size(); i++) {
+                if (i > 0) body.append(',');
+                var problem = commandProblems.get(i);
+                body.append("{\"id\":\"").append(escapeJson(problem.rule().id()))
+                        .append("\",\"label\":\"").append(escapeJson(problem.rule().label()))
+                        .append("\",\"detail\":\"").append(escapeJson(problem.detail()))
+                        .append("\",\"remediation\":\"")
+                        .append(escapeJson(problem.rule().remediation())).append("\"}");
+            }
+            body.append("]}");
+        }
+        body.append('}');
         req.response()
                 .putHeader("Content-Type", "application/json")
-                .end(body);
+                .end(body.toString());
+    }
+
+    private record FileStamp(boolean exists, long size, long modifiedMillis,
+                             Set<java.nio.file.attribute.PosixFilePermission> permissions) {}
+
+    private static FileStamp fileStamp(Path file) {
+        var exists = Files.exists(file, java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        if (!exists) return new FileStamp(false, 0, 0, Set.of());
+        try {
+            return new FileStamp(true, Files.size(file),
+                    Files.getLastModifiedTime(file, java.nio.file.LinkOption.NOFOLLOW_LINKS).toMillis(),
+                    Files.getPosixFilePermissions(file, java.nio.file.LinkOption.NOFOLLOW_LINKS));
+        } catch (IOException | UnsupportedOperationException e) {
+            return new FileStamp(true, -1, -1, Set.of());
+        }
     }
 
     private boolean hasConfigChangedSinceLoad() {
+        if (!commandConfigLoadedStamp.equals(fileStamp(CommandCredentialConfig.configFile()))) {
+            return true;
+        }
         try {
             var configFile = dev.incusspawn.config.SpawnConfig.configDir().resolve("config.yaml");
             if (Files.exists(configFile)

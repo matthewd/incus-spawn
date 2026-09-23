@@ -16,10 +16,11 @@ class ImageDefTest {
     @Test
     void loadAllReturnsBuiltinImages() {
         var defs = ImageDef.loadAll();
-        assertTrue(defs.size() >= 3, "Should load at least 3 built-in images");
+        assertTrue(defs.size() >= 4, "Should load at least 4 built-in images");
         assertTrue(defs.containsKey("tpl-minimal"));
         assertTrue(defs.containsKey("tpl-dev"));
         assertTrue(defs.containsKey("tpl-java"));
+        assertTrue(defs.containsKey("tpl-bb"));
     }
 
     @Test
@@ -56,6 +57,88 @@ class ImageDefTest {
         assertEquals("tpl-dev", java.getParent());
         assertTrue(java.getPackages().contains("java-25-openjdk-devel"));
         assertTrue(java.getTools().stream().anyMatch(t -> "maven-3".equals(t.getName())));
+    }
+
+    @Test
+    void bbExtendsHardenedMinimalAndContainsBootstrapPrerequisites() {
+        var defs = ImageDef.loadAll();
+        var bb = defs.get("tpl-bb");
+
+        assertEquals("tpl-minimal", bb.getParent());
+        assertTrue(bb.getPackages().containsAll(List.of("git", "curl", "nodejs", "npm")));
+        assertTrue(bb.getTools().isEmpty(), "tpl-bb must not install credential-bearing providers");
+        assertFalse(bb.getSecurity().isSudo());
+        assertFalse(bb.getSecurity().isNestedContainers());
+        assertFalse(bb.getSecurity().isPermissiveCapabilities());
+    }
+
+    @Test
+    void builtInSecurityPoliciesAreEffective() {
+        var defs = ImageDef.loadAll();
+        var minimal = defs.get("tpl-minimal").getSecurity();
+        var dev = defs.get("tpl-dev").getSecurity();
+        var java = defs.get("tpl-java").getSecurity();
+
+        assertFalse(minimal.isSudo());
+        assertFalse(minimal.isNestedContainers());
+        assertFalse(minimal.isPermissiveCapabilities());
+        assertTrue(dev.isSudo());
+        assertTrue(dev.isNestedContainers());
+        assertTrue(dev.isPermissiveCapabilities());
+        assertTrue(java.isSudo(), "children inherit sudo");
+        assertTrue(java.isNestedContainers(), "children inherit nested-container support");
+        assertTrue(java.isPermissiveCapabilities(), "children inherit capability policy");
+    }
+
+    @Test
+    void securityFieldsInheritIndependentlyWithinDefinitionDirectory(@TempDir Path tempDir) throws Exception {
+        var imagesDir = tempDir.resolve("images");
+        Files.createDirectories(imagesDir);
+        Files.writeString(imagesDir.resolve("parent.yaml"), """
+                name: tpl-security-parent
+                parent: tpl-minimal
+                security:
+                  sudo: true
+                  nested-containers: true
+                """);
+        Files.writeString(imagesDir.resolve("child.yaml"), """
+                name: tpl-security-child
+                parent: tpl-security-parent
+                security:
+                  sudo: false
+                  permissive-capabilities: true
+                """);
+
+        var policy = ImageDef.loadAll(List.of(tempDir.toString()))
+                .get("tpl-security-child").getSecurity();
+
+        assertFalse(policy.isSudo(), "an explicit child value overrides its parent");
+        assertTrue(policy.isNestedContainers(), "an omitted child value inherits");
+        assertTrue(policy.isPermissiveCapabilities());
+    }
+
+    @Test
+    void parsesSecurityObject() throws Exception {
+        var def = ImageDef.parseYaml("""
+                name: tpl-secure
+                security:
+                  sudo: true
+                  nested-containers: true
+                  permissive-capabilities: false
+                """);
+
+        assertTrue(def.getSecurity().isSudo());
+        assertTrue(def.getSecurity().isNestedContainers());
+        assertFalse(def.getSecurity().isPermissiveCapabilities());
+    }
+
+    @Test
+    void rejectsUnknownSecurityField() {
+        assertThrows(java.io.IOException.class, () -> ImageDef.parseYaml("""
+                name: tpl-secure
+                security:
+                  nested-container: true
+                """));
     }
 
     @Test
@@ -297,6 +380,24 @@ class ImageDefTest {
         var minimal = defs.get("tpl-minimal");
         assertNotNull(minimal);
         assertTrue(minimal.getHostResources().isEmpty());
+    }
+
+    @Test
+    void malformedOverrideIsRecordedSoBuildsCannotUseLowerLayerFallback(@TempDir Path tempDir) throws Exception {
+        var imagesDir = tempDir.resolve("images");
+        Files.createDirectories(imagesDir);
+        Files.writeString(imagesDir.resolve("dev.yaml"), """
+                name: tpl-dev
+                parent: tpl-minimal
+                security:
+                  nested-container: false
+                """);
+
+        var result = ImageDef.loadAllWithConflicts(List.of(tempDir.toString()), msg -> {});
+
+        assertEquals(1, result.parseErrors().size());
+        assertTrue(result.parseErrors().get(0).contains("nested-container"));
+        assertEquals("built-in", result.defs().get("tpl-dev").getSource());
     }
 
     @Test
@@ -721,6 +822,23 @@ class ImageDefTest {
         var a = makeDef("images:fedora/44", null, List.of(), List.of());
         var b = makeDef("images:fedora/44", null, List.of(), List.of("maven"));
         assertNotEquals(a.contentFingerprint(Map.of()), b.contentFingerprint(Map.of()));
+    }
+
+    @Test
+    void fingerprintIncludesEffectiveInheritedSecurity() {
+        var permissiveParent = makeDef("images:fedora/44", null, List.of(), List.of());
+        permissiveParent.setName("tpl-parent");
+        permissiveParent.setSecurity(new ImageDef.Security(true, true, true));
+        var child = makeDef("images:fedora/44", "tpl-parent", List.of(), List.of());
+        child.setName("tpl-child");
+
+        var hardenedParent = makeDef("images:fedora/44", null, List.of(), List.of());
+        hardenedParent.setName("tpl-parent");
+        hardenedParent.setSecurity(new ImageDef.Security(false, false, false));
+
+        assertNotEquals(
+                child.contentFingerprint(Map.of(), Map.of("tpl-parent", permissiveParent)),
+                child.contentFingerprint(Map.of(), Map.of("tpl-parent", hardenedParent)));
     }
 
     @Test

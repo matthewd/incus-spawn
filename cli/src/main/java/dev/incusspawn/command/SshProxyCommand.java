@@ -3,6 +3,7 @@ package dev.incusspawn.command;
 import org.aesh.command.CommandDefinition;
 import org.aesh.command.CommandResult;
 import org.aesh.command.option.Argument;
+import org.aesh.command.option.Option;
 
 @CommandDefinition(
         name = "ssh-proxy",
@@ -14,11 +15,14 @@ public class SshProxyCommand extends BaseCommand {
     @Argument(description = "Instance name", required = true)
     String instance;
 
+    @Option(name = "key", description = "Expected automation ownership key")
+    String key;
+
     @Override
     protected CommandResult doExecute() throws Exception {
         var incus = dev.incusspawn.RuntimeServices.incus();
 
-        if (!checkInstanceRunning(incus)) {
+        if (!checkInstanceRunning(incus) || !checkOwnership(incus)) {
             return CommandResult.valueOf(1);
         }
 
@@ -26,6 +30,23 @@ public class SshProxyCommand extends BaseCommand {
                 new String[]{"nc", "localhost", "22"},
                 System.in, System.out, System.err);
         return CommandResult.valueOf(exitCode);
+    }
+
+    private boolean checkOwnership(dev.incusspawn.incus.IncusClient incus) {
+        if (key == null) return true;
+        try {
+            var owner = incus.configGet(instance, dev.incusspawn.incus.Metadata.AUTOMATION_KEY);
+            if (ownershipMatches(key, owner)) return true;
+            System.err.println("Error: instance automation ownership does not match.");
+            return false;
+        } catch (Exception e) {
+            System.err.println("Error: could not verify instance automation ownership.");
+            return false;
+        }
+    }
+
+    static boolean ownershipMatches(String expected, String actual) {
+        return expected != null && expected.equals(actual);
     }
 
     private boolean checkInstanceRunning(dev.incusspawn.incus.IncusClient incus) {

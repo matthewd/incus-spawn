@@ -17,7 +17,8 @@ import java.util.Map;
  * update {@code name:}) and is recorded as a {@link NameConflict}. Callers bracket
  * each directory scan with {@link #beginDirectory()} / {@link #endDirectory()} and
  * feed definitions via {@link #put}; built-ins (the first, unique layer) go through
- * {@link #putBuiltin}.
+ * {@link #putBuiltin}. Parse failures are retained separately so security-sensitive
+ * consumers such as builds can fail closed instead of using a lower-layer fallback.
  *
  * @param <T> the resolved definition type (e.g. {@code ImageDef}, {@code YamlToolSetup})
  */
@@ -57,6 +58,7 @@ public final class LayeredDefinitions<T> {
     private final Map<String, String> sources = new LinkedHashMap<>();
     private final List<NameConflict> conflicts = new ArrayList<>();
     private final List<LayerOverride> overrides = new ArrayList<>();
+    private final List<String> parseErrors = new ArrayList<>();
     // Files seen in the directory currently being scanned, keyed by declared name.
     private Map<String, List<Path>> currentDir;
 
@@ -120,6 +122,12 @@ public final class LayeredDefinitions<T> {
 
     /** Immutable snapshot of same-directory conflicts (read-only diagnostics). */
     public List<NameConflict> conflicts() { return List.copyOf(conflicts); }
+
+    /** Record a definition that could not be parsed in a filesystem layer. */
+    public void addParseError(String error) { parseErrors.add(error); }
+
+    /** Immutable snapshot of definition parse failures. */
+    public List<String> parseErrors() { return List.copyOf(parseErrors); }
 
     /** Immutable snapshot of cross-layer overrides (read-only diagnostics). */
     public List<LayerOverride> overrides() { return List.copyOf(overrides); }

@@ -15,8 +15,8 @@
 #   4. Cleans up all test instances
 #
 # The test script (.github/scripts/test-instance.sh) exercises 6 major
-# isx features: proxy interception, git clone, sudo, systemd, DNS, and
-# login shell environment.
+# isx features: proxy interception, git clone, hardened agentuser state,
+# systemd, DNS, and login shell environment.
 
 set -euo pipefail
 

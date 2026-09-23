@@ -1,8 +1,14 @@
 package dev.incusspawn.vm;
 
+import dev.incusspawn.config.WorkerPoolConfig;
+import dev.incusspawn.config.WorkerPoolSelection;
+
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.regex.Pattern;
 
 /**
@@ -19,6 +25,32 @@ public final class VmNetwork {
      * Locally-administered (bit 1 of first octet set), avoids OUI conflicts.
      */
     public static final String ISX_VM_MAC = "4a:53:58:00:00:01";
+
+    /**
+     * MAC for the immutable process selection. Named pools use a stable hash-derived local address;
+     * the legacy process keeps its historical address byte-for-byte.
+     */
+    public static String selectedMac() {
+        return macForPool(WorkerPoolSelection.current().name().orElse(null));
+    }
+
+    public static String macForPool(String poolName) {
+        if (poolName == null) return ISX_VM_MAC;
+        if (!WorkerPoolConfig.isSafeName(poolName)) {
+            throw new IllegalArgumentException("Unsafe worker pool name for MAC derivation: " + poolName);
+        }
+        try {
+            var digest = MessageDigest.getInstance("SHA-256")
+                    .digest(("incus-spawn-worker-pool\0" + poolName).getBytes(StandardCharsets.UTF_8));
+            // 02 is unicast (low bit clear) and locally administered (next bit set), and cannot
+            // collide with the legacy address whose first octet is 4a.
+            return "02:%02x:%02x:%02x:%02x:%02x".formatted(
+                    digest[0] & 0xff, digest[1] & 0xff, digest[2] & 0xff,
+                    digest[3] & 0xff, digest[4] & 0xff);
+        } catch (NoSuchAlgorithmException e) {
+            throw new AssertionError("SHA-256 is required by the Java platform", e);
+        }
+    }
 
     private static final Path DHCP_LEASES_FILE = Path.of("/var/db/dhcpd_leases");
 
@@ -37,10 +69,14 @@ public final class VmNetwork {
      * Returns the IP or null if no matching lease is found.
      */
     public static String discoverVmIp() {
-        if (!Files.exists(DHCP_LEASES_FILE)) return null;
+        return discoverVmIp(DHCP_LEASES_FILE, selectedMac());
+    }
+
+    static String discoverVmIp(Path leasesFile, String targetMac) {
+        if (!Files.exists(leasesFile)) return null;
         try {
-            var content = Files.readString(DHCP_LEASES_FILE);
-            var normalizedMac = normalizeMac(ISX_VM_MAC);
+            var content = Files.readString(leasesFile);
+            var normalizedMac = normalizeMac(targetMac);
 
             // Split into lease records (brace-delimited blocks)
             var records = content.split("\\}");

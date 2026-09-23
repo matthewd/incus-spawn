@@ -76,6 +76,10 @@ class ProxyHealthCheckTest {
         var staleDns = ProxyHealthCheck.formatError(ProxyHealthCheck.ProxyStatus.STALE_DNS);
         assertTrue(staleDns.contains("isx proxy"));
         assertTrue(staleDns.contains("DNS overrides"));
+
+        var waiting = ProxyHealthCheck.formatError(ProxyHealthCheck.ProxyStatus.WAITING_FOR_DNS);
+        assertTrue(waiting.contains("isx proxy configure-dns"));
+        assertTrue(waiting.contains("selected appliance"));
     }
 
     @Test
@@ -172,7 +176,7 @@ class ProxyHealthCheckTest {
     }
 
     @Test
-    void authRemediationHintDistinguishesVertexFromOauth() {
+    void authRemediationHintDistinguishesBuiltInAndConfiguredCredentials() {
         var vertex = new ProxyHealthCheck.ProxyInfo("1.0", "", "", "", false, true,
                 "gcloud auth print-access-token failed (exit 1): ERROR");
         assertEquals("gcloud auth login", vertex.authRemediationHint());
@@ -180,6 +184,31 @@ class ProxyHealthCheckTest {
         var oauth = new ProxyHealthCheck.ProxyInfo("1.0", "", "", "", false, true,
                 "Claude OAuth token rejected (HTTP 401).");
         assertEquals("isx init", oauth.authRemediationHint());
+
+        var configured = new ProxyHealthCheck.ProxyInfo("1.0", "", "", "", false, true,
+                "Example credential gateway: credential command failed",
+                java.util.List.of(new ProxyHealthCheck.CredentialProblem(
+                        "example-gateway", "Example credential gateway",
+                        "credential command failed", "Repair host credential access")));
+        assertEquals("Repair host credential access", configured.authRemediationHint());
+        assertEquals("Example credential gateway",
+                configured.commandCredentialProblem().label());
+    }
+
+    @Test
+    void parseProxyInfoReadsGenericCommandCredentialProblems() {
+        var info = ProxyHealthCheck.parseProxyInfo("""
+                {"status":"ok","version":"1.0","authError":"Example credential gateway: failed",
+                 "authProblems":{"commandCredentials":[
+                   {"id":"example-gateway","label":"Example credential gateway",
+                    "detail":"failed","remediation":"Repair host credential access"}]}}
+                """);
+
+        assertEquals(1, info.commandCredentialProblems().size());
+        var problem = info.commandCredentialProblem();
+        assertEquals("example-gateway", problem.id());
+        assertEquals("failed", problem.detail());
+        assertEquals("Repair host credential access", problem.remediation());
     }
 
     @Test

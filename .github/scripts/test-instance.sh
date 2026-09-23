@@ -1,6 +1,6 @@
 #!/bin/bash
 # Functional integration tests for incus-spawn instances.
-# Exercises end-to-end behavior: proxy interception, git, sudo, systemd.
+# Exercises end-to-end behavior: proxy interception, git, hardened user state, systemd.
 #
 # Usage: incus file push test-instance.sh <instance>/tmp/
 #        incus exec <instance> -- bash /tmp/test-instance.sh
@@ -73,13 +73,23 @@ assert "cloned repo has commits" \
 rm -rf /tmp/test-clone
 echo ""
 
-# --- 3. Passwordless sudo ---
-# isx creates agentuser with a sudoers rule during template build.
-echo "[3] Passwordless Sudo"
-assert "agentuser can sudo without password" \
-    su -l agentuser -c "sudo -n true"
-assert "agentuser can run commands as root via sudo" \
-    su -l agentuser -c "sudo cat /etc/shadow"
+# --- 3. Hardened agent user ---
+# tpl-minimal must scrub privileges inherited from a pre-baked image.
+echo "[3] Hardened Agent User"
+assert "agentuser is non-root" \
+    bash -c "test \"\$(id -u agentuser)\" -ne 0"
+assert "agentuser has no sudoers drop-in" \
+    test ! -e /etc/sudoers.d/agentuser
+assert "agentuser cannot sudo non-interactively" \
+    bash -c "! su -l agentuser -c 'sudo -n true'"
+assert "agentuser is not in wheel or sudo" \
+    bash -c "! id -nG agentuser | tr ' ' '\\n' | grep -qxE 'wheel|sudo'"
+assert "agentuser has no subordinate UID allocation" \
+    bash -c "! grep -q '^agentuser:' /etc/subuid"
+assert "agentuser has no subordinate GID allocation" \
+    bash -c "! grep -q '^agentuser:' /etc/subgid"
+assert "permissive development sysctls are absent" \
+    test ! -e /etc/sysctl.d/99-dev-container.conf
 echo ""
 
 # --- 4. Systemd service lifecycle ---

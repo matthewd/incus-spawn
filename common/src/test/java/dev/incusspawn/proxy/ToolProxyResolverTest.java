@@ -3,14 +3,25 @@ package dev.incusspawn.proxy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.incusspawn.tool.ToolDef;
+import dev.incusspawn.tool.ToolDefLoader;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class ToolProxyResolverTest {
+
+    @Test
+    void declaredRoutesIncludeBuiltInsWithoutConfiguredCredentials() {
+        var routes = ToolProxyResolver.declaredRoutes();
+
+        assertTrue(routes.exactDomains().contains("github.com"));
+        assertTrue(routes.wildcardSuffixes().contains(".github.com"));
+        assertTrue(routes.wildcardSuffixes().contains(".githubusercontent.com"));
+    }
 
     @Test
     void fingerprintEmptyListReturnsEmpty() {

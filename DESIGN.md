@@ -45,18 +45,19 @@ Three Maven modules under a parent POM:
 ### Container Model
 
 - **System containers** by default (lightweight, full init system), with `--vm` flag for KVM VMs (stronger isolation, separate kernel)
-- Containers don't drop capabilities (`lxc.cap.drop =`) and relax kernel paranoia (`ptrace_scope`, `perf_event_paranoid`, `ping_group_range`) to match bare-metal behaviour
+- Containers are hardened by default. Templates opt into passwordless sudo, nested-container support, and retained capabilities/relaxed development sysctls independently through their inherited `security` policy
 - No GUI by default; Wayland + GPU passthrough available at branch time
 - Three network modes at branch time: full internet (default), proxy-only, or airgapped
-- Container user: `agentuser` (UID 1000, passwordless sudo)
+- Container user: non-root `agentuser` (UID 1000), without sudo unless the template explicitly enables it
 
 ### Template Image Hierarchy
 
 Images are defined in YAML and layered via copy-on-write. Built-in definitions live in `src/main/resources/images/*.yaml`; user-defined images in `~/.config/incus-spawn/images/` can extend or override them:
 
 ```
-tpl-minimal   (Base OS only — no tools)
-  └── tpl-dev   (Podman, GitHub CLI, Starship, tmux)
+tpl-minimal   (hardened base OS only — no tools)
+  ├── tpl-bb    (hardened Git/curl/Node.js/npm bootstrap host)
+  └── tpl-dev   (privileged Podman, GitHub CLI, Starship, tmux)
         └── tpl-java  (JDK packages + Maven tool)
 ```
 
@@ -73,10 +74,13 @@ Each image definition specifies:
 - `vm_image_url` — download URL for the VM base image (qcow2 tarball, supports `{arch}` and `{tag}` placeholders)
 - `vm_image_sha256` — per-architecture checksums for the VM base image
 - `parent` — parent image name (omit for root images)
+- `security` — independently inherited `sudo`, `nested-containers`, and `permissive-capabilities` booleans
 - `packages` — dnf packages to install
 - `tools` — tool names to run (resolved from YAML or Java)
 
-Building an image automatically builds missing parents recursively. `isx build --all` rebuilds every defined image from scratch.
+Every root security field defaults to false. Children inherit omitted fields and can explicitly disable a privilege enabled by a parent. The effective policy is part of the definition fingerprint, so policy changes make built templates out of sync. Image parsing is strict, including the nested `security` object, to prevent misspelled policy keys from silently producing a different security posture.
+
+Building an image automatically builds missing parents recursively. `isx build --all` rebuilds every defined image from scratch. `tpl-dev` explicitly enables all three security options to preserve the upstream workstation and rootless-Podman behavior. `tpl-bb` derives directly from `tpl-minimal`, carries only Git, curl, Node.js 22.19+ and npm prerequisites for bb host bootstrap, and does not install a provider tool or credentials.
 
 **Base image**: The root image (`tpl-minimal`) uses a custom Fedora base image
 from [`Sanne/incus-spawn-images`](https://github.com/Sanne/incus-spawn-images)
@@ -163,10 +167,10 @@ Before building templates or running `isx update-all`, `HostRepoRefresh` fetches
 ### Build Flow
 
 **`buildFromScratch` (root image, no parent):**
-1. Import and launch base image (pre-baked with agentuser, systemd-networkd, service masks)
-2. Install MITM proxy CA certificate
-3. Configure security (idmap, nesting, syscall interception, no capability dropping) — *skipped for VMs*
-4. Prepare container for package install (tmpfiles overrides, temporary DHCP network config, man dirs) — *skipped for VMs*
+1. Import and create the base instance while stopped (the bundled image is pre-baked with agentuser, systemd-networkd, and service masks)
+2. Replace pre-baked Incus security state with the effective declarative policy — *skipped for VMs*
+3. Start the instance and install the MITM proxy CA certificate
+4. Prepare the running container for package install (tmpfiles overrides, temporary DHCP network config, man dirs) — *skipped for VMs*
 5. Configure DNS (disable systemd-resolved, point at Incus bridge gateway)
 6. Upgrade system packages
 7. Install image-defined packages via dnf
@@ -174,8 +178,9 @@ Before building templates or running `isx update-all`, `HostRepoRefresh` fetches
 9. Clone declared repos (with reference optimization — see below)
 10. Configure terminal title (`PROMPT_COMMAND` in `.bashrc` sets `isx:<hostname>`)
 11. Pre-trust cloned repo directories in `.claude.json` (if Claude Code is installed)
-12. Clean caches (dnf, /tmp)
-13. Tag metadata (version, SHA, definition fingerprint, CA fingerprint, build source), stop
+12. Apply the in-guest security policy after all trusted root build work, scrubbing stale sudo/group/subid/sysctl state before recreating explicit opt-ins
+13. Clean caches (dnf, /tmp)
+14. Tag metadata (version, SHA, definition fingerprint, CA fingerprint, build source), stop
 
 **VM-specific build behavior:**
 
@@ -183,17 +188,19 @@ When `type` is `vm` or `kvm` (set in the definition or via `--type`), `buildFrom
 
 - **Base image**: uses `vm_image_url` (pre-baked VM qcow2) when available, falls back to a stock Incus VM image otherwise
 - **Disk expansion**: runs `growpart` + `resize2fs`/`xfs_growfs` before package install (both for pre-baked images that ship at 10G and the final build which defaults to 100G)
-- **Security config**: container-specific security settings (raw.idmap, nesting, setxattr interception) are skipped — VMs have their own kernel and don't need them
-- **No restart**: VMs don't need the container restart that applies security config changes
+- **Security config**: container-specific security settings (raw.idmap/idmap size, nesting, setxattr interception, raw LXC capability retention, and tun device) are skipped — VMs have their own kernel. The in-guest user/sudo/subid/sysctl scrub still runs
+- **No restart**: container security is applied while stopped before first boot; VMs have no equivalent restart step
 - **Tool downloads**: large file pushes over vsock are slow, so `YamlToolSetup` uses a mount-and-copy strategy for both extracted archive and downloaded files exposed via `destination_file`
 - **KVM passthrough**: when `type: kvm`, `/dev/kvm` is passed through to the VM for nested virtualization
 
 **`buildFromParent` (derived image):**
-1. Copy parent image, start, wait for network
-2. Install image-defined packages via dnf (deduplicated — see below)
-3. Install image-defined tools (with transitive `requires` resolution)
-4. Clean caches
-5. Tag metadata, stop
+1. Copy the parent image and replace its Incus security state with the child's effective policy while stopped
+2. Start and wait for network
+3. Install image-defined packages via dnf (deduplicated — see below)
+4. Install image-defined tools (with transitive `requires` resolution)
+5. Apply the final in-guest security policy, clean caches, tag metadata, and stop
+
+Security finalization is exact-state, not additive. For every container build, isx first unsets `security.privileged`, `security.nesting`, `security.syscalls.intercept.setxattr`, `raw.lxc`, `raw.idmap`, and non-default `security.idmap.*` values and removes the `tun` device, then recreates only settings selected by the effective policy. After package/tool/repository setup has completed as trusted root work and temporary host mounts are detached, the fail-fast in-guest pass removes `/etc/sudoers.d/agentuser`, `agentuser` membership in `wheel`/`sudo`, its `/etc/subuid` and `/etc/subgid` entries, and `/etc/sysctl.d/99-dev-container.conf`, then recreates only opted-in state. This ordering prevents a permissive parent, pre-baked image, or build-time tool from leaking privilege into a hardened child.
 
 **Package deduplication**: Before installing packages, the build walks the parent chain and collects all packages from ancestor images and their tools. These are subtracted from the current image's package list so derived images only install what's new. The build logs both the count being installed and the count already present in ancestors.
 
@@ -218,15 +225,32 @@ The TUI branch modal supports:
 - Inbox mount (read-only host directory for sharing files into the container)
 - VM resource limits (CPU, memory, disk)
 
+### Versioned Automation Surface
+
+`isx automation` is the non-interactive API for machine providers. The shared command group is registered in both platform command trees and exposes `create`, `inspect`, `start`, `stop`, `mount`, `unmount`, `delete`, and `exec`. It deliberately does not call the interactive init path, prompt, or use `BuildOutput`; an automation caller must arrange host initialization and appliance startup before invoking it.
+
+The aesh classes only decode flags and select streams. `AutomationService` owns lifecycle validation, ownership, idempotency, and reconciliation behind the transport-neutral `AutomationTransport` interface. `AutomationProtocol` owns the version-one JSON and NDJSON representation. `IncusAutomationTransport` is the adapter to `IncusClient`. Unit tests therefore exercise protocol and lifecycle semantics with in-memory transports rather than reproducing those semantics in command fields.
+
+Every automation allocation has a caller-supplied key in `user.incus-spawn.automation-key` and its source in `user.incus-spawn.automation-template`. Creation accepts only a stopped instance tagged as an isx base/project template and requires `planCopy()` to select the source's same CoW pool. The initial Incus copy request contains the ownership key, source, clone type, parent, and creation time, rather than patching them after creation. A lost response can consequently be reconciled by inspecting the committed copy. Existing names are accepted only when both key and source match; all other collisions fail closed. Start and stop accept only their normal opposite state, with the desired state as an idempotent no-op. Delete may identify the allocation by key alone, treats no match as an idempotent success, and rejects duplicate-key metadata rather than choosing an arbitrary instance. Inspect serializes only name, normalized state, container/VM type, and source template.
+
+Mount and unmount take the owned instance, a restricted deterministic device name, an absolute physical host source, an absolute non-root container target, and `read-only` or `read-write`. `AutomationService` rejects line/NUL delimiters, relative or `..` paths, unsafe names, ownership mismatch, and states other than Running or Stopped before device mutation. The transport inspects only the instance's own unexpanded `devices`, classifies absence separately from malformed and conflicting entries, and compares the entire device object. The exact expected Incus object is `type=disk`, the translated source leaf, `path=<target>`, and, only for read-only access, `readonly=true`; additional fields also conflict. Mount is unchanged only for that exact object. Unmount is unchanged when absent, but an existing object must match every expected field before the same read-modify-write removes it. A device selected by name alone is never removed. Mutation rechecks ownership, state, and the own-device map on a fresh instance GET, then sends the returned ETag in `If-Match`; a concurrent config/device change therefore fails its precondition instead of being overwritten by stale state.
+
+For named macOS pools, the adapter requests an access-aware `VmHostExports.Translation` after checking the persisted running-plan fingerprint. Translation canonicalizes through the longest containing export: read-only can use workspace, runtime, or reference roots, while read-write is accepted only under the workspace export. A leaf alias that canonicalizes to an export root is rejected so translation cannot broaden a narrow request to the complete workspace. Symlink escapes and undeclared paths remain errors. The translated appliance leaf is the Incus disk source; the outer runtime/reference shares remain VZ-enforced read-only, while the inner Incus `readonly=true` is defense in depth. The legacy macOS whole-home share can satisfy read-only mounts only because the appliance mounts it with `-o ro`; its vfkit export is not VZ-enforced read-only, unlike named runtime/reference exports. Legacy translation canonicalizes an existing source and rejects anything outside the exported home so a physical host path can never be misinterpreted as an appliance-local path.
+
+Lifecycle replies, including mount and unmount, are one-line JSON envelopes with `protocol: "isx-automation"` and `version: 1`. Their instance resource remains limited to name, normalized state, container/VM type, and source template: host and container paths are not public fields, and raw backend errors are not serialized. Exec is NDJSON: synchronized stdout/stderr writers base64-encode each binary payload, followed by one result or error frame. `--argv-json` is parsed as a non-empty string array and passed directly to the Incus exec `command` array; no shell joins it. Environment values are also string-only JSON. Defaults are UID/GID 1000 and cwd/HOME `/home/agentuser`; stdin is relayed as bytes and is never logged or echoed.
+
+The automation exec path is separate from the existing capture, streaming, bidirectional, and PTY wrappers. It retains `/wait` as the authoritative normal completion signal but uses one-second wait slices so a caller timeout or external cancellation is observed promptly. Either termination path makes one best-effort `DELETE` request against the Incus operation and returns a structured `TIMEOUT` or `CANCELLED` outcome carrying whether the daemon accepted deletion. The CLI registers a JVM shutdown hook so SIGINT/SIGTERM can trigger that same action. This is intentionally not reported as proof that every descendant process died: live Incus verification, including the macOS/vsock path, must confirm that operation deletion kills the complete guest process tree before a provider relies on that property.
+
 ### Terminal Output Visual Language
 
-All multi-step command output follows a consistent visual language, centralized in
+All multi-step human-facing command output follows a consistent visual language, centralized in
 `BuildOutput` (`common/.../util/BuildOutput.java`). All output helpers live
 there; individual commands should not define their own ANSI constants or
 formatting patterns. Beyond build/branch, this governs the other lifecycle
 commands too — `vm` (start/stop/resize), `destroy`, `update-all`, `update-base`,
-and `project` — plus the shared `VmManager`. (`isx init`'s large interactive
-first-run flow is the one deliberate exception, kept in its own style for now.)
+and `project` — plus the shared `VmManager`. `isx init` keeps its dedicated
+interactive style; `isx automation` is the other deliberate exception because
+its stdout is a versioned machine protocol and must never contain decoration.
 
 **Structure:**
 
@@ -284,6 +308,24 @@ inline ANSI escapes, and do not leave a `Doing X...` line dangling. Pure
 reports/tables and interactive prompts (e.g. `proxy` status, `clean` summaries,
 the TUI) are not step sequences and stay as plain output.
 
+### Worker-pool process selection
+
+`ISX_POOL` selects one named worker pool for the lifetime of an `isx` process. There is no command-line selector and no mutable in-process switch: `RuntimeConstants.WORKER_POOL` captures the environment once in the run-time-initialized host-state holder. An unset variable preserves legacy behavior exactly. A set value takes the fail-closed path through `SpawnConfig.loadStrict()` before command dispatch, so an unsafe or unknown name, malformed YAML, an unknown pool field, or any invalid pool definition cannot fall through to the legacy VM.
+
+Pools are declared under `worker-pools` in the global `config.yaml`. Each entry requires fixed `cpus` (at least 1), `memory-mib` (at least 2048), `swap` (the VM size syntax), `runtime-root`, `workspace-root`, and `reference-roots` (which may be empty). `WorkerPoolConfig` represents runtime and reference roots as `ReadOnlyExport` and the workspace as `ReadWriteExport`; the access mode is part of the type rather than a user-selectable string. Pool and reference names are restricted to lowercase alphanumeric/hyphen path-safe names.
+
+`VmHostExports` turns those declarations into a resolved launch plan without consulting mutable process state. It expands `~`, canonicalizes the longest existing ancestor, requires every existing root to be a directory, creates only the controlled runtime and workspace roots, and requires references to exist already. It rejects canonical duplicate/nested roots. Translation canonicalizes the requested host path again and maps it through the longest containing root, so undeclared paths, dangling symlinks, and child symlinks escaping an export fail closed. vfkit's comma-separated device fields have no escaping convention, so commas, newlines, and NULs are rejected before argv construction. Reference names are limited to the 22 bytes left by the 36-byte virtio-fs tag limit, and the complete sorted kernel parameter is bounded to avoid command-line truncation. VM tool downloads that need a temporary Incus mount stage under the runtime root rather than broadening the plan to a cache or system temporary directory.
+
+A named vfkit launch attaches runtime as `isx-runtime` read-only, workspace as `isx-workspace` read-write, and sorted references as `isx-reference-<name>` read-only. The appliance receives the sorted safe reference names on the kernel command line and mounts the devices at `/host/runtime`, `/host/workspace`, and `/host/references/<name>`; its `-o ro` flags mirror the runtime/reference virtualization flags. The virtualization restriction is authoritative: this requires the companion incus-spawn vfkit extension whose `virtio-fs,...,readonly` field passes `true` to `VZSharedDirectory`. Upstream vfkit does not support the field and therefore fails named-pool launch rather than falling back to a writable export. A guest-only `mount -o ro` would not protect the host from a compromised guest and is not considered sufficient. With no named-pool marker, both vfkit argv and appliance boot preserve the historical `hostfs` whole-home export mounted read-only at `/host`.
+
+A named pool owns `~/.local/state/incus-spawn/pools/<name>/`: root/data/swap disks, disk version, dummy initrd, PID, lifecycle lock, serial log, REST URI, Incus and agent sockets, export-plan fingerprint, appliance-skew marker, and vfkit app bundle all derive from that directory. The fingerprint is written atomically only after vfkit has started successfully and is removed on stop or stale-process cleanup. A process whose current resolved plan differs from a running VM's fingerprint must restart that pool before host-path translation. Its per-instance lock directory is `<pool>/locks`. The unset selection retains `~/.local/state/incus-spawn/` and `~/.cache/incus-spawn/locks` byte-for-byte. Global configuration and credentials, CA and leaf certificates, proxy locks/state/logs, persisted macOS gateway, appliance artifacts, support caches, and download caches stay outside the pool directory. This split lets several appliance VMs coexist without duplicating credentials or immutable downloads.
+
+Named macOS appliances are demand-started. A proxy install selected through `ISX_POOL` never writes or bootstraps the historical `dev.incusspawn.vm` login LaunchAgent; it boots out and removes a stale copy so the legacy whole-home VM cannot return at login. The unset selection retains that LaunchAgent behavior. The `dev.incusspawn.proxy` LaunchAgent remains a global singleton: installation discovers the selected running VM's private host-side bridge address, atomically writes it to global proxy state, and emits an explicit `--gateway-ip` argument. The plist contains neither `ISX_POOL` nor credentials, and proxy launch/reload does not require an Incus/vsock connection. A valid persisted address permits reinstall while no appliance is reachable; installation fails rather than writing an unvalidated listener address when neither source is available. Uninstall removes both global launchd state and any stale legacy VM plist.
+
+Named-pool VM resources come only from the validated pool entry; `ISX_VM_CPUS`, `ISX_VM_MEMORY`, and `ISX_VM_SWAP` remain legacy-only overrides. `ISX_VM_DISK` remains the data-disk size input because disk size is not part of this first pool schema. `isx vm status` prints the selected pool, fixed resources, and state directory. Each named pool receives a deterministic SHA-256-derived locally administered unicast MAC (first octet `02`); the historical `4a:53:58:00:00:01` is retained for the legacy VM. vfkit launch and DHCP lease discovery both use the selected address.
+
+A source checkout may supply appliance artifacts through `ISX_APPLIANCE_DIR`. `ISX_APPLIANCE_VERSION` gives that local build an opaque version distinct from upstream releases; it is restricted to URL/path-safe version characters and becomes the root-disk sidecar identity. The appliance build must embed the same value in `/etc/isx-version`. This lets a fork replace a release appliance deterministically when its init or mount policy changes, without teaching development builds to masquerade as the latest upstream tag.
+
 ### Resource Limits (Adaptive)
 
 Detected at branch time from host resources:
@@ -296,13 +338,15 @@ Overridable via TUI branch modal (for VMs, all three fields are shown).
 
 ### Container Configuration
 
-**Capabilities**: `lxc.cap.drop =` (don't drop any — the container is the security boundary).
+The default policy retains Incus capability dropping, has no nested-container idmap/tun configuration, and gives `agentuser` no sudo or subordinate IDs. Explicit options add only their corresponding state:
 
-**Sysctl relaxation** (`/etc/sysctl.d/99-dev-container.conf`):
-- `net.ipv4.ping_group_range = 0 2147483647` — unprivileged ping
-- `kernel.dmesg_restrict = 0` — read kernel logs
-- `kernel.perf_event_paranoid = 1` — perf profiling
-- `kernel.yama.ptrace_scope = 0` — strace/debuggers
+- **`sudo`**: `/etc/sudoers.d/agentuser` grants passwordless sudo. Group membership is not required.
+- **`nested-containers`**: `security.nesting`, Linux setxattr interception, a 165536-ID map with UID/GID 1000 passed through, matching `agentuser` subuid/subgid ranges, and `/dev/net/tun`.
+- **`permissive-capabilities`**: `raw.lxc = lxc.cap.drop =` and `/etc/sysctl.d/99-dev-container.conf` with:
+  - `net.ipv4.ping_group_range = 0 2147483647` — unprivileged ping
+  - `kernel.dmesg_restrict = 0` — read kernel logs
+  - `kernel.perf_event_paranoid = 1` — perf profiling
+  - `kernel.yama.ptrace_scope = 0` — strace/debuggers
 
 **DNS**: systemd-resolved disabled, `/etc/resolv.conf` points at Incus bridge gateway (`incusbr0`), immutable via `chattr +i`.
 
@@ -371,14 +415,17 @@ iptables -P OUTPUT DROP
 
 **How it works:**
 
-1. The proxy configures bridge-level DNS overrides (via `raw.dnsmasq` on `incusbr0`) so all containers resolve intercepted domains to the gateway IP
+1. The CLI configures bridge-level DNS overrides (via `raw.dnsmasq` on `incusbr0`) so all containers resolve intercepted domains to the gateway IP. `isx proxy configure-dns` writes and verifies the complete built-in, currently resolved tool-proxy, and startup-only command-credential set on the selected appliance without restarting the singleton proxy; named macOS pools use it after each demand start
 2. Template images include a custom CA certificate (generated during `isx init`) so containers trust the proxy's TLS certificates
 3. The proxy listens on port 18443 on the gateway IP. An iptables PREROUTING redirect rule (installed by `isx init` via `firewall-cmd --permanent --direct`) transparently redirects traffic arriving on `incusbr0` destined for port 443 to port 18443, avoiding conflicts with the Incus daemon on port 443. The proxy terminates TLS using per-domain certificates signed by the custom CA
 4. Based on the target domain, the proxy injects authentication headers:
    - `api.anthropic.com` — `x-api-key: <anthropic-api-key>` (direct API key mode), `Authorization: Bearer <oauth-token>` (OAuth mode, for Claude Pro/Max subscriptions), or Vertex AI passthrough/translation with GCP Bearer token (Vertex mode, see below). Anthropic auth is hardcoded in `MitmProxy` (three auth modes with complex routing)
    - Tool-contributed domains (GitHub, OpenAI, Bob, and user-defined tools) — credential injection is declared in YAML tool definitions via `proxy:` entries (see "Tool-contributed proxy definitions" below)
    - Container registry, Maven, and npm domains — relayed transparently with caching (no auth injection)
-5. The proxy re-encrypts and forwards to the real upstream over TLS
+   - `bb.isx.internal` — relayed without injection or body logging to plain HTTP/WebSocket on host loopback port 18444
+5. The proxy re-encrypts and forwards normal intercepted traffic to the real upstream over TLS; the fixed bb gateway terminates at the loopback daemon
+
+**bb gateway trust split:** `bb.isx.internal` is always in the built-in intercepted set, so normal certificate generation and `isx proxy configure-dns` cover it without tool configuration. ISX owns DNS, container-facing TLS, and transport to `127.0.0.1:18444`; it preserves the original `Host` for downstream policy and, for WebSocket handshakes, the caller's `Authorization` and `bb-host-daemon.v1` subprotocol. It deliberately bypasses generic tool credential injection and debug body capture. The HTTP relay has a dedicated streaming path: it rejects malformed or conflicting length/transfer framing, enforces 16 MiB against both a declared `Content-Length` and bytes observed in a chunked stream, applies backpressure in both directions, and resets the other leg when either side aborts. An oversized `/internal/session/events` batch receives bb's nonretryable `invalid_request` JSON so the daemon bisects it; other oversized requests receive 413. Gateway WebSocket writes are serialized per direction, with each source paused until the corresponding asynchronous frame write completes. Logs identify only `bb.isx.internal`, never its request target, URI, or query. The bb host daemon owns caller authentication and authorization; loopback is the plaintext boundary between the two host-side components. Its per-host `bbdh_` credential is agent-readable because both processes share the container account, so the downstream allowlist and bb's host/thread assignment checks—not daemon-only secrecy—bound that capability.
 
 **Vertex AI support:** When the host is configured for Vertex AI (`useVertex=true` in config), containers run Claude Code in **Vertex mode** with `CLAUDE_CODE_USE_VERTEX=1`, `CLAUDE_CODE_SKIP_VERTEX_AUTH=1`, and `ANTHROPIC_VERTEX_BASE_URL=https://api.anthropic.com/v1`. This causes the Vertex SDK inside the container to send already-formatted Vertex requests (`/v1/projects/.../models/...:streamRawPredict`) to `api.anthropic.com`, which resolves to the proxy via dnsmasq. The proxy then forwards to the real Vertex endpoint with GCP credentials. No GCP credentials enter the container.
 
@@ -418,9 +465,9 @@ The body translation uses an allowlist approach: only known-good fields (`messag
 
 **Pi coding agent support:** Pi is a provider-agnostic coding agent that always communicates via the standard Anthropic API (`/v1/messages`). Unlike Claude Code, Pi does not have a Vertex mode — it always sends standard API requests with an `x-api-key` header. The proxy handles both direct key injection and standard-to-Vertex translation transparently. No Vertex-specific environment variables are needed inside the container; `ANTHROPIC_API_KEY=sk-ant-placeholder` is the only auth configuration (declared via `PiSetup.envEntries()`).
 
-**WebSocket passthrough:** The proxy also handles WebSocket upgrade requests. When a client sends an HTTP Upgrade to a proxied domain, the proxy establishes a corresponding upstream WebSocket connection (injecting credentials on the initial handshake), then relays frames bidirectionally. The client socket is paused until the upstream connection is established to prevent frame drops. Keepalive pings are sent on both legs, and close codes are propagated. This is used by Codex CLI, which communicates with `api.openai.com` over WebSocket.
+**WebSocket passthrough:** The proxy also handles WebSocket upgrade requests. When a client sends an HTTP Upgrade to a proxied domain, the proxy establishes a corresponding upstream WebSocket connection (injecting credentials on the initial handshake), then relays frames bidirectionally. The client socket is paused until the upstream connection is established to prevent frame drops. Keepalive pings are sent on both legs, and close codes are propagated. This is used by Codex CLI, which communicates with `api.openai.com` over WebSocket. The `bb.isx.internal` path instead opens plain WebSocket to `127.0.0.1:18444`, preserving caller authorization and the `bb-host-daemon.v1` subprotocol without injection; frame and ping writes on that path are serialized, and each source is paused until its destination write completes. Vert.x's client-generated `Origin` is disabled on this trusted loopback leg, while an `Origin` or `Sec-Fetch-Site` received from a container is rejected as browser-originated traffic.
 
-**Intercepted domains:** Built-in: `api.anthropic.com`, `registry-1.docker.io`, `auth.docker.io`, `ghcr.io`, `quay.io`, `repo.maven.apache.org`, `repo1.maven.org`, `plugins.gradle.org`, `services.gradle.org`, `registry.npmjs.org`. Tool-contributed (via YAML `proxy:` entries): `github.com`, `api.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `codeload.github.com`, `uploads.github.com`, `api.openai.com`, `bob.ibm.com` (and all `*.bob.ibm.com` subdomains). User-defined tools can add additional domains.
+**Intercepted domains:** Built-in: `api.anthropic.com`, `bb.isx.internal`, `registry-1.docker.io`, `auth.docker.io`, `ghcr.io`, `quay.io`, `repo.maven.apache.org`, `repo1.maven.org`, `plugins.gradle.org`, `services.gradle.org`, `registry.npmjs.org`. Tool-contributed (via YAML `proxy:` entries): `github.com`, `api.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `codeload.github.com`, `uploads.github.com`, `api.openai.com`, `bob.ibm.com` (and all `*.bob.ibm.com` subdomains). User-defined tools can add additional domains. Protected machine-local command-credential rules contribute exact hosts without making command execution part of the tool or project schemas.
 
 **HTTPS only:** The proxy intercepts HTTPS traffic, so Git operations must use HTTPS URLs (not SSH). `gh` defaults to HTTPS automatically; for `git clone`, use `https://github.com/...` instead of `git@github.com:...`.
 
@@ -429,6 +476,8 @@ All other domains (package mirrors, PyPI, etc.) route normally via Incus bridge 
 **Credential validation**: Building a template image that includes `claude`, `codex`, `pi`, or `gh` tools requires the corresponding credentials to be configured on the host. Both the CLI and TUI check this before starting a build and abort with a clear error if credentials are missing. Tools behind a feature flag that is not enabled are excluded from credential checks.
 
 **Auth error reporting**: When credential injection fails the proxy records an `authError` and surfaces it on `/health`, which `isx proxy status`, `isx doctor` and the TUI banner all render. Injection only runs on real container traffic, so that latch alone makes the status wrong in both directions: it reports failures the user has already fixed, and reports nothing at all before the first API call of a session. The health endpoint therefore verifies the Vertex token itself, on a worker thread, before answering — clearing a stale error, or reporting a broken credential that no request has hit yet.
+
+**Per-appliance DNS status**: The proxy process cannot attach one meaningful pool identity to its `/health` `dnsConfigured` field because it is global while appliance bridges are per pool. CLI/TUI status therefore verifies the exact IPv4 and IPv6-suppression lines for the complete current domain set directly on the selected bridge rather than accepting that global bit. `configure-dns` performs the same read-after-write verification. The raw `/health` field remains process-global for compatibility and is not evidence that every named appliance has been configured.
 
 The checks it declines are what keep this cheap:
 
@@ -445,11 +494,17 @@ A failure found by the health check is recorded via `recordProbeAuthError`, whic
 
 **Leaf certificate persistence (clock-skew safety)**: Per-domain leaf certs are not minted fresh on every proxy start. `CertStore` persists them under `~/.config/incus-spawn/certs/` (keyed by domain — `<domain>.crt`/`.key`, wildcards as `_wildcard.<domain>`) and reuses them across restarts, re-minting only when a cert is missing, was signed by a rotated CA, or is within 30 days of expiry.
 
-This fixes an intermittent "certificate is not yet valid" failure. A cert's `notBefore` is stamped from the **host** clock at mint time, but it is validated against the **container** clock. These are independent clocks: on macOS the proxy runs on the Mac host (launchd, `KeepAlive=true`) while containers run inside an Incus VM whose clock lags after the Mac sleeps — `--timesync` only re-seeds at boot, not on resume. `KeepAlive` relaunches the proxy whenever it exits (including right after wake, when the Mac clock has already jumped forward to real time); re-minting at that moment produced a `notBefore` in the lagging container's future, failing validation with "certificate is not yet valid". No clock ever runs backward — both are monotonic — but the gap between the mint clock (host, ahead) and the validating clock (container, behind) can exceed a day. Reusing a persisted leaf keeps its original `notBefore` (stamped while the clocks were in sync), so the container's lagging-but-monotonic clock always accepts it. `CertificateAuthority.BACKDATE_MS` (2 days) backdates `notBefore` as a margin for the rare remaining fresh-mint moments (first install, CA rotation, near-expiry renewal). The underlying clock drift is now corrected by `chronyd` running inside the VM appliance — it steps the guest clock to NTP time within seconds of network recovery after wake (see `appliance/DESIGN.md`, Clock Synchronization). Cert persistence and backdating remain as defense-in-depth for the brief window before chrony syncs.
+This fixes an intermittent "certificate is not yet valid" failure. A cert's `notBefore` is stamped from the **host** clock at mint time, but it is validated against the **container** clock. These are independent clocks: on macOS the proxy runs on the Mac host (launchd, `KeepAlive=true`) while containers run inside an Incus VM whose clock can lag briefly after the Mac sleeps, before host/guest reconciliation completes. `KeepAlive` relaunches the proxy whenever it exits (including right after wake, when the Mac clock has already jumped forward to real time); re-minting at that moment produced a `notBefore` in the lagging container's future, failing validation with "certificate is not yet valid". No clock ever runs backward — both are monotonic — but the gap between the mint clock (host, ahead) and the validating clock (container, behind) can exceed a day. Reusing a persisted leaf keeps its original `notBefore` (stamped while the clocks were in sync), so the container's lagging-but-monotonic clock always accepts it. `CertificateAuthority.BACKDATE_MS` (2 days) backdates `notBefore` as a margin for the rare remaining fresh-mint moments (first install, CA rotation, near-expiry renewal). The underlying clock drift is corrected through `qemu-ga`: vfkit reconciles the guest against the Mac at startup, after wake, and during periodic checks, using fresh bounded-retry vsock connections. `chronyd` remains an independent network-dependent fallback (see `appliance/DESIGN.md`, Clock Synchronization). Cert persistence and backdating remain as defense-in-depth for the brief window before either synchronizer runs.
 
 Certs are keyed by domain, never by container: a leaf is a function of `(domain, CA)` and is identical for every container that intercepts that domain. Planned per-container interception (a different intercepted-domain set per container) is a routing/DNS concern — it decides which domains reach the proxy for a given container — and does not change cert identity, so the store stays domain-keyed. The remaining work for that feature is to resolve certs per-SNI on demand against this same on-disk store rather than building a single JKS at start; the storage format does not change.
 
 **Vertex AI token refresh**: Vertex AI requests that receive a 401 response are retried once with a fresh GCP access token (the cached token is invalidated). This handles token expiry during long-running sessions without user intervention.
+
+**Command-backed credential injection:** `CommandCredentialConfig` reads only `~/.config/incus-spawn/command-credentials.yaml`. Absence and explicit `rules: []` disable the feature; every other present file must be a non-empty, owner-readable regular non-symlink file with no group or other permissions. Jackson duplicate detection and unknown-field rejection make the schema strict. IDs are unique bounded lowercase names. Hosts are unique exact lowercase DNS names and are unconditionally HTTPS/443; wildcard, scheme, and port configuration is intentionally absent. Startup rejects overlap with built-in routes, exact tool routes, and tool wildcard suffixes, including tool definitions whose credential is not currently resolved. This surface is deliberately separate from `ToolDef`, `ImageDef`, and project YAML, so an untrusted or project-scoped definition cannot cause host command execution.
+
+A rule supplies absolute argv, one-line credential validation regex, exact inert placeholders for a Bearer `Authorization` carrier and/or one named raw header, command timeout/output bounds, HTTP body bound, positive and failure-cache TTLs, and generic health label/remediation. `CommandCredentialBroker` invokes argv directly off the event loop with stderr discarded and a cleared environment containing only `HOME`, `USER`, `LOGNAME`, `TMPDIR`, and the fixed safe system `PATH`; it never invokes a shell. It accepts one bounded UTF-8 stdout line matching the configured regex. Successful values remain only in a generation-aware single-flight memory cache, while failures use the configured negative-cache TTL. The request path requires at least one configured carrier with its exact configured placeholder, rejects a duplicate, unsupported, or non-exact carrier before command acquisition, enforces body size against both `Content-Length` and observed bytes, and never forwards a placeholder after acquisition failure. A 401 drains the response, conditionally invalidates the lease, and retries once; a second 401 is relayed and leaves a generic per-rule health problem. Command-credential traffic bypasses API debug capture and WebSocket upgrades fail closed.
+
+The health payload exposes only rule ID, generic label, generic failure detail, and configured remediation under `authProblems.commandCredentials`; argv, stdout, and credentials are never included. `ProxyHealthCheck` parses that source-neutral shape, and Doctor renders the configured remediation without treating it as an executable action. Rule hosts are included in the proxy routing map, certificate keystore, and every complete DNS set. The proxy loads the file once at startup. `config.yaml` and CA reloads rebuild ordinary credentials and certificates around the already loaded rules rather than re-reading commands or policy; file metadata still contributes to drift detection. Applying an edit therefore requires both `isx proxy restart` and `isx proxy configure-dns`.
 
 **Proxy caching**: The proxy caches three types of upstream content to avoid redundant downloads:
 - **OCI blobs** — keyed by SHA256 content digest, verified on store
@@ -464,7 +519,7 @@ Certs are keyed by domain, never by container: a leaf is a function of `(domain,
 
 **Dynamic credential setup:** `isx init` builds its credential menu dynamically from tool setups via `ToolDefLoader.allToolSetups()`. Tools with proxy configuration are discovered, filtered by feature gates (`ToolSetup.feature()` + `SpawnConfig.isFeatureEnabled()`), and sorted (known tools first: claude, gh, bob, codex; then alphabetically). Each entry shows `ToolSetup.description()` and a `[configured]` tag. Known tools dispatch to specialized setup methods with validation (e.g., `setupClaudeAuth` with env-var detection and API verification); unknown tools use a generic prompt (`setupGenericToolCredentials`) that iterates `proxy.getConfiguration()` directly, respects `ConfigEntry.isSecret()` and `ConfigEntry.isConfirm()` (for y/n prompts like license acceptance), and saves via `SpawnConfig.setConfigByPath()` using the entry's `config-path`. User-defined tool YAMLs with proxy entries appear in the menu automatically.
 
-**Configuration**: `~/.config/incus-spawn/config.yaml` (owner-only permissions, `chmod 600`). CA key and certificate at `~/.config/incus-spawn/ca.key` and `~/.config/incus-spawn/ca.crt`. Vertex AI users must have `gcloud` installed on the host and `gcloud auth login` completed — the proxy and `isx init` both shell out to `gcloud auth print-access-token`, which reads the gcloud user credential, not application-default credentials.
+**Configuration**: `~/.config/incus-spawn/config.yaml` (owner-only permissions, `chmod 600`). Startup-only command credential policy is isolated in `~/.config/incus-spawn/command-credentials.yaml` with independently enforced owner-only permissions and strict parsing. CA key and certificate are at `~/.config/incus-spawn/ca.key` and `~/.config/incus-spawn/ca.crt`. Vertex AI users must have `gcloud` installed on the host and `gcloud auth login` completed — the proxy and `isx init` both shell out to `gcloud auth print-access-token`, which reads the gcloud user credential, not application-default credentials.
 
 ### Host Resources
 
@@ -531,6 +586,8 @@ user.incus-spawn.network-mode=PROXY_ONLY     # (proxy-only branches only)
 user.incus-spawn.proxy-gateway=10.166.11.1   # (proxy-only branches only)
 user.incus-spawn.static-ip=10.166.11.2       # (branches only, assigned at creation)
 user.incus-spawn.host-resources=[...]        # (JSON, when host-resources declared)
+user.incus-spawn.automation-key=allocation-17 # (automation-owned instances only)
+user.incus-spawn.automation-template=tpl-bb   # (automation-owned instances only)
 ```
 
 **Staleness detection**: The TUI uses `build-version` and `definition-sha` to display staleness indicators next to template names:
@@ -686,9 +743,10 @@ where `$HOME=/root`), so a field holding an `Environment` path freezes the build
 than the user's.
 
 Host-derived state that must be resolved eagerly therefore lives in exactly two classes, both on
-the flag: **`RuntimeConstants`** in `common` (the download and skills cache directories, plus the
-Java tool setups holding them) and **`RuntimeServices`** in the CLI (Incus client, lock manager,
-tool-def loader). Both say so in their javadoc; `Environment` itself is on the list too and stays
+the flag: **`RuntimeConstants`** in `common` (the immutable `ISX_POOL` selection, download and skills
+cache directories, plus the Java tool setups holding them) and **`RuntimeServices`** in the CLI
+(Incus client, background tasks, pool-aware lock manager, tool-def loader). Both say so in their
+javadoc; `Environment` itself is on the list too and stays
 method-based, which is also what lets tests retarget `user.home`. Everywhere else, call the
 `Environment` method rather than storing its result.
 
@@ -732,8 +790,8 @@ evidence; `.claude/rules/native-image.md` records what fixing it involves.
 - `ToolDefTest` — YAML tool parsing, fingerprinting, composite fingerprints with transitive dependencies
 - `ToolDefLoaderTest` — resolution order (builtins, user overrides, unknown tools)
 - `YamlToolSetupTest` — execution order with mocked Container
-- `ImageDefTest` — image definition loading, parent chain, descriptions, fingerprinting
-- `BuildCommandTest` — `.claude.json` trust configuration, skill deduplication across inheritance chains, shell quoting, GitHub URL parsing
+- `ImageDefTest` — image definition loading, parent chain, strict security parsing/inheritance, template discovery, descriptions, fingerprinting
+- `BuildCommandTest` — exact hardened/opted-in Incus calls, guest scrub-script content, `.claude.json` trust configuration, skill deduplication across inheritance chains, shell quoting, GitHub URL parsing
 - `GitRemoteUtilsTest` — URL normalization (SSH/HTTPS/case), protocol-lenient matching, reference device naming (hash-based, truncation, collision resistance), host repo matching across multiple remotes
 - `IncusApiTest` — REST API request/response parsing, exec body format, default exec environment, LOGIN_PATH_PREFIX
 
@@ -745,13 +803,28 @@ evidence; `.claude/rules/native-image.md` records what fixing it involves.
 **Integration tests** (`mvn verify -DskipITs=false`, requires Incus):
 - `TemplateBuildIT` — builds actual images, verifies metadata and agentuser
 
+**Manual security smoke checklist** (requires live Incus and is deliberately not covered by unit tests):
+1. Build and inspect `tpl-minimal`; verify `agentuser` has no sudo/group/subid privileges, the development sysctl file is absent, the listed Incus security keys are absent, and no `tun` device exists.
+2. Build and inspect `tpl-dev`; verify passwordless sudo and rootless Podman work and that every declared Incus setting/device is present.
+3. Build a hardened child directly from `tpl-dev`; verify the same hardened state as `tpl-minimal`. This specifically exercises the stopped-container ownership/idmap transition from a permissive parent.
+4. Build hardened and opted-in templates from both current pre-baked container and VM images. Verify UID 1000 ownership remains correct after idmap changes; VMs must have only the intended in-guest state and no container-specific Incus settings.
+
+**Manual automation mount checklist** (do not fold into the unit suite; run against disposable instances and paths):
+1. On Linux, mount and unmount read-only and read-write directories while an owned container is stopped and running. Inspect the instance's own devices after each operation and verify the exact source, target, type, and presence/absence of `readonly=true`; repeat each command to verify idempotency.
+2. Before each unmount, alter source, target, access, and one extra device field in turn. Verify every mismatch fails without removing or replacing the device. Repeat with another key, transient/error states, unsafe names, relative/`..`/root paths, NUL/newline input, and a malformed own device.
+3. On a named macOS pool, attach workspace leaves read-write and read-only. Verify the Incus source is the exact `/host/workspace/...` leaf, host writes work only for the read-write request, and an explicit read-only request remains read-only inside the instance.
+4. Attempt read-write mounts from runtime and each reference export, undeclared paths, symlink escapes, and a workspace leaf symlink resolving to the workspace root. Verify rejection before Incus mutation. Change the running export fingerprint and verify translation also fails closed.
+5. Mount runtime/reference leaves read-only and confirm both the inner Incus flag and outer VZ share prevent writes. Repeat through the macOS vsock path with both stopped and running containers, then verify lifecycle JSON remains one line and contains neither source nor target.
+
+Do not treat unit tests as coverage for these ownership/idmap transitions: they can assert the exact REST calls and scripts, but only a live Incus storage backend performs the on-disk remapping.
+
 ## Technical Tradeoffs
 
 ### System containers vs application containers
 System containers run a full init system and present as a complete machine. This means higher base image size (~200MB vs ~5MB Alpine) and longer first-build time (system upgrade, user creation, tool installation). However, clones are instant and near-zero cost with CoW storage, which is the common operation — you build once, branch many times.
 
-### No capability dropping (`lxc.cap.drop =`)
-Standard Incus containers drop many Linux capabilities for defense-in-depth. We don't, because the container *is* the security boundary and developers expect `ping`, `strace`, `perf`, raw sockets, and `dmesg` to work. The risk is that a container escape exploit has more host capabilities to abuse. For untrusted code where this matters, use `--vm` for KVM isolation with a separate kernel.
+### Explicit capability retention (`lxc.cap.drop =`)
+Standard Incus containers drop Linux capabilities for defense in depth, and hardened isx templates retain that default. Development templates can opt into `permissive-capabilities` when they require `ping`, `strace`, `perf`, raw sockets, or `dmesg`. The option deliberately broadens the impact of a container escape; use it only for workloads that need bare-metal-like debugging, and prefer a VM when stronger isolation matters.
 
 ### YAML tools vs a full plugin system (Packer, Ansible, etc.)
 We evaluated Packer (null builder + shell provisioner) and Ansible but rejected both. Packer's null builder is just indirection over what Java already does, and Ansible adds a Python dependency and playbook complexity for what amounts to "install some packages and run some scripts." YAML tool definitions give 90% of the flexibility with zero dependencies. Java `ToolSetup` implementations remain available as an escape hatch for tools that need programmatic logic (reading host config, conditional branching).
@@ -763,7 +836,7 @@ Built-in YAML tools are loaded from a hardcoded list of filenames rather than sc
 systemd-resolved (127.0.0.53) doesn't work reliably inside Incus containers because it expects to manage the network configuration. We disable it, point `/etc/resolv.conf` directly at the Incus bridge gateway (which runs dnsmasq), and make the file immutable with `chattr +i`. This is less flexible than systemd-resolved (no per-link DNS, no DNSSEC validation) but works reliably across container restarts and network changes. Domain interception for the MITM proxy is configured at the bridge level via `raw.dnsmasq` (dnsmasq `address=` directives), not via per-container `/etc/hosts`. This avoids a class of bugs where Incus overwrites `/etc/hosts` on container start.
 
 ### Credential isolation via MITM TLS proxy
-A TLS-terminating MITM proxy intercepts HTTPS connections to specific domains (Anthropic API, GitHub, IBM Bob), injects authentication headers server-side, and forwards to the real upstream. Containers resolve these domains to the gateway IP via bridge-level dnsmasq overrides (configured when `isx proxy` starts) and trust the proxy's certificates via a custom CA installed in the template image. This approach was chosen over simpler alternatives (reverse proxy with `ANTHROPIC_BASE_URL`, credential helpers, shell wrappers) because those approaches still expose credentials to code running inside the container — either as environment variables, in process memory via `curl` calls, or through accessible endpoints. The MITM proxy provides complete isolation: there is no API, endpoint, environment variable, or file that container code can access to obtain credentials.
+A TLS-terminating MITM proxy intercepts HTTPS connections to specific domains (Anthropic API, GitHub, IBM Bob), injects authentication headers server-side, and forwards to the real upstream. Containers resolve these domains to the gateway IP via bridge-level dnsmasq overrides configured during normal proxy setup or explicitly with `isx proxy configure-dns`, and trust the proxy's certificates via a custom CA installed in the template image. This approach was chosen over simpler alternatives (reverse proxy with `ANTHROPIC_BASE_URL`, credential helpers, shell wrappers) because those approaches still expose credentials to code running inside the container — either as environment variables, in process memory via `curl` calls, or through accessible endpoints. The MITM proxy provides complete isolation: there is no API, endpoint, environment variable, or file that container code can access to obtain credentials.
 
 ### Vertex AI: container in Vertex mode vs standard mode
 We initially ran containers in standard (non-Vertex) mode with proxy-side API translation — the container sent `/v1/messages` and the proxy rewrote to Vertex `rawPredict`. This had a critical flaw: Claude Code's model list is provider-dependent. In standard "firstParty" mode the model picker is a hardcoded subset that omits newer models (e.g. Opus 4.6 was missing). In Vertex mode the full catalogue is shown.
@@ -803,7 +876,8 @@ The CLI communicates with the Incus daemon via its REST API. The transport depen
 
 ```
 UnixSocketTransport (plain HTTP/1.1)
-  → ~/.local/state/incus-spawn/vm.incus.sock  (Unix socket on host)
+  → ~/.local/state/incus-spawn/vm.incus.sock  (legacy Unix socket on host)
+    or ~/.local/state/incus-spawn/pools/<name>/vm.incus.sock
     → vfkit virtio-vsock device (port 8443)
       → socat VSOCK-LISTEN:8443 inside VM
         → /run/incus/unix.socket (Incus daemon)
@@ -827,7 +901,7 @@ The vfkit vsock tunnel (`AF_VSOCK` across `host unix socket → vfkit → in-VM 
 
 ### Lifecycle locking
 
-Multiple `isx` processes can modify VM or proxy state concurrently (e.g. `isx vm restart` in one terminal while `ensureRunning()` auto-starts in another). Both `VmManager` and `ProxyService` guard mutating operations with an `fcntl` advisory file lock (`FileChannel.tryLock()`), auto-released on process death. The lock holder class is `AutoCloseable` and used in try-with-resources; public methods (`start`, `stop`, `restart`, `ensureRunning`, `install`, etc.) acquire the lock then delegate to private `*Locked()` variants so a method that calls another mutating method (e.g. `restart` → `stopLocked` + `startLocked`) does not re-lock within the same JVM — Java throws `OverlappingFileLockException` on same-JVM re-acquisition. Lock files live at `~/.local/state/incus-spawn/vm.lock` (VM) and `~/.config/incus-spawn/proxy.lock` (proxy). Acquisition retries for 30 seconds with a user-visible wait message before timing out.
+Multiple `isx` processes can modify VM or proxy state concurrently (e.g. `isx vm restart` in one terminal while `ensureRunning()` auto-starts in another). Both `VmManager` and `ProxyService` guard mutating operations with an `fcntl` advisory file lock (`FileChannel.tryLock()`), auto-released on process death. The lock holder class is `AutoCloseable` and used in try-with-resources; public methods (`start`, `stop`, `restart`, `ensureRunning`, `install`, etc.) acquire the lock then delegate to private `*Locked()` variants so a method that calls another mutating method (e.g. `restart` → `stopLocked` + `startLocked`) does not re-lock within the same JVM — Java throws `OverlappingFileLockException` on same-JVM re-acquisition. The VM lock lives at `~/.local/state/incus-spawn/vm.lock` for the legacy VM or `~/.local/state/incus-spawn/pools/<name>/vm.lock` for a named pool; the global proxy lock remains `~/.config/incus-spawn/proxy.lock`. Acquisition retries for 30 seconds with a user-visible wait message before timing out.
 
 ## VM Appliance
 
@@ -850,7 +924,7 @@ Real API keys and tokens never enter containers, regardless of network mode. Con
 | GCP credentials (Vertex mode) | **Nothing** | Container runs Claude Code in Vertex mode with `CLAUDE_CODE_SKIP_VERTEX_AUTH=1`. Proxy injects GCP Bearer token from `gcloud` on the host. No GCP credentials, service accounts, or access tokens enter the container |
 | Pi Anthropic key | Placeholder `sk-ant-placeholder` in `ANTHROPIC_API_KEY` | Same as Claude direct/OAuth mode. Pi always uses standard API format; the proxy handles key injection, OAuth Bearer injection, or Vertex translation transparently |
 | OpenAI API key | Placeholder `sk-placeholder` in `OPENAI_API_KEY` | Proxy replaces `Authorization: Bearer` header with real key for `api.openai.com`. Behind `openai` feature flag |
-| GitHub token | Placeholder `gho_placeholder` in `GH_TOKEN` | Proxy replaces `Authorization` header with real token for GitHub domains (Basic auth for `github.com` git HTTP, Bearer for API) |
+| GitHub token | Placeholder `gho_placeholder` in `GITHUB_TOKEN` and `GH_TOKEN` | Proxy replaces `Authorization` header with real token for GitHub domains (Basic auth for `github.com` git HTTP, Bearer for API) |
 
 The MITM TLS proxy provides credential isolation:
 1. Bridge-level dnsmasq overrides (configured by `isx proxy`) route intercepted domains to the gateway IP

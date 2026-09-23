@@ -1,7 +1,7 @@
 #!/bin/bash
-# Tests rootless podman inside an incus-spawn container.
-# Validates subordinate UID/GID support (security.idmap.size + subuid/subgid)
-# by running a PostgreSQL container as agentuser without root privileges.
+# Tests rootless podman inside an incus-spawn container whose template sets
+# security.nested-containers. Validates the resulting idmap, tun, and subordinate
+# UID/GID state by running a PostgreSQL container as agentuser without root privileges.
 #
 # Usage: incus file push test-podman.sh <instance>/tmp/
 #        incus exec <instance> -- bash /tmp/test-podman.sh

@@ -21,9 +21,10 @@ every user's run then fails on a directory they cannot even stat.
 
 **Two classes may hold eagerly resolved host state, and both are on the flag:**
 
-- `RuntimeConstants` (`common`) — `DOWNLOAD_CACHE_DIR`, `SKILLS_CACHE_DIR`, and `CDI_TOOLS` (the
-  Java tool setups, which hold a `DownloadCache`).
-- `RuntimeServices` (`cli`) — Incus client, background tasks, lock manager, tool-def loader.
+- `RuntimeConstants` (`common`) — the immutable `ISX_POOL` selection, `DOWNLOAD_CACHE_DIR`,
+  `SKILLS_CACHE_DIR`, and `CDI_TOOLS` (the Java tool setups, which hold a `DownloadCache`).
+- `RuntimeServices` (`cli`) — Incus client, background tasks, pool-aware lock manager, tool-def
+  loader.
 
 `Environment` is on the list too and stays **method-based** on purpose: that is what lets tests
 point `user.home` at a temp dir. `Platform` is deliberately *not* on it — its `os.name` lookup is

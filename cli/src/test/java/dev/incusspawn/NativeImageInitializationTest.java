@@ -18,8 +18,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * and the proxy's {@code application.properties}, and the duplicate list in {@code cli/pom.xml}'s
  * {@code macos-native} profile.
  * <p>
- * {@link RuntimeConstants} and {@link RuntimeServices} resolve host paths in their static
- * initializers and are only correct because {@code --initialize-at-run-time} defers them past image
+ * {@link RuntimeConstants} and {@link RuntimeServices} resolve host paths (and the immutable
+ * worker-pool environment selection) in their static initializers and are only correct because
+ * {@code --initialize-at-run-time} defers them past image
  * build; {@link BakedHostPathFeature} is what catches it when that slips. Dropping either from one
  * declaration yields a binary with the build machine's home directory baked in (that is how
  * {@code /root/.cache/incus-spawn/downloads} once shipped) — and a Linux build would never notice

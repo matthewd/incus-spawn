@@ -12,8 +12,23 @@ import java.util.Map;
  */
 interface IncusTransport {
 
-    record RawResponse(int statusCode, byte[] body) {
+    record RawResponse(int statusCode, byte[] body, Map<String, String> headers) {
+        public RawResponse(int statusCode, byte[] body) {
+            this(statusCode, body, Map.of());
+        }
+
+        public RawResponse {
+            var normalized = new java.util.LinkedHashMap<String, String>();
+            headers.forEach((name, value) ->
+                    normalized.put(name.toLowerCase(java.util.Locale.ROOT), value));
+            headers = Map.copyOf(normalized);
+        }
+
         boolean isSuccess() { return statusCode >= 200 && statusCode < 300; }
+
+        String header(String name) {
+            return headers.getOrDefault(name.toLowerCase(java.util.Locale.ROOT), "");
+        }
     }
 
     /**

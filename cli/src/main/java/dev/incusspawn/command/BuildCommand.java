@@ -171,6 +171,13 @@ public class BuildCommand extends BaseCommand {
         toolDefLoader.reload();
         var loaded = ImageDef.loadAllWithConflicts();
         var toolConflicts = toolDefLoader.conflicts();
+        if (!loaded.parseErrors().isEmpty()) {
+            System.err.println("Cannot build: one or more image definitions are invalid.");
+            for (var error : loaded.parseErrors()) {
+                System.err.println("  " + error);
+            }
+            return CommandResult.valueOf(1);
+        }
         if (!loaded.conflicts().isEmpty() || !toolConflicts.isEmpty()) {
             System.err.println("Cannot build: definitions have conflicting names.");
             for (var conflict : loaded.conflicts()) {
@@ -725,7 +732,7 @@ public class BuildCommand extends BaseCommand {
         var storedSha = incus.configGet(imageName, Metadata.DEFINITION_SHA);
         if (storedSha != null && !storedSha.isEmpty()) {
             var currentSha = imageDef.contentFingerprint(
-                    computeToolFingerprints(imageDef, toolDefLoader, defs));
+                    computeToolFingerprints(imageDef, toolDefLoader, defs), defs);
             if (!storedSha.equals(currentSha)) {
                 return true;
             }
@@ -936,16 +943,8 @@ public class BuildCommand extends BaseCommand {
         }
         BuildOutput.stepStart("Deriving from parent image '" + parentCanonical + "'...");
         incus.copy(parentSource, buildName, copyPlan);
-        if (!effectiveVm) {
-            incus.configSet(buildName, "security.idmap.size", "165536");
-            incus.configSet(buildName, "security.nesting", "true");
-            if (Platform.isLinux()) {
-                incus.configSet(buildName, "security.syscalls.intercept.setxattr", "true");
-            }
-            incus.configSet(buildName, "raw.lxc", "lxc.cap.drop =");
-            incus.deviceAdd(buildName, "tun", "unix-char",
-                    "source=/dev/net/tun", "path=/dev/net/tun", "mode=0666");
-        }
+        var security = ImageDef.resolveSecurity(imageDef, defs);
+        applyContainerSecurityPolicy(buildName, security, effectiveVm);
         incus.start(buildName);
         incus.waitForReady(buildName);
 
@@ -1001,6 +1000,7 @@ public class BuildCommand extends BaseCommand {
 
         HostResourceSetup.removeBuildDevices(incus, buildName, hostResources);
         unmountDnfCache(buildName);
+        applyGuestSecurityPolicy(container, security);
 
         cleanCaches(buildName);
 
@@ -1089,6 +1089,7 @@ public class BuildCommand extends BaseCommand {
             incus.deviceConfigSet(buildName, "root", "size", ResourceLimits.defaultDiskLimit());
             incus.configSet(buildName, "limits.memory", ResourceLimits.adaptiveMemoryLimit());
         }
+        applyContainerSecurityPolicy(buildName, ImageDef.resolveSecurity(imageDef, defs), effectiveVm);
         incus.start(buildName);
         waitForReady(buildName);
         BuildOutput.stepDone();
@@ -1106,26 +1107,9 @@ public class BuildCommand extends BaseCommand {
                 .assertSuccess("Failed to update CA trust");
         BuildOutput.stepDone();
 
-        // Container-only security tweaks: UID mapping, nesting, capability
-        // retention, and setxattr interception. VMs run a full kernel and
-        // don't need any of these. Restart activates the new config.
         if (!effectiveVm) {
-            incus.configSet(buildName, "raw.idmap", "both 1000 1000");
-            incus.configSet(buildName, "security.idmap.size", "165536");
-            incus.configSet(buildName, "security.nesting", "true");
-            if (Platform.isLinux()) {
-                incus.configSet(buildName, "security.syscalls.intercept.setxattr", "true");
-            }
-            incus.configSet(buildName, "raw.lxc", "lxc.cap.drop =");
             prepareContainerForPackageInstall(container);
-
-            BuildOutput.stepStart("Restarting container...");
-            incus.stop(buildName);
-            incus.deviceAdd(buildName, "tun", "unix-char",
-                    "source=/dev/net/tun", "path=/dev/net/tun", "mode=0666");
-            incus.start(buildName);
             incus.waitForSystemd(buildName);
-            BuildOutput.stepDone();
             waitForIpv4(container);
         }
 
@@ -1183,15 +1167,8 @@ public class BuildCommand extends BaseCommand {
                     .assertSuccess("Failed to set home directory ownership");
             container.exec("mkdir", "-p", "/home/agentuser/inbox")
                     .assertSuccess("Failed to create inbox directory");
-            container.sh(
-                    "echo 'agentuser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/agentuser")
-                    .assertSuccess("Failed to configure passwordless sudo");
             BuildOutput.stepDone();
         }
-        container.sh(
-                "echo 'agentuser:100000:65536' > /etc/subuid && " +
-                "echo 'agentuser:100000:65536' > /etc/subgid")
-                .assertSuccess("Failed to configure subordinate UIDs");
 
         if (!prebaked) {
             container.sh(
@@ -1246,6 +1223,7 @@ public class BuildCommand extends BaseCommand {
 
         HostResourceSetup.removeBuildDevices(incus, buildName, hostResources);
         unmountDnfCache(buildName);
+        applyGuestSecurityPolicy(container, ImageDef.resolveSecurity(imageDef, defs));
 
         cleanCaches(buildName);
 
@@ -1362,6 +1340,89 @@ public class BuildCommand extends BaseCommand {
             throw new RuntimeException(
                     "Failed to download base image from " + resolvedUrl + ": " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Replace all Incus-side privilege state on a stopped container. Clearing
+     * first is essential for children copied from a more permissive parent and
+     * for pre-baked roots carrying stale instance configuration.
+     */
+    void applyContainerSecurityPolicy(String container, ImageDef.Security policy, boolean vm) {
+        if (vm) return;
+
+        incus.configUnset(container, "security.privileged");
+        incus.configUnset(container, "security.nesting");
+        incus.configUnset(container, "security.syscalls.intercept.setxattr");
+        incus.configUnset(container, "raw.lxc");
+        incus.configUnset(container, "raw.idmap");
+        incus.configUnset(container, "security.idmap.base");
+        incus.configUnset(container, "security.idmap.isolated");
+        incus.configUnset(container, "security.idmap.size");
+        incus.deviceRemove(container, "tun");
+
+        if (policy.isNestedContainers()) {
+            incus.configSet(container, "raw.idmap", "both 1000 1000");
+            incus.configSet(container, "security.idmap.size", "165536");
+            incus.configSet(container, "security.nesting", "true");
+            if (Platform.isLinux()) {
+                incus.configSet(container, "security.syscalls.intercept.setxattr", "true");
+            }
+            incus.deviceAdd(container, "tun", "unix-char",
+                    "source=/dev/net/tun", "path=/dev/net/tun", "mode=0666");
+        }
+        if (policy.isPermissiveCapabilities()) {
+            incus.configSet(container, "raw.lxc", "lxc.cap.drop =");
+        }
+    }
+
+    /** Apply the in-guest half of the exact security policy after trusted setup. */
+    void applyGuestSecurityPolicy(Container container, ImageDef.Security policy) {
+        container.sh(guestSecurityScript(policy))
+                .assertSuccess("Failed to apply template security policy");
+    }
+
+    static String guestSecurityScript(ImageDef.Security policy) {
+        var script = new StringBuilder("""
+                set -eu
+                test "$(id -u agentuser)" -ne 0
+                rm -f /etc/sudoers.d/agentuser
+                for group in wheel sudo; do
+                  if id -nG agentuser | tr ' ' '\\n' | grep -qx "$group"; then
+                    gpasswd -d agentuser "$group" >/dev/null
+                  fi
+                done
+                for file in /etc/subuid /etc/subgid; do
+                  if [ -f "$file" ]; then
+                    sed -i '/^[[:space:]]*agentuser:/d' "$file"
+                  fi
+                done
+                rm -f /etc/sysctl.d/99-dev-container.conf
+                """);
+        if (policy.isSudo()) {
+            script.append("""
+                    mkdir -p /etc/sudoers.d
+                    printf '%s\\n' 'agentuser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/agentuser
+                    chmod 0440 /etc/sudoers.d/agentuser
+                    """);
+        }
+        if (policy.isNestedContainers()) {
+            script.append("""
+                    printf '%s\\n' 'agentuser:100000:65536' >> /etc/subuid
+                    printf '%s\\n' 'agentuser:100000:65536' >> /etc/subgid
+                    """);
+        }
+        if (policy.isPermissiveCapabilities()) {
+            script.append("""
+                    mkdir -p /etc/sysctl.d
+                    printf '%s\\n' \\
+                      'net.ipv4.ping_group_range = 0 2147483647' \\
+                      'kernel.dmesg_restrict = 0' \\
+                      'kernel.perf_event_paranoid = 1' \\
+                      'kernel.yama.ptrace_scope = 0' \\
+                      > /etc/sysctl.d/99-dev-container.conf
+                    """);
+        }
+        return script.toString();
     }
 
     private void prepareContainerForPackageInstall(Container container) {
@@ -2008,7 +2069,7 @@ public class BuildCommand extends BaseCommand {
         incus.configSet(container, Metadata.BUILD_SHA, info.gitSha());
         incus.configSet(container, Metadata.CA_FINGERPRINT, CertificateAuthority.currentCaFingerprint());
         incus.configSet(container, Metadata.DEFINITION_SHA,
-                imageDef.contentFingerprint(computeToolFingerprints(imageDef, toolDefLoader, defs)));
+                imageDef.contentFingerprint(computeToolFingerprints(imageDef, toolDefLoader, defs), defs));
     }
 
     private static Map<String, String> computeToolFingerprints(

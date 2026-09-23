@@ -22,8 +22,11 @@ On macOS the build runs in a podman container that cannot create loop devices, s
 
 This is how to test a freshly-built appliance the way macOS users actually run
 it — `isx` boots the VM itself (wiring up the vsock forwarder, the virtio-fs
-host mount, and the data/swap disks) and connects to the Incus daemon over
-vsock.
+host exports, and the data/swap disks) and connects to the Incus daemon over
+vsock. Named worker pools require the companion incus-spawn vfkit fork's
+`virtio-fs,...,readonly` extension; upstream vfkit intentionally fails their
+launch. The appliance's matching `mount -o ro` flags are defense in depth and
+do not replace the fork's `VZSharedDirectory` read-only enforcement.
 
 > **macOS only.** On Linux, `isx` connects to a *natively installed* Incus over
 > `/run/incus/unix.socket`; the appliance VM (QEMU) is not wired for vsock, so

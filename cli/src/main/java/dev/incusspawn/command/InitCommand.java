@@ -3,6 +3,7 @@ package dev.incusspawn.command;
 import dev.incusspawn.Environment;
 import dev.incusspawn.config.HostResourceSetup;
 import dev.incusspawn.config.SpawnConfig;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.incus.BridgeSubnetCheck;
 import dev.incusspawn.incus.CidrUtils;
 import dev.incusspawn.incus.FirewalldCheck;
@@ -283,6 +284,9 @@ public class InitCommand extends BaseCommand {
         startStep("DNS Configuration", DNS_HINT);
         ProxyConfig.configureBridgeDns(incus);
 
+        // Everything required by the proxy is now configured. Publish completion before
+        // starting the service, which validates this marker in a separate process.
+        markInitComplete();
         startStep("Proxy Service",
                 "The MITM proxy intercepts HTTPS traffic from containers",
                 "and injects real credentials (API keys, tokens) so that",
@@ -295,7 +299,6 @@ public class InitCommand extends BaseCommand {
         var proxyStep = proxyServiceInstalled
                 ? "   2. Proxy is running as a systemd service"
                 : "   2. Start the auth proxy:  isx proxy start";
-        markInitComplete();
         printCompletionBox(
                 "   " + GREEN_BOLD + "✓" + RESET + BOLD + " Setup complete!" + RESET,
                 "",
@@ -350,6 +353,9 @@ public class InitCommand extends BaseCommand {
         startStep("DNS Configuration", DNS_HINT);
         ProxyConfig.configureBridgeDns(incus);
 
+        // The launchd proxy validates initialization when it starts. Mandatory setup is complete;
+        // service installation is optional and may be retried independently.
+        markInitComplete();
         startStep("macOS Services",
                 "Installs the Incus VM and MITM proxy as macOS launch",
                 "agents so they start automatically on login and survive",
@@ -358,7 +364,6 @@ public class InitCommand extends BaseCommand {
                 "containers.");
         offerMacOsServices();
 
-        markInitComplete();
         printCompletionBox(
                 "   " + GREEN_BOLD + "✓" + RESET + BOLD + " Setup complete!" + RESET,
                 "",
@@ -2466,21 +2471,37 @@ public class InitCommand extends BaseCommand {
     }
 
     private void offerMacOsServices() {
+        var namedPool = !WorkerPoolSelection.current().isLegacy();
         if (ProxyService.isMacOsServiceInstalled()) {
-            System.out.println("  macOS services already installed.");
+            if (!ProxyService.upgradeIfNeeded()) {
+                throw new IllegalStateException(
+                        "Could not reconcile the macOS proxy service for the selected worker pool");
+            }
+            System.out.println(namedPool
+                    ? "  macOS proxy service already installed; named pool remains demand-started."
+                    : "  macOS services already installed.");
             return;
         }
         System.out.println();
-        System.out.println("  Optional: install VM and proxy as macOS services so they start");
-        System.out.println("  automatically on login and survive reboots.");
+        if (namedPool) {
+            System.out.println("  Optional: install the global proxy as a macOS service.");
+            System.out.println("  Named worker pools remain demand-started and get no login service.");
+        } else {
+            System.out.println("  Optional: install VM and proxy as macOS services so they start");
+            System.out.println("  automatically on login and survive reboots.");
+        }
         System.out.println();
         var console = System.console();
         if (console == null) return;
-        if (!askConfirmation(console, "  Install services?", true)) {
-            System.out.println("  Skipped. Start manually with: isx vm start && isx proxy start");
+        if (!askConfirmation(console, namedPool ? "  Install proxy service?" : "  Install services?", true)) {
+            System.out.println(namedPool
+                    ? "  Skipped. Start manually with: isx proxy start"
+                    : "  Skipped. Start manually with: isx vm start && isx proxy start");
             return;
         }
-        ProxyService.install();
+        if (!ProxyService.install()) {
+            throw new IllegalStateException("Could not install the macOS proxy service");
+        }
     }
 
     private boolean offerProxyService() {

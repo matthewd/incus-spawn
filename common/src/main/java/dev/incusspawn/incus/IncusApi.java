@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import dev.incusspawn.Environment;
+import dev.incusspawn.automation.AutomationTransport;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -23,6 +24,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * High-level HTTP client for the Incus REST API.
@@ -130,7 +133,18 @@ class IncusApi {
                 """;
     }
 
-    record ApiResponse(int statusCode, JsonNode body) {
+    record ApiResponse(int statusCode, JsonNode body, Map<String, String> headers) {
+        ApiResponse(int statusCode, JsonNode body) {
+            this(statusCode, body, Map.of());
+        }
+
+        ApiResponse {
+            var normalized = new LinkedHashMap<String, String>();
+            headers.forEach((name, value) ->
+                    normalized.put(name.toLowerCase(java.util.Locale.ROOT), value));
+            headers = Map.copyOf(normalized);
+        }
+
         boolean isSuccess() {
             return statusCode >= 200 && statusCode < 300;
         }
@@ -141,6 +155,10 @@ class IncusApi {
 
         String operationPath() {
             return body.path("operation").asText("");
+        }
+
+        String header(String name) {
+            return headers.getOrDefault(name.toLowerCase(java.util.Locale.ROOT), "");
         }
     }
 
@@ -183,33 +201,124 @@ class IncusApi {
                 Map.of("devices", Map.of(deviceName, merged)));
     }
 
+    /** Add a named own device only if a fresh unexpanded-device GET still finds it absent. */
+    ApiResponse addDeviceIfAbsent(
+            String instanceName, String automationKey, String deviceName,
+            java.util.Map<String, String> device) {
+        var getResp = get("/1.0/instances/" + instanceName);
+        if (!getResp.isSuccess()) throw new IncusException("Failed to get instance " + instanceName);
+        var metadata = getResp.body().path("metadata");
+        requireAutomationMutationOwner(metadata, automationKey, instanceName);
+        var devices = metadata.path("devices");
+        if (!devices.isObject()) {
+            throw new IncusException("Instance " + instanceName + " has malformed own devices");
+        }
+        if (devices.has(deviceName)) {
+            throw new IncusException("Device " + deviceName
+                    + " appeared before exact addition to " + instanceName);
+        }
+        var devicesNode = copyOwnDevices(devices);
+        devicesNode.set(deviceName, JSON.valueToTree(device));
+        return requestAndWait("PUT", "/1.0/instances/" + instanceName,
+                instanceUpdateBody(metadata, devicesNode), ifMatch(getResp, instanceName));
+    }
+
     /**
      * Remove a named device from an instance.
      * Incus PATCH cannot remove devices (null/empty are rejected), so this does a
      * read-modify-write: GET the current config, drop the device, PUT the full config back.
      */
     ApiResponse removeDevice(String instanceName, String deviceName) {
+        return removeDevice(instanceName, null, deviceName, null);
+    }
+
+    ApiResponse removeDeviceExact(
+            String instanceName, String automationKey, String deviceName,
+            java.util.Map<String, String> expected) {
+        return removeDevice(instanceName, automationKey, deviceName, expected);
+    }
+
+    private ApiResponse removeDevice(
+            String instanceName, String automationKey, String deviceName,
+            java.util.Map<String, String> expected) {
         var getResp = get("/1.0/instances/" + instanceName);
         if (!getResp.isSuccess()) throw new IncusException("Failed to get instance " + instanceName);
 
         var metadata = getResp.body().path("metadata");
+        if (expected != null) {
+            requireAutomationMutationOwner(metadata, automationKey, instanceName);
+            if (!exactTextObject(metadata.path("devices").path(deviceName), expected)) {
+                throw new IncusException("Device " + deviceName
+                        + " changed before exact removal from " + instanceName);
+            }
+        }
 
         var devicesNode = JSON.createObjectNode();
         metadata.path("devices").fields().forEachRemaining(e -> {
             if (!e.getKey().equals(deviceName)) devicesNode.set(e.getKey(), e.getValue());
         });
+        var putBody = instanceUpdateBody(metadata, devicesNode);
 
-        var putBody = JSON.createObjectNode();
-        putBody.put("architecture", metadata.path("architecture").asText());
-        putBody.set("config", metadata.path("config").deepCopy());
-        putBody.put("description", metadata.path("description").asText(""));
-        putBody.set("devices", devicesNode);
-        putBody.put("ephemeral", metadata.path("ephemeral").asBoolean(false));
-        var profiles = putBody.putArray("profiles");
-        metadata.path("profiles").forEach(p -> profiles.add(p.asText()));
-        putBody.put("stateful", metadata.path("stateful").asBoolean(false));
+        return expected == null
+                ? requestAndWait("PUT", "/1.0/instances/" + instanceName, putBody)
+                : requestAndWait("PUT", "/1.0/instances/" + instanceName, putBody,
+                        ifMatch(getResp, instanceName));
+    }
 
-        return requestAndWait("PUT", "/1.0/instances/" + instanceName, putBody);
+    private static com.fasterxml.jackson.databind.node.ObjectNode copyOwnDevices(JsonNode devices) {
+        var copy = JSON.createObjectNode();
+        devices.fields().forEachRemaining(entry -> copy.set(entry.getKey(), entry.getValue()));
+        return copy;
+    }
+
+    private static com.fasterxml.jackson.databind.node.ObjectNode instanceUpdateBody(
+            JsonNode metadata, JsonNode devices) {
+        var body = JSON.createObjectNode();
+        body.put("architecture", metadata.path("architecture").asText());
+        body.set("config", metadata.path("config").deepCopy());
+        body.put("description", metadata.path("description").asText(""));
+        body.set("devices", devices);
+        body.put("ephemeral", metadata.path("ephemeral").asBoolean(false));
+        var profiles = body.putArray("profiles");
+        metadata.path("profiles").forEach(profile -> profiles.add(profile.asText()));
+        body.put("stateful", metadata.path("stateful").asBoolean(false));
+        return body;
+    }
+
+    private static void requireAutomationMutationOwner(
+            JsonNode metadata, String automationKey, String instanceName) {
+        if (!automationKey.equals(metadata.path("config").path(Metadata.AUTOMATION_KEY).asText(""))) {
+            throw new IncusException("Automation ownership changed before device mutation on "
+                    + instanceName);
+        }
+        var status = metadata.path("status").asText("");
+        if (!"Running".equalsIgnoreCase(status) && !"Stopped".equalsIgnoreCase(status)) {
+            throw new IncusException("Instance " + instanceName
+                    + " changed to a non-mountable state before device mutation");
+        }
+    }
+
+    private static Map<String, String> ifMatch(ApiResponse response, String instanceName) {
+        var etag = response.header("etag");
+        if (etag.isBlank()) {
+            throw new IncusException("Incus omitted the instance ETag required for exact mutation on "
+                    + instanceName);
+        }
+        return Map.of("If-Match", etag);
+    }
+
+    private static boolean exactTextObject(
+            JsonNode actual, java.util.Map<String, String> expected) {
+        if (!actual.isObject() || actual.size() != expected.size()) return false;
+        var fields = actual.fields();
+        while (fields.hasNext()) {
+            var field = fields.next();
+            if (!field.getValue().isTextual()
+                    || !field.getValue().textValue().equals(expected.get(field.getKey()))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     ApiResponse removeDevices(String instanceName, java.util.Collection<String> deviceNames) {
@@ -248,7 +357,12 @@ class IncusApi {
      * Incus returns HTTP 202 with an operation URL for async operations (start, stop, copy, etc.).
      */
     ApiResponse requestAndWait(String method, String apiPath, Object body) {
-        var resp = request(method, apiPath, body);
+        return requestAndWait(method, apiPath, body, Map.of());
+    }
+
+    ApiResponse requestAndWait(
+            String method, String apiPath, Object body, Map<String, String> headers) {
+        var resp = request(method, apiPath, body, headers);
         if (!resp.isAsync()) return resp;
         var opPath = resp.operationPath();
         if (opPath.isEmpty()) throw new IncusException("Async response missing operation path");
@@ -398,11 +512,16 @@ class IncusApi {
     }
 
     private ApiResponse request(String method, String path, Object bodyObj) {
+        return request(method, path, bodyObj, Map.of());
+    }
+
+    private ApiResponse request(
+            String method, String path, Object bodyObj, Map<String, String> headers) {
         try {
             byte[] bodyBytes = bodyObj != null ? JSON.writeValueAsBytes(bodyObj) : new byte[0];
-            var raw = transport.requestPooled(method, path, "application/json", Map.of(), bodyBytes);
+            var raw = transport.requestPooled(method, path, "application/json", headers, bodyBytes);
             var bodyJson = raw.body().length == 0 ? JSON.nullNode() : JSON.readTree(raw.body());
-            return new ApiResponse(raw.statusCode(), bodyJson);
+            return new ApiResponse(raw.statusCode(), bodyJson, raw.headers());
         } catch (IOException e) {
             throw new IncusException("Incus REST request failed: " + method + " " + path, e);
         }
@@ -415,7 +534,7 @@ class IncusApi {
             var raw = transport.requestPooled(method, path, "application/json", Map.of(),
                     bodyBytes, timeoutSeconds);
             var bodyJson = raw.body().length == 0 ? JSON.nullNode() : JSON.readTree(raw.body());
-            return new ApiResponse(raw.statusCode(), bodyJson);
+            return new ApiResponse(raw.statusCode(), bodyJson, raw.headers());
         } catch (IOException e) {
             throw new IncusException("Incus REST request failed: " + method + " " + path, e);
         }
@@ -426,7 +545,7 @@ class IncusApi {
         try {
             var raw = transport.request(method, path, contentType, extraHeaders, bodyBytes);
             var bodyJson = raw.body().length == 0 ? JSON.nullNode() : JSON.readTree(raw.body());
-            return new ApiResponse(raw.statusCode(), bodyJson);
+            return new ApiResponse(raw.statusCode(), bodyJson, raw.headers());
         } catch (IOException e) {
             throw new IncusException("Incus REST request failed: " + method + " " + path, e);
         }
@@ -437,7 +556,7 @@ class IncusApi {
         try {
             var raw = transport.request(method, path, contentType, extraHeaders, bodyFile);
             var bodyJson = raw.body().length == 0 ? JSON.nullNode() : JSON.readTree(raw.body());
-            return new ApiResponse(raw.statusCode(), bodyJson);
+            return new ApiResponse(raw.statusCode(), bodyJson, raw.headers());
         } catch (IOException e) {
             throw new IncusException("Incus REST request failed: " + method + " " + path, e);
         }
@@ -1033,6 +1152,201 @@ class IncusApi {
                                     InputStream stdin, OutputStream stdout, OutputStream stderr) {
         var exec = postExec(instance, command, uid, gid, cwd, env, false, 0, 0);
         return execWebSocket(exec, stdout, stderr, stdin);
+    }
+
+    /**
+     * Automation-only exact-argv exec with a caller deadline and externally triggered operation
+     * deletion. Existing exec entry points deliberately continue to use their established wait
+     * behavior above.
+     */
+    AutomationTransport.ExecOutcome execControlled(
+            String instance,
+            List<String> command,
+            Integer uid,
+            Integer gid,
+            String cwd,
+            Map<String, String> env,
+            InputStream stdin,
+            OutputStream stdout,
+            OutputStream stderr,
+            long timeoutMillis,
+            AutomationTransport.Cancellation cancellation) {
+        return retryOnNotRunning(() -> execControlledWs(instance, command, uid, gid, cwd, env,
+                stdin, stdout, stderr, timeoutMillis, cancellation));
+    }
+
+    private AutomationTransport.ExecOutcome execControlledWs(
+            String instance,
+            List<String> command,
+            Integer uid,
+            Integer gid,
+            String cwd,
+            Map<String, String> env,
+            InputStream stdin,
+            OutputStream stdout,
+            OutputStream stderr,
+            long timeoutMillis,
+            AutomationTransport.Cancellation cancellation) {
+        long started = System.nanoTime();
+        long timeoutNanos = timeoutMillis == 0
+                ? Long.MAX_VALUE
+                : java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        long deadline = timeoutNanos == Long.MAX_VALUE || Long.MAX_VALUE - started < timeoutNanos
+                ? Long.MAX_VALUE : started + timeoutNanos;
+
+        var exec = postExec(instance, command, uid, gid, cwd, env, false, 0, 0);
+        var deletionStarted = new AtomicBoolean();
+        var deletion = new CompletableFuture<AutomationTransport.CancellationAttempt>();
+        Runnable deleteOperation = () -> {
+            if (!deletionStarted.compareAndSet(false, true)) return;
+            deletion.complete(deleteExecOperation(exec.opPath));
+        };
+        cancellation.register(deleteOperation);
+        try {
+            if (cancellation.isRequested()) {
+                deleteOperation.run();
+                return terminated(AutomationTransport.Termination.CANCELLED, deletion.join());
+            }
+            if (System.nanoTime() >= deadline) {
+                deleteOperation.run();
+                return terminated(AutomationTransport.Termination.TIMEOUT, deletion.join());
+            }
+
+            var outDst = stdout != null ? stdout : OutputStream.nullOutputStream();
+            var errDst = stderr != null ? stderr : OutputStream.nullOutputStream();
+            try (var controlWs = transport.openWebSocket(wsUrl(exec, "control"));
+                 var stdoutWs = transport.openWebSocket(wsUrl(exec, "1"));
+                 var stderrWs = transport.openWebSocket(wsUrl(exec, "2"))) {
+                var keepalive = startKeepalive(controlWs);
+                var stdoutAlive = startKeepalive(stdoutWs);
+                var stderrAlive = startKeepalive(stderrWs);
+                var controlDrain = Thread.ofVirtual().start(() -> drainQuietly(controlWs));
+                var lastData = new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
+                var stdoutThread = Thread.ofVirtual().start(() -> wsWriteTo(stdoutWs, outDst, lastData));
+                var stderrThread = Thread.ofVirtual().start(() -> wsWriteTo(stderrWs, errDst, lastData));
+                var stdinThread = Thread.ofVirtual().start(() ->
+                        wsForward(exec.opPath, exec.fds.path("0").asText(), stdin));
+                assertAllFdsConnected(exec.fds, Set.of("0", "1", "2", "control"));
+
+                var waited = waitForControlledExec(exec.opPath, deadline, cancellation,
+                        deleteOperation, deletion);
+
+                stdoutAlive.interrupt();
+                stderrAlive.interrupt();
+                if (waited.termination() == AutomationTransport.Termination.EXITED) {
+                    drainThenClose(lastData, stdoutThread, stderrThread, stdoutWs, stderrWs);
+                } else {
+                    stdoutWs.close();
+                    stderrWs.close();
+                    joinQuietly(stdoutThread, stderrThread);
+                }
+                keepalive.interrupt();
+                controlWs.close();
+                joinQuietly(controlDrain);
+                try {
+                    stdinThread.join(2000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return new AutomationTransport.ExecOutcome(waited.exitCode(), waited.termination(),
+                        waited.cancellationAttempt());
+            } catch (IOException e) {
+                if (cancellation.isRequested()) {
+                    deleteOperation.run();
+                    return terminated(AutomationTransport.Termination.CANCELLED, deletion.join());
+                }
+                if (System.nanoTime() >= deadline) {
+                    deleteOperation.run();
+                    return terminated(AutomationTransport.Termination.TIMEOUT, deletion.join());
+                }
+                throw new IncusException("Failed to open automation exec WebSocket", e);
+            }
+        } finally {
+            cancellation.unregister(deleteOperation);
+        }
+    }
+
+    private record ControlledWait(int exitCode, AutomationTransport.Termination termination,
+                                  AutomationTransport.CancellationAttempt cancellationAttempt) {
+    }
+
+    private ControlledWait waitForControlledExec(
+            String opPath,
+            long deadline,
+            AutomationTransport.Cancellation cancellation,
+            Runnable deleteOperation,
+            CompletableFuture<AutomationTransport.CancellationAttempt> deletion) {
+        while (true) {
+            if (cancellation.isRequested()) {
+                deleteOperation.run();
+                return new ControlledWait(-1, AutomationTransport.Termination.CANCELLED,
+                        deletion.join());
+            }
+            if (System.nanoTime() >= deadline) {
+                deleteOperation.run();
+                return new ControlledWait(-1, AutomationTransport.Termination.TIMEOUT,
+                        deletion.join());
+            }
+
+            ApiResponse waitResp;
+            try {
+                waitResp = requestWithTimeout("GET", opPath + "/wait?timeout=1", null, 3);
+            } catch (IncusException failure) {
+                if (cancellation.isRequested()) {
+                    deleteOperation.run();
+                    return new ControlledWait(-1, AutomationTransport.Termination.CANCELLED,
+                            deletion.join());
+                }
+                if (System.nanoTime() >= deadline) {
+                    deleteOperation.run();
+                    return new ControlledWait(-1, AutomationTransport.Termination.TIMEOUT,
+                            deletion.join());
+                }
+                throw failure;
+            }
+            if (cancellation.isRequested()) {
+                deleteOperation.run();
+                return new ControlledWait(-1, AutomationTransport.Termination.CANCELLED,
+                        deletion.join());
+            }
+            if (System.nanoTime() >= deadline && !waitResp.isSuccess()) {
+                deleteOperation.run();
+                return new ControlledWait(-1, AutomationTransport.Termination.TIMEOUT,
+                        deletion.join());
+            }
+            if (!waitResp.isSuccess()) {
+                throw new IncusException("Exec operation wait failed (HTTP "
+                        + waitResp.statusCode() + ")");
+            }
+            var meta = waitResp.body().path("metadata");
+            var status = meta.path("status").asText();
+            if (!"Running".equals(status) && !"Pending".equals(status)) {
+                return new ControlledWait(meta.path("metadata").path("return").asInt(0),
+                        AutomationTransport.Termination.EXITED,
+                        AutomationTransport.CancellationAttempt.notAttempted());
+            }
+        }
+    }
+
+    private AutomationTransport.CancellationAttempt deleteExecOperation(String opPath) {
+        try {
+            var response = requestWithTimeout("DELETE", opPath, null, 3);
+            if (response.isSuccess()) {
+                return new AutomationTransport.CancellationAttempt(true, true, "");
+            }
+            var detail = response.body().path("error").asText("");
+            if (detail.isBlank()) detail = "HTTP " + response.statusCode();
+            return new AutomationTransport.CancellationAttempt(true, false, detail);
+        } catch (RuntimeException e) {
+            return new AutomationTransport.CancellationAttempt(true, false,
+                    e.getMessage() == null ? "operation DELETE failed" : e.getMessage());
+        }
+    }
+
+    private static AutomationTransport.ExecOutcome terminated(
+            AutomationTransport.Termination termination,
+            AutomationTransport.CancellationAttempt attempt) {
+        return new AutomationTransport.ExecOutcome(-1, termination, attempt);
     }
 
     /**

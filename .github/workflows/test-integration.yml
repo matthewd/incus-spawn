@@ -372,6 +372,8 @@ jobs:
           cat > ~/.config/incus-spawn/images/test-podman.yaml << 'EOF'
           name: tpl-test-podman
           parent: tpl-minimal
+          security:
+            nested-containers: true
           tools:
             - podman
           EOF

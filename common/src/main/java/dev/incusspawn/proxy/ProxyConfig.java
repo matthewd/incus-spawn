@@ -19,6 +19,10 @@ public final class ProxyConfig {
     public static final int CONTAINER_FACING_PORT = 443;
     public static final int DEFAULT_MITM_PORT = 18443;
     public static final int DEFAULT_HEALTH_PORT = 18080;
+    public static final String BB_GATEWAY_DOMAIN = "bb.isx.internal";
+    public static final String BB_GATEWAY_HOST = "127.0.0.1";
+    public static final int BB_GATEWAY_PORT = 18444;
+    public static final String BB_GATEWAY_SUBPROTOCOL = "bb-host-daemon.v1";
 
     public static final Set<String> ANTHROPIC_DOMAINS = Set.of("api.anthropic.com");
     public static final Set<String> REGISTRY_DOMAINS = Set.of(
@@ -41,6 +45,7 @@ public final class ProxyConfig {
         all.addAll(MAVEN_DOMAINS);
         all.addAll(GRADLE_DOMAINS);
         all.addAll(NPM_DOMAINS);
+        all.add(BB_GATEWAY_DOMAIN);
         BUILTIN_INTERCEPTED_DOMAINS = Set.copyOf(all);
     }
 
@@ -48,6 +53,10 @@ public final class ProxyConfig {
 
     public static Set<String> builtinInterceptedDomains() {
         return BUILTIN_INTERCEPTED_DOMAINS;
+    }
+
+    public static boolean isBbGatewayDomain(String domain) {
+        return BB_GATEWAY_DOMAIN.equalsIgnoreCase(domain);
     }
 
     /**
@@ -65,6 +74,17 @@ public final class ProxyConfig {
             all.add(d.startsWith("*.") ? d.substring(2) : d);
         }
         return Set.copyOf(all);
+    }
+
+    /** Resolve the exact domain set used by a normally configured proxy process. */
+    public static Set<String> resolvedInterceptedDomains(SpawnConfig config) {
+        var extra = new HashSet<>(ToolProxyResolver.resolvedDomains(config));
+        extra.addAll(CommandCredentialConfig.loadStrict().hosts());
+        return interceptedDomains(extra);
+    }
+
+    public static Set<String> currentInterceptedDomains() {
+        return resolvedInterceptedDomains(SpawnConfig.load());
     }
 
     public static boolean isInterceptedDomain(String domain, Set<String> toolProxyDomains,
@@ -120,7 +140,7 @@ public final class ProxyConfig {
     }
 
     public static void configureBridgeDns(IncusClient incus) {
-        configureBridgeDns(incus, Set.of());
+        configureBridgeDns(incus, currentInterceptedDomains());
     }
 
     public static void configureBridgeDns(IncusClient incus, Set<String> allDomains) {
@@ -131,7 +151,7 @@ public final class ProxyConfig {
     }
 
     public static void writeBridgeDns(IncusClient incus) {
-        writeBridgeDns(incus, BUILTIN_INTERCEPTED_DOMAINS);
+        writeBridgeDns(incus, currentInterceptedDomains());
     }
 
     public static void writeBridgeDns(IncusClient incus, Set<String> allDomains) {
@@ -216,14 +236,17 @@ public final class ProxyConfig {
     }
 
     public static boolean isBridgeDnsComplete(IncusClient incus) {
-        return isBridgeDnsComplete(incus, Set.of());
+        return isBridgeDnsComplete(incus, currentInterceptedDomains());
     }
 
     public static boolean isBridgeDnsComplete(IncusClient incus, Set<String> allDomains) {
         var overrides = getDnsOverrides(incus);
-        if (overrides.isEmpty()) return true;
+        if (overrides.isEmpty()) return false;
+        var lines = overrides.lines().collect(Collectors.toUnmodifiableSet());
+        var gatewayIp = resolveGatewayIp(incus);
         var domains = allDomains.isEmpty() ? BUILTIN_INTERCEPTED_DOMAINS : allDomains;
-        return domains.stream()
-                .allMatch(d -> overrides.contains("address=/" + d + "/"));
+        return domains.stream().allMatch(d ->
+                lines.contains("address=/" + d + "/" + gatewayIp)
+                        && lines.contains("address=/" + d + "/::"));
     }
 }

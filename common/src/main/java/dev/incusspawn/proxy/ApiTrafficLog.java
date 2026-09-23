@@ -56,17 +56,17 @@ public class ApiTrafficLog {
             var sb = new StringBuilder();
 
             sb.append(">>> REQUEST\n");
-            sb.append(originalRequest);
+            sb.append(redactHeaders(originalRequest));
             appendBody(sb, originalBody);
 
             if (forwardedRequest != null) {
                 sb.append("\n>>> FORWARDED AS\n");
-                sb.append(forwardedRequest);
+                sb.append(redactHeaders(forwardedRequest));
                 appendBody(sb, forwardedBody);
             }
 
             sb.append("\n<<< RESPONSE\n");
-            sb.append(responseDump);
+            sb.append(redactHeaders(responseDump));
             appendBody(sb, responseBody);
 
             Files.writeString(logDir.resolve(filename), sb.toString());
@@ -115,6 +115,30 @@ public class ApiTrafficLog {
         } catch (Exception e) {
             return new String(body, 0, Math.min(body.length, 4096));
         }
+    }
+
+    static String redactHeaders(String dump) {
+        if (dump == null) return null;
+        var redacted = new StringBuilder();
+        for (var line : dump.split("\\n", -1)) {
+            var colon = line.indexOf(':');
+            if (colon > 0) {
+                var name = line.substring(0, colon).trim();
+                if (name.equalsIgnoreCase("Authorization")
+                        || name.equalsIgnoreCase("Proxy-Authorization")
+                        || name.equalsIgnoreCase("x-api-key")
+                        || name.equalsIgnoreCase("x-access-token")) {
+                    redacted.append(line, 0, colon + 1).append(" [REDACTED]");
+                } else {
+                    redacted.append(line);
+                }
+            } else {
+                redacted.append(line);
+            }
+            redacted.append('\n');
+        }
+        if (!dump.endsWith("\n")) redacted.setLength(redacted.length() - 1);
+        return redacted.toString();
     }
 
     private static String sanitize(String path) {

@@ -587,16 +587,16 @@ class IncusApiTest {
     // --- copy() REST body format ---
 
     @Test
-    void copyBodyContainsSourceAndTarget() throws Exception {
-        var body = new java.util.LinkedHashMap<String, Object>();
-        body.put("name", "my-branch");
-        body.put("source", java.util.Map.of("type", "copy", "source", "tpl-dev"));
-        body.put("storage", "default");
+    void copyBodyContainsSourceTargetAndAtomicConfig() {
+        var body = IncusClient.copyRequestBody("tpl-dev", "my-branch", "default",
+                java.util.Map.of("user.incus-spawn.automation-key", "allocation-17"));
         var json = JSON.valueToTree(body);
         assertEquals("my-branch", json.path("name").asText());
         assertEquals("copy", json.path("source").path("type").asText());
         assertEquals("tpl-dev", json.path("source").path("source").asText());
         assertEquals("default", json.path("storage").asText());
+        assertEquals("allocation-17",
+                json.path("config").path("user.incus-spawn.automation-key").asText());
     }
 
     // --- launch() REST body format ---

@@ -2,6 +2,7 @@ package dev.incusspawn.vm;
 
 import dev.incusspawn.BuildInfo;
 import dev.incusspawn.Environment;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.incus.ResourceLimits;
 import dev.incusspawn.tool.DownloadCache;
@@ -24,11 +25,13 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntPredicate;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -115,47 +118,63 @@ public final class VmManager {
     // --- Resource detection ---
 
     public static int detectCpus() {
-        var env = System.getenv("ISX_VM_CPUS");
-        if (env != null && !env.isBlank()) {
+        return detectCpus(WorkerPoolSelection.current(), System.getenv("ISX_VM_CPUS"), () -> {
+            if (Platform.isMacOS()) {
+                int pcores = CpuInfo.performanceCores();
+                if (pcores > 0) return pcores;
+            }
+            return Math.max(1, ResourceLimits.hostProcessorCount() - 2);
+        });
+    }
+
+    static int detectCpus(WorkerPoolSelection selection, String legacyOverride,
+                          IntSupplier legacyDefault) {
+        var pool = selection.pool();
+        if (pool.isPresent()) return pool.get().cpus();
+        if (legacyOverride != null && !legacyOverride.isBlank()) {
             try {
-                int val = Integer.parseInt(env);
+                int val = Integer.parseInt(legacyOverride);
                 if (val < 1) {
-                    System.err.println("Warning: ISX_VM_CPUS=" + env + " is invalid, using 1");
+                    System.err.println("Warning: ISX_VM_CPUS=" + legacyOverride + " is invalid, using 1");
                     return 1;
                 }
                 return val;
             } catch (NumberFormatException e) {
-                System.err.println("Warning: ISX_VM_CPUS=" + env + " is not a number, ignoring");
+                System.err.println("Warning: ISX_VM_CPUS=" + legacyOverride + " is not a number, ignoring");
             }
         }
-        if (Platform.isMacOS()) {
-            int pcores = CpuInfo.performanceCores();
-            if (pcores > 0) return pcores;
-        }
-        return Math.max(1, ResourceLimits.hostProcessorCount() - 2);
+        return legacyDefault.getAsInt();
     }
 
     public static int detectMemoryMiB() {
-        var env = System.getenv("ISX_VM_MEMORY");
-        if (env != null && !env.isBlank()) {
+        return detectMemoryMiB(WorkerPoolSelection.current(), System.getenv("ISX_VM_MEMORY"), () -> {
+            long totalBytes = ResourceLimits.totalMemoryBytes();
+            if (totalBytes <= 0) return 4096;
+            int pct = Platform.isMacOS() ? 40 : 60;
+            long limitMiB = totalBytes * pct / 100 / (1024 * 1024);
+            return (int) Math.max(2048, limitMiB);
+        });
+    }
+
+    static int detectMemoryMiB(WorkerPoolSelection selection, String legacyOverride,
+                               IntSupplier legacyDefault) {
+        var pool = selection.pool();
+        if (pool.isPresent()) return pool.get().memoryMib();
+        if (legacyOverride != null && !legacyOverride.isBlank()) {
             try {
-                int val = Integer.parseInt(env);
+                int val = Integer.parseInt(legacyOverride);
                 if (val < 2048) {
-                    System.err.println("Warning: ISX_VM_MEMORY=" + env + " is below minimum, using 2048 MiB");
+                    System.err.println("Warning: ISX_VM_MEMORY=" + legacyOverride
+                            + " is below minimum, using 2048 MiB");
                     return 2048;
                 }
                 return val;
             } catch (NumberFormatException e) {
-                System.err.println("Warning: ISX_VM_MEMORY=" + env + " is not a number, ignoring");
+                System.err.println("Warning: ISX_VM_MEMORY=" + legacyOverride
+                        + " is not a number, ignoring");
             }
         }
-        long totalBytes = ResourceLimits.totalMemoryBytes();
-        if (totalBytes <= 0) {
-            return 4096;
-        }
-        int pct = Platform.isMacOS() ? 40 : 60;
-        long limitMiB = totalBytes * pct / 100 / (1024 * 1024);
-        return (int) Math.max(2048, limitMiB);
+        return legacyDefault.getAsInt();
     }
 
     public static String diskSize() {
@@ -171,10 +190,13 @@ public final class VmManager {
     }
 
     public static String swapSize() {
-        var env = System.getenv("ISX_VM_SWAP");
-        if (env != null && !env.isBlank()) {
-            return env;
-        }
+        return swapSize(WorkerPoolSelection.current(), System.getenv("ISX_VM_SWAP"));
+    }
+
+    static String swapSize(WorkerPoolSelection selection, String legacyOverride) {
+        var pool = selection.pool();
+        if (pool.isPresent()) return pool.get().swap();
+        if (legacyOverride != null && !legacyOverride.isBlank()) return legacyOverride;
         return DEFAULT_SWAP_SIZE;
     }
 
@@ -194,6 +216,15 @@ public final class VmManager {
         var cached = resolvedApplianceVersion;
         if (cached != null) return cached;
 
+        var override = Environment.strippedEnv("ISX_APPLIANCE_VERSION");
+        if (!override.isBlank()) {
+            if (!isSafeApplianceVersion(override)) {
+                throw new VmException("ISX_APPLIANCE_VERSION contains unsupported characters");
+            }
+            resolvedApplianceVersion = override;
+            return override;
+        }
+
         var build = BuildInfo.instance();
         String result;
         if (!build.isDev()) {
@@ -210,6 +241,10 @@ public final class VmManager {
         }
         resolvedApplianceVersion = result;
         return result;
+    }
+
+    static boolean isSafeApplianceVersion(String value) {
+        return value != null && value.matches("[A-Za-z0-9][A-Za-z0-9._+-]{0,127}");
     }
 
     private static String queryLatestGitHubRelease() {
@@ -238,6 +273,11 @@ public final class VmManager {
     public static Backend detectBackend() {
         if (Platform.isMacOS()) {
             if (!commandExists("vfkit")) {
+                if (!WorkerPoolSelection.current().isLegacy()) {
+                    throw new VmException("vfkit not found. Named worker pools require the companion "
+                            + "incus-spawn vfkit fork with virtio-fs readonly support; do not install "
+                            + "unsupported upstream vfkit for this pool.");
+                }
                 throw new VmException("vfkit not found. Install with: brew install vfkit");
             }
             return Backend.VFKIT;
@@ -335,6 +375,7 @@ public final class VmManager {
 
     private static boolean startLocked() {
         if (isRunning()) {
+            requireRunningExportPlanCurrent();
             BuildOutput.note("VM already running (pid=" + readPid() + ").");
             return true;
         }
@@ -351,12 +392,18 @@ public final class VmManager {
         var backend = detectBackend();
         int cpus = detectCpus();
         int memoryMiB = detectMemoryMiB();
+        VmHostExports hostExports = backend == Backend.VFKIT ? selectedHostExports() : null;
 
         if (backend == Backend.VFKIT && !Files.exists(Environment.vmLogFile())) {
             System.out.println();
-            BuildOutput.note("macOS may show permission dialogs for home folder access and");
+            BuildOutput.note("macOS may show permission dialogs for host folders and");
             BuildOutput.note("local network connectivity. These are safe to approve:");
-            BuildOutput.note("  - Your home directory is mounted read-only (nothing is modified)");
+            if (hostExports == null) {
+                BuildOutput.note("  - Your home directory is mounted read-only (nothing is modified)");
+            } else {
+                BuildOutput.note("  - Only the worker pool's declared roots are exported");
+                BuildOutput.note("  - Runtime and reference roots are enforced read-only by vfkit");
+            }
             BuildOutput.note("  - Agents run in sandboxed containers that only see paths you configure");
             BuildOutput.note("  - Network access enables connectivity for the Linux containers");
         }
@@ -366,7 +413,7 @@ public final class VmManager {
         try {
             Files.createDirectories(Environment.vmStateDir());
             switch (backend) {
-                case VFKIT -> startVfkit(cpus, memoryMiB);
+                case VFKIT -> startVfkit(cpus, memoryMiB, hostExports);
                 case QEMU -> startQemu(cpus, memoryMiB);
             }
             return true;
@@ -439,15 +486,27 @@ public final class VmManager {
             } catch (Exception ignored) {}
         }
 
-        // SIGTERM
+        // SIGTERM. vfkit's signal handler makes its own bounded VZ stop request,
+        // so let that handler finish before escalating.
         if (handle.get().isAlive()) {
             handle.get().destroy();
-            try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+            if (!awaitProcessExit(handle.get(), Duration.ofSeconds(7))) {
+                handle.get().destroyForcibly();
+            }
+        }
+        if (!awaitProcessExit(handle.get(), Duration.ofSeconds(5))) {
+            throw new VmException("VM process " + pid + " did not exit after forced termination");
         }
 
-        // SIGKILL
-        if (handle.get().isAlive()) {
-            handle.get().destroyForcibly();
+        // Process exit closes the image descriptors, but Virtualization.framework
+        // may release the corresponding storage attachments asynchronously.
+        if (Platform.isMacOS()) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new VmException("Interrupted while waiting for VM storage release");
+            }
         }
 
         cleanupStaleFiles();
@@ -455,18 +514,38 @@ public final class VmManager {
         BuildOutput.stepDone();
     }
 
+    static boolean awaitProcessExit(ProcessHandle handle, Duration timeout) {
+        if (!handle.isAlive()) return true;
+        try {
+            handle.onExit().get(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+            return true;
+        } catch (java.util.concurrent.TimeoutException e) {
+            return !handle.isAlive();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new VmException("Interrupted while waiting for VM process " + handle.pid() + " to exit");
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw new VmException("Failed while waiting for VM process " + handle.pid() + " to exit: "
+                    + e.getCause().getMessage());
+        }
+    }
+
     public static String status() {
+        var selection = WorkerPoolSelection.current();
         if (isRunning()) {
+            requireRunningExportPlanCurrent();
             long pid = readPid();
             var sb = new StringBuilder();
             sb.append("VM running (pid=").append(pid).append(")");
+            appendPoolStatus(sb, selection);
             var restUriFile = Environment.vmRestUriFile();
             if (Files.exists(restUriFile)) {
                 try {
                     sb.append("\n  REST API: ").append(Files.readString(restUriFile).strip());
                 } catch (IOException ignored) {}
             }
-            sb.append("\n  Log: ").append(Environment.vmLogFile());
+            sb.append("\n  Serial log: ").append(Environment.vmLogFile());
+            sb.append("\n  Launch log: ").append(Environment.vmLaunchLogFile());
             var running = runningApplianceVersion();
             if (running != null) {
                 sb.append("\n  Appliance: ").append(running);
@@ -486,7 +565,23 @@ public final class VmManager {
             return sb.toString();
         }
         cleanupStaleFiles();
-        return "VM not running";
+        var sb = new StringBuilder("VM not running");
+        appendPoolStatus(sb, selection);
+        if (Files.exists(Environment.vmLaunchLogFile())) {
+            sb.append("\n  Last launch log: ").append(Environment.vmLaunchLogFile());
+        }
+        return sb.toString();
+    }
+
+    private static void appendPoolStatus(StringBuilder sb, WorkerPoolSelection selection) {
+        selection.name().ifPresent(name -> {
+            var pool = selection.pool().orElseThrow();
+            sb.append("\n  Worker pool: ").append(name);
+            sb.append("\n  Resources: cpus=").append(pool.cpus())
+                    .append(", memory=").append(pool.memoryMib()).append(" MiB")
+                    .append(", swap=").append(pool.swap());
+            sb.append("\n  State: ").append(Environment.vmStateDir());
+        });
     }
 
     // Above this many held vsock connections, the appliance's socat forwarder is
@@ -545,6 +640,7 @@ public final class VmManager {
     public static boolean waitUntilReady(int maxWaitSeconds) {
         long deadline = System.nanoTime() + maxWaitSeconds * 1_000_000_000L;
         while (System.nanoTime() < deadline) {
+            if (!isRunning()) return false;
             if (IncusClient.isReachable()) return true;
             try { Thread.sleep(1000); } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -634,6 +730,7 @@ public final class VmManager {
 
     private static boolean ensureRunningLocked() {
         if (isRunning()) {
+            requireRunningExportPlanCurrent();
             if (IncusClient.isReachable()) {
                 warnIfApplianceStale();
                 return true;
@@ -708,6 +805,37 @@ public final class VmManager {
 
     // --- Internal: vfkit ---
 
+    private static VmHostExports selectedHostExports() {
+        var selection = WorkerPoolSelection.current();
+        if (selection.isLegacy()) return null;
+        try {
+            return VmHostExports.create(selection.name().orElseThrow(),
+                    selection.pool().orElseThrow(), Environment.home());
+        } catch (IllegalStateException e) {
+            throw new VmException("Invalid worker-pool host exports: " + e.getMessage());
+        }
+    }
+
+    /** Enforce the named export generation before any Incus API operation. */
+    public static void requireExportPlanCurrentIfRunning() {
+        if (!Platform.isMacOS() || WorkerPoolSelection.current().isLegacy() || !isRunning()) return;
+        requireRunningExportPlanCurrent();
+    }
+
+    private static void requireRunningExportPlanCurrent() {
+        if (!Platform.isMacOS() || WorkerPoolSelection.current().isLegacy()) return;
+        try {
+            selectedHostExports().requirePersistedFingerprint(Environment.vmExportPlanFingerprint());
+        } catch (IllegalStateException e) {
+            throw new VmException(e.getMessage());
+        } catch (VmException e) {
+            var name = WorkerPoolSelection.current().name().orElseThrow();
+            throw new VmException("Cannot resolve the exports configured for running worker pool '"
+                    + name + "': " + e.getMessage() + " Fix the configuration, then run "
+                    + "'ISX_POOL=" + name + " isx vm restart'.");
+        }
+    }
+
     /**
      * Create a macOS .app bundle wrapper around the vfkit binary. macOS uses the
      * bundle's Info.plist for permission dialog text (home folder access, local
@@ -750,12 +878,11 @@ public final class VmManager {
                 host.</string>
                     <key>NSHomeDirectoryUsageDescription</key>
                     <string>incus-spawn runs Linux containers inside a lightweight \
-                virtual machine on your Mac. Your home directory is mounted \
-                read-only to enable host file sharing — no data is modified. \
-                Agents run inside sandboxed containers, and each container only \
-                receives access to the specific paths you explicitly configure \
-                (such as a project directory or a build cache). Containers never \
-                see your full home directory.</string>
+                virtual machine on your Mac. Legacy mode shares your home directory \
+                read-only; named worker pools share only their configured roots, \
+                with runtime and references read-only. Agents run inside sandboxed \
+                containers, and each container only receives access to the specific \
+                paths you explicitly configure.</string>
                 </dict>
                 </plist>
                 """);
@@ -778,11 +905,67 @@ public final class VmManager {
         throw new IOException("vfkit not found in PATH. Install it with: brew install vfkit");
     }
 
-    private static void startVfkit(int cpus, int memoryMiB) throws IOException {
+    private static void startVfkit(int cpus, int memoryMiB, VmHostExports hostExports)
+            throws IOException {
         int restPort = findFreePort();
         ensureDummyInitrd();
 
         var vfkitBin = ensureVfkitAppBundle();
+        var cmd = vfkitCommand(vfkitBin, cpus, memoryMiB, restPort, hostExports,
+                System.currentTimeMillis() / 1000);
+
+        var launchLog = Environment.vmLaunchLogFile();
+        Files.writeString(
+                launchLog,
+                "\n=== vfkit launch " + Instant.now() + " ===\n",
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND);
+        var pb = new ProcessBuilder(cmd);
+        pb.redirectErrorStream(true);
+        pb.redirectOutput(ProcessBuilder.Redirect.appendTo(launchLog.toFile()));
+        var process = pb.start();
+        long pid = process.pid();
+
+        try {
+            if (hostExports != null) {
+                // Stock upstream vfkit rejects the companion fork's `readonly` field and exits.
+                // Do not record a plan for a process that failed immediately during launch.
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while checking vfkit launch", e);
+                }
+                if (!process.isAlive()) {
+                    throw new IOException("vfkit exited during launch. Named worker pools require "
+                            + "the incus-spawn vfkit fork with virtio-fs readonly support; upstream "
+                            + "vfkit is intentionally unsupported.");
+                }
+            }
+            // Record process ownership before ancillary launch state, so an interruption can still
+            // identify and stop the vfkit process rather than leaving an untracked appliance.
+            Files.writeString(Environment.vmPidFile(), String.valueOf(pid));
+            Files.writeString(Environment.vmRestUriFile(), "http://localhost:" + restPort);
+            if (hostExports != null) {
+                hostExports.persistFingerprint(Environment.vmExportPlanFingerprint());
+            }
+        } catch (IOException | RuntimeException e) {
+            process.destroyForcibly();
+            cleanupStaleFiles();
+            throw e;
+        }
+        BuildOutput.stepDone("pid=" + pid + ", rest=localhost:" + restPort);
+    }
+
+    /** Build the complete vfkit argv without requiring macOS, for launch-policy unit tests. */
+    static List<String> vfkitCommand(
+            String vfkitBin,
+            int cpus,
+            int memoryMiB,
+            int restPort,
+            VmHostExports hostExports,
+            long epochSeconds) {
+        validateVfkitDevicePaths(hostExports);
 
         var cmd = new ArrayList<>(List.of(
                 vfkitBin,
@@ -790,13 +973,25 @@ public final class VmManager {
                 "--memory", String.valueOf(memoryMiB),
                 "--kernel", Environment.applianceKernel().toString(),
                 "--initrd", Environment.vmDummyInitrd().toString(),
-                "--kernel-cmdline", kernelCmdline("hvc0"),
+                "--kernel-cmdline", kernelCmdline("hvc0", hostExports, epochSeconds),
                 "--device", "virtio-blk,path=" + Environment.vmDiskImage(),
                 "--device", "virtio-blk,path=" + Environment.vmSwapImage(),
                 "--device", "virtio-blk,path=" + Environment.vmDataImage(),
-                "--device", "virtio-net,nat,mac=" + VmNetwork.ISX_VM_MAC,
-                "--device", "virtio-serial,logFilePath=" + Environment.vmLogFile(),
-                "--device", "virtio-fs,sharedDir=" + System.getProperty("user.home") + ",mountTag=hostfs",
+                "--device", "virtio-net,nat,mac=" + VmNetwork.selectedMac(),
+                "--device", "virtio-serial,logFilePath=" + Environment.vmLogFile()
+        ));
+        if (hostExports == null) {
+            cmd.addAll(List.of("--device", "virtio-fs,sharedDir="
+                    + System.getProperty("user.home") + ",mountTag=hostfs"));
+        } else {
+            for (var export : hostExports.exports()) {
+                cmd.add("--device");
+                cmd.add("virtio-fs,sharedDir=" + export.hostPath()
+                        + ",mountTag=" + export.mountTag()
+                        + (export.readOnly() ? ",readonly" : ""));
+            }
+        }
+        cmd.addAll(List.of(
                 "--device", "virtio-vsock,port=" + INCUS_VSOCK_PORT
                         + ",socketURL=" + Environment.vmVsockSocket() + ",connect",
                 "--device", "virtio-vsock,port=" + AGENT_VSOCK_PORT
@@ -804,16 +999,22 @@ public final class VmManager {
                 "--timesync", "vsockPort=" + GA_VSOCK_PORT,
                 "--restful-uri", "tcp://localhost:" + restPort
         ));
+        return List.copyOf(cmd);
+    }
 
-        var pb = new ProcessBuilder(cmd);
-        pb.redirectErrorStream(true);
-        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-        var process = pb.start();
-        long pid = process.pid();
-
-        Files.writeString(Environment.vmPidFile(), String.valueOf(pid));
-        Files.writeString(Environment.vmRestUriFile(), "http://localhost:" + restPort);
-        BuildOutput.stepDone("pid=" + pid + ", rest=localhost:" + restPort);
+    private static void validateVfkitDevicePaths(VmHostExports hostExports) {
+        VmHostExports.requireVfkitSafePath(Environment.vmDiskImage().toString());
+        VmHostExports.requireVfkitSafePath(Environment.vmSwapImage().toString());
+        VmHostExports.requireVfkitSafePath(Environment.vmDataImage().toString());
+        VmHostExports.requireVfkitSafePath(Environment.vmLogFile().toString());
+        VmHostExports.requireVfkitSafePath(Environment.vmVsockSocket().toString());
+        VmHostExports.requireVfkitSafePath(Environment.vmAgentSocket().toString());
+        if (hostExports == null) {
+            VmHostExports.requireVfkitSafePath(System.getProperty("user.home"));
+        } else {
+            hostExports.exports().forEach(export ->
+                    VmHostExports.requireVfkitSafePath(export.hostPath().toString()));
+        }
     }
 
     // --- Internal: QEMU ---
@@ -1148,18 +1349,28 @@ public final class VmManager {
     // --- Internal: helpers ---
 
     private static String kernelCmdline(String console) {
+        return kernelCmdline(console, null, System.currentTimeMillis() / 1000);
+    }
+
+    private static String kernelCmdline(
+            String console, VmHostExports hostExports, long epochSeconds) {
         // mitigations=off is compiled in (CONFIG_CPU_MITIGATIONS=n), so it is
         // not repeated here. rootfstype=btrfs avoids the kernel probing fuseblk
         // (which rejects the 'commit' rootflag) before btrfs at root mount.
-        return "root=/dev/vda rootfstype=btrfs rw rootflags=commit=300 console=" + console
+        var cmdline = "root=/dev/vda rootfstype=btrfs rw rootflags=commit=300 console=" + console
                 + " isx.gateway=" + gatewayIp()
                 + " isx.mitm_port=" + mitmPort()
-                + " isx.time=" + (System.currentTimeMillis() / 1000)
+                + " isx.time=" + epochSeconds
                 + " isx.ga_vsock=" + GA_VSOCK_PORT
                 + " isx.vsock_incus=" + INCUS_VSOCK_PORT
                 + " isx.agent_vsock=" + AGENT_VSOCK_PORT
                 + " isx.proxy=remote"
-                + " isx.shared=/host";
+                + " isx.shared=" + (hostExports == null ? "/host" : "/host/runtime");
+        if (hostExports != null) {
+            cmdline += " isx.host_exports=named isx.reference_names="
+                    + String.join(",", hostExports.referenceNames());
+        }
+        return cmdline;
     }
 
     private static void ensureDummyInitrd() throws IOException {
@@ -1220,6 +1431,9 @@ public final class VmManager {
         try { Files.deleteIfExists(Environment.vmRestUriFile()); } catch (IOException ignored) {}
         try { Files.deleteIfExists(Environment.vmVsockSocket()); } catch (IOException ignored) {}
         try { Files.deleteIfExists(Environment.vmAgentSocket()); } catch (IOException ignored) {}
+        if (!WorkerPoolSelection.current().isLegacy()) {
+            try { Files.deleteIfExists(Environment.vmExportPlanFingerprint()); } catch (IOException ignored) {}
+        }
     }
 
     public static String humanSize(long bytes) {

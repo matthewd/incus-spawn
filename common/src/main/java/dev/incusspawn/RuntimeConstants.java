@@ -1,5 +1,6 @@
 package dev.incusspawn;
 
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.tool.BobSetup;
 import dev.incusspawn.tool.ClaudeSetup;
 import dev.incusspawn.tool.CodexSetup;
@@ -31,6 +32,12 @@ import java.util.List;
  * instead of storing its result.
  */
 public final class RuntimeConstants {
+
+    /**
+     * Worker pool selected once from {@code ISX_POOL}. Invalid selections are retained in a
+     * fail-closed state so command entry points can report the original configuration error.
+     */
+    public static final WorkerPoolSelection WORKER_POOL = WorkerPoolSelection.fromEnvironment();
 
     /** Host-side tool/image download cache; see {@link dev.incusspawn.tool.DownloadCache}. */
     public static final Path DOWNLOAD_CACHE_DIR = Environment.downloadCacheDir();

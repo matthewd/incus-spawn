@@ -34,10 +34,10 @@ Keep the two in sync.
 
 The `isx-integration-tests` job exercises three environments: a container (from `tpl-minimal`), a rootless-podman container (from `tpl-test-podman`), and a VM (from `tpl-test-vm`). Test scripts live in `.github/scripts/`:
 
-- **`test-instance.sh`**: pushed into containers and VMs, tests proxy interception (Maven/GitHub HTTPS), git clone, passwordless sudo, systemd lifecycle, DNS interception, login shell env vars, TLS certificate quality, and tool-contributed proxy credential injection (section 10 verifies bearer token injection via a test fixture tool `.github/test-fixtures/tools/test-proxy-tool.yaml` and a local HTTPS echo server at `echo.incus-spawn.test`). Uses `assert()` / `assert_eq()` shell helpers.
-- **`test-podman.sh`**: pushed into the podman container, tests rootless podman (pull, run, build).
+- **`test-instance.sh`**: pushed into hardened `tpl-minimal` containers and VMs, tests proxy interception (Maven/GitHub HTTPS), git clone, absence of agentuser sudo/group/subid/development-sysctl privileges, systemd lifecycle, DNS interception, login shell env vars, TLS certificate quality, and tool-contributed proxy credential injection (section 10 verifies bearer token injection via a test fixture tool `.github/test-fixtures/tools/test-proxy-tool.yaml` and a local HTTPS echo server at `echo.incus-spawn.test`). Uses `assert()` / `assert_eq()` shell helpers.
+- **`test-podman.sh`**: pushed into a template explicitly opting into `security.nested-containers`, then tests rootless podman (pull, run, build).
 
-When adding a new end-to-end test, add an `assert` call in the appropriate script under a new numbered section. The test runs as root inside the container; use `su -l agentuser -c "..."` to test user-level behavior. The `tpl-minimal` base image is Fedora with only git, curl, which, procps-ng, and findutils -- install extra packages with `dnf install` inside the test if needed.
+When adding a new end-to-end test, add an `assert` call in the appropriate script under a new numbered section. The test runs as root inside the container; use `su -l agentuser -c "..."` to test user-level behavior. The `tpl-minimal` base image is Fedora with only git, curl, which, procps-ng, and findutils -- install extra packages with `dnf install` inside the test if needed. Incus ownership/idmap transitions (especially a hardened child copied from a nested-container parent) cannot be represented by mocks; run the manual security smoke checklist in DESIGN.md when changing this path.
 
 # Benchmarking
 

@@ -4,7 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
 import dev.incusspawn.Environment;
 import dev.incusspawn.Platform;
+import dev.incusspawn.automation.AutomationTransport;
 import dev.incusspawn.config.BuildSource;
+import dev.incusspawn.vm.VmManager;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -17,6 +19,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -66,6 +69,9 @@ public class IncusClient {
     }
 
     private IncusApi http() {
+        // A named VM must not serve requests under a process whose resolved host-export plan
+        // differs from the generation it launched with. Stop/restart do not use this API path.
+        VmManager.requireExportPlanCurrentIfRunning();
         var result = api();
         if (result == null) {
             throw new IncusException(IncusApi.diagnoseConnectionFailure());
@@ -215,6 +221,29 @@ public class IncusClient {
     }
 
     /**
+     * Execute exact argv without a shell, with raw stdin and independently streamed output.
+     * Unlike the established exec wrappers, this automation-only path supports a caller timeout
+     * and external cancellation. Timeout/cancellation attempts to delete the Incus operation and
+     * reports whether the daemon accepted that request; it does not assert stronger guest process
+     * tree semantics than Incus has been live-verified to provide.
+     */
+    public AutomationTransport.ExecOutcome execExact(
+            String container,
+            List<String> argv,
+            int uid,
+            int gid,
+            String cwd,
+            Map<String, String> environment,
+            InputStream stdin,
+            OutputStream stdout,
+            OutputStream stderr,
+            long timeoutMillis,
+            AutomationTransport.Cancellation cancellation) {
+        return http().execControlled(container, argv, uid, gid, cwd, environment,
+                stdin, stdout, stderr, timeoutMillis, cancellation);
+    }
+
+    /**
      * Poll a command inside a container until it succeeds or the timeout expires.
      *
      * Polls aggressively (tight fixed cadence) so a container that becomes ready is detected
@@ -274,6 +303,7 @@ public class IncusClient {
      * Returns null if connected successfully, or a diagnostic message if not.
      */
     public String checkConnectivity() {
+        VmManager.requireExportPlanCurrentIfRunning();
         if (api() != null) return null;
         if (Platform.isMacOS()) {
             var layer = dev.incusspawn.vm.VmManager.detectLeakLayer();
@@ -368,7 +398,7 @@ public class IncusClient {
         }
 
         try {
-            var homeDir = "/home/" + user;
+            var homeDir = "root".equals(user) ? "/root" : "/home/" + user;
             var targetCwd = prep.workdir() != null ? prep.workdir() : homeDir;
 
             String innerScript;
@@ -1335,16 +1365,32 @@ public class IncusClient {
     }
 
     public void copy(String source, String target, CopyPlan plan) {
+        copy(source, target, plan, Map.of());
+    }
+
+    /**
+     * Copy an existing instance while applying config in the initial Incus create request.
+     * Automation ownership uses this overload so a committed copy is discoverable by key even if
+     * the client loses the response before a follow-up request could run.
+     */
+    public void copy(String source, String target, CopyPlan plan, Map<String, String> atomicConfig) {
         var http = http();
         if (plan.targetPool() == null) {
             throw new IncusException("No target storage pool for copy — " + plan.fullCopyReason());
         }
+        var body = copyRequestBody(source, target, plan.targetPool(), atomicConfig);
+        var resp = http.requestAndWait("POST", "/1.0/instances", body);
+        if (!resp.isSuccess()) throw failedOp(resp, "Failed to copy " + source + " to " + target);
+    }
+
+    static Map<String, Object> copyRequestBody(String source, String target, String targetPool,
+                                               Map<String, String> atomicConfig) {
         var body = new LinkedHashMap<String, Object>();
         body.put("name", target);
         body.put("source", Map.of("type", "copy", "source", source));
-        body.put("storage", plan.targetPool());
-        var resp = http.requestAndWait("POST", "/1.0/instances", body);
-        if (!resp.isSuccess()) throw new IncusException("Failed to copy " + source + " to " + target);
+        body.put("storage", targetPool);
+        if (!atomicConfig.isEmpty()) body.put("config", Map.copyOf(atomicConfig));
+        return body;
     }
 
     public String getLog(String instance) {
@@ -1511,17 +1557,34 @@ public class IncusClient {
      * Add a device to a container/VM.
      */
     public void deviceAdd(String container, String deviceName, String type, String... props) {
+        var device = device(type, props);
+        var resp = http().requestAndWait("PATCH", "/1.0/instances/" + container,
+                Map.of("devices", Map.of(deviceName, device)));
+        if (!resp.isSuccess()) {
+            throw failedOp(resp, "Failed to add device " + deviceName + " to " + container);
+        }
+    }
+
+    /** Add an instance-owned device only if a fresh own-device inspection still finds it absent. */
+    public void deviceAddIfAbsent(
+            String container, String automationKey, String deviceName,
+            String type, String... props) {
+        var resp = http().addDeviceIfAbsent(
+                container, automationKey, deviceName, device(type, props));
+        if (!resp.isSuccess()) {
+            throw new IncusException("Failed to add absent device " + deviceName
+                    + " to " + container);
+        }
+    }
+
+    private static Map<String, String> device(String type, String... props) {
         var device = new LinkedHashMap<String, String>();
         device.put("type", type);
         for (var prop : props) {
             int eq = prop.indexOf('=');
             if (eq > 0) device.put(prop.substring(0, eq), prop.substring(eq + 1));
         }
-        var resp = http().requestAndWait("PATCH", "/1.0/instances/" + container,
-                Map.of("devices", Map.of(deviceName, device)));
-        if (!resp.isSuccess()) {
-            throw failedOp(resp, "Failed to add device " + deviceName + " to " + container);
-        }
+        return device;
     }
 
     static IncusException failedOp(IncusApi.ApiResponse resp, String context) {
@@ -1543,6 +1606,20 @@ public class IncusClient {
     }
 
     /**
+     * Strict instance lookup for automation reconciliation. Only an HTTP 404 is absence; every
+     * other failed response is surfaced so a daemon error cannot be mistaken for an idempotent
+     * create/delete result.
+     */
+    public Optional<JsonNode> findInstanceMetadata(String name) {
+        var response = http().get("/1.0/instances/" + name);
+        if (response.statusCode() == 404) return Optional.empty();
+        if (!response.isSuccess()) {
+            throw failedOp(response, "Failed to inspect instance " + name);
+        }
+        return Optional.of(response.body().path("metadata"));
+    }
+
+    /**
      * Host source of a device as {@link #instanceMetadata} reports it, or ""
      * when the instance declares no such device (profile-inherited devices
      * are not part of that representation).
@@ -1559,6 +1636,20 @@ public class IncusClient {
     public void deviceRemove(String container, String deviceName) {
         var resp = http().removeDevice(container, deviceName);
         if (!resp.isSuccess()) throw new IncusException("Failed to remove device " + deviceName + " from " + container);
+    }
+
+    /**
+     * Remove an instance-owned device only after the same GET used to construct the replacement
+     * device map proves that every field exactly matches the caller's expectation.
+     */
+    public void deviceRemoveExact(
+            String container, String automationKey, String deviceName,
+            Map<String, String> expected) {
+        var resp = http().removeDeviceExact(container, automationKey, deviceName, expected);
+        if (!resp.isSuccess()) {
+            throw new IncusException("Failed to remove exact device " + deviceName
+                    + " from " + container);
+        }
     }
 
     /**

@@ -74,12 +74,23 @@ class SshKeyManagerTest {
         var content = assertDoesNotThrow(() -> Files.readString(configFile));
         assertTrue(content.contains("Host test-instance"));
         assertTrue(content.contains("ProxyCommand"));
-        assertTrue(content.contains("ssh-proxy test-instance"));
+        assertTrue(content.contains("ssh-proxy 'test-instance'"));
         assertTrue(content.contains("User agentuser"));
         assertTrue(content.contains("IdentityFile ~/.config/incus-spawn/ssh/id_ed25519"));
         assertTrue(content.contains("IdentitiesOnly yes"));
+        assertTrue(content.contains("ForwardAgent no"));
+        assertTrue(content.contains("ClearAllForwardings yes"));
         assertTrue(content.contains("StrictHostKeyChecking no"));
         assertTrue(content.contains("UserKnownHostsFile /dev/null"));
+    }
+
+    @Test
+    void ownedHostEntryPinsTheProxyToItsAutomationKey() {
+        SshKeyManager.addOwnedHostEntry("test-instance", "thread/key-17");
+
+        var content = assertDoesNotThrow(
+                () -> Files.readString(tempDir.resolve(".config/incus-spawn/ssh/config")));
+        assertTrue(content.contains("ssh-proxy 'test-instance' --key 'thread/key-17'"));
     }
 
     @Test

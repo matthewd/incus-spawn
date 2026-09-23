@@ -19,6 +19,8 @@ import static org.mockito.Mockito.*;
 class PiSetupTest {
 
     private static final IncusClient.ExecResult OK = new IncusClient.ExecResult(0, "", "");
+    private static final IncusClient.ExecResult NETWORK_RESET =
+            new IncusClient.ExecResult(1, "", "npm error code ECONNRESET\nnpm error network aborted");
     private static final String CONTAINER = "test-container";
 
     @TempDir
@@ -61,7 +63,47 @@ class PiSetupTest {
         new PiSetup().install(new Container(incus, CONTAINER), java.util.Map.of());
 
         verify(incus).shellExec(eq(CONTAINER),
-                eq("npm"), eq("install"), eq("-g"), eq("--ignore-scripts"), eq("--loglevel=error"), eq("@earendil-works/pi-coding-agent"));
+                eq("npm"), eq("install"), eq("-g"), eq("--ignore-scripts"),
+                eq("--loglevel=error"), eq("--fetch-retries=4"),
+                eq("--fetch-retry-factor=2"), eq("--fetch-retry-mintimeout=1000"),
+                eq("--fetch-retry-maxtimeout=15000"),
+                eq("@earendil-works/pi-coding-agent"));
+    }
+
+    @Test
+    void installRetriesRecognizableTransientNetworkFailures() {
+        var incus = mock(IncusClient.class);
+        when(incus.shellExec(anyString(), any(String[].class)))
+                .thenReturn(NETWORK_RESET, OK);
+        var setup = new PiSetup();
+        setup.retryDelaysMs = new long[]{0};
+
+        setup.install(new Container(incus, CONTAINER), Map.of());
+
+        assertEquals(2, npmInstallCalls(incus));
+    }
+
+    @Test
+    void installDoesNotRetryPackageFailures() {
+        var incus = mock(IncusClient.class);
+        var packageFailure = new IncusClient.ExecResult(1, "", "npm error code E404");
+        when(incus.shellExec(anyString(), any(String[].class))).thenReturn(packageFailure);
+        var setup = new PiSetup();
+        setup.retryDelaysMs = new long[]{0};
+
+        assertThrows(RuntimeException.class,
+                () -> setup.install(new Container(incus, CONTAINER), Map.of()));
+
+        assertEquals(1, npmInstallCalls(incus));
+    }
+
+    private static long npmInstallCalls(IncusClient incus) {
+        return mockingDetails(incus).getInvocations().stream()
+                .filter(invocation -> {
+                    var args = invocation.getArguments();
+                    return args.length > 1 && "npm".equals(args[1]);
+                })
+                .count();
     }
 
     @Test

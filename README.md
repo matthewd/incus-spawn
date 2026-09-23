@@ -6,7 +6,7 @@ You're about to hand an AI agent a terminal. On your laptop, that terminal can r
 
 isx onboards agents the way you'd onboard a new teammate:
 
-- **A real machine of their own.** Each agent gets a full Linux workstation — its own filesystem, init system, networking, and process tree. It can `dnf install`, run Docker Compose, use `strace` and nested containers — everything works, because it *is* a real system, not an app container. Hardware-isolated KVM virtual machines are one flag away for untrusted code.
+- **A real machine of their own.** Each agent gets a full Linux workstation — its own filesystem, init system, networking, and process tree. Templates can explicitly enable `sudo`, debugging capabilities, and nested containers when a workload needs them; hardened templates expose none of those privileges. Hardware-isolated KVM virtual machines are one flag away for untrusted code.
 - **Zero credential exposure.** API keys and tokens never enter the environment in any form. A host-side TLS proxy injects real credentials upstream, so `claude`, `pi`, `gh`, `git`, and `curl` work unmodified inside — with nothing worth stealing. See [Credential Isolation](#credential-isolation).
 - **Disposable in seconds.** Branch a prepared template like you'd branch a repo — instant copy-on-write clones. Use them, throw them away, branch again from a clean state.
 - **Full autonomy, no babysitting.** Agents commit under their own identity and run without permission prompts — safe to let run, because the blast radius is the branch.
@@ -76,16 +76,18 @@ See [Installation](#installation) for all options and update instructions. Shell
 
 ## Credential Isolation
 
-**API keys and tokens never enter containers in any form.** A host-side MITM TLS proxy (`isx proxy`) provides completely transparent authentication:
+**Upstream provider API keys and tokens never enter containers.** A host-side MITM TLS proxy (`isx proxy`) provides completely transparent authentication:
 
 - The proxy uses bridge-level DNS overrides and a custom CA certificate so containers transparently route intercepted domains through the proxy
 - The proxy terminates TLS, injects real authentication headers, and forwards to the real upstream over TLS — tools (`curl`, `git`, `gh`, `claude`, `pi`) work unmodified inside containers
+- `https://bb.isx.internal` is a fixed gateway relay to the host's plain HTTP/WebSocket listener on `127.0.0.1:18444`. ISX provides DNS and container-facing TLS but performs no credential injection or debug body logging; it preserves the original `Host`, caller `Authorization`, and `bb-host-daemon.v1` WebSocket subprotocol so the host daemon remains responsible for authentication and policy. HTTP request bodies are limited to 16 MiB; an oversized bb event batch receives a permanent `invalid_request` response so the daemon can bisect it instead of wedging delivery
 - Containers hold only placeholder values (e.g. `sk-ant-placeholder`) that satisfy tools' local auth checks; placeholders cannot authenticate against any real service
 - **Vertex AI support**: the proxy transparently translates requests to Vertex AI format — no GCP credentials enter the container
 - **Claude Pro/Max support**: authenticate via `claude setup-token`; the proxy injects the OAuth Bearer token transparently
+- **Command-backed credentials**: a protected host-only configuration can obtain short-lived credentials from an absolute command, replace exact inert Bearer and/or raw-header placeholders, cache only in memory, and refresh once after a 401; no command or provider policy enters project or tool YAML
 - **HTTPS only**: Git operations must use HTTPS URLs (not SSH). `gh` defaults to HTTPS; for `git clone`, use `https://github.com/...`
 
-There is no API, endpoint, environment variable, or file that code inside the container can access to obtain real credentials — the injection happens entirely outside the trust boundary.
+There is no API, endpoint, environment variable, or file that code inside the container can access to obtain upstream provider credentials — the injection happens entirely outside the trust boundary. A bb worker is different: its host daemon persists a per-host `bbdh_` capability under the same Unix account as the agent, so the gateway assumes that capability is agent-readable and limits it to bb's authenticated machine/session routes.
 
 The proxy must be running for non-airgapped containers. `isx init` can install it as a systemd user service, or run `isx proxy` in a separate terminal. The CLI verifies proxy reachability and version compatibility before builds, branches, and shell access.
 
@@ -97,6 +99,16 @@ Containers need a git identity (`user.name` and `user.email`) for commits. When 
 
 - **Dedicated agent account (recommended)** -- create a separate GitHub account for your agents and provide its PAT during `isx init`. This keeps agent commits clearly attributed, gives the agent its own identity for PR authorship and review workflows, and lets you scope repository permissions independently from your personal account.
 - **Your personal account** -- provide your own PAT. If you also want your aliases and other settings, mount `~/.gitconfig` as a [host resource](#host-resources) -- it takes precedence over the auto-generated config.
+
+To replace only the host-wrapped GitHub token from an existing environment variable without putting its value in argv or rerunning the complete initializer:
+
+```sh
+isx proxy github-token --from-env GITHUB_TOKEN_READONLY
+isx proxy restart
+isx proxy configure-dns
+```
+
+The command validates only bounded single-line token shape; it deliberately does not probe scopes or identity. Containers receive inert values in both `GITHUB_TOKEN` and `GH_TOKEN`, while the proxy uses the protected host configuration. Additional service-specific proxy definitions belong in external tool configuration rather than the ISX core.
 
 **Commit signing.** Containers do not currently support signing commits. To produce signed commits, fetch the changes to your host via [git remotes](#git-remotes) and rebase there -- the host's signing configuration (GPG or SSH) applies automatically during the rebase. Native container-side signing is tracked in [#271](https://github.com/Sanne/incus-spawn/issues/271).
 
@@ -111,7 +123,7 @@ tpl-java  (stopped template, ~2GB)
   └── experiment       (stopped, uses ~10MB extra)
 ```
 
-You can install packages, break things, and destroy a branch when done. The template and other branches are completely unaffected. Sudo works without a password, and shell sessions set the terminal title to `isx:<containername>` so you always know which environment you're in.
+You can modify the branch freely within the privileges declared by its template, break things, and destroy it when done. The template and other branches are completely unaffected. `agentuser` is non-root and has no sudo access by default; templates that need passwordless sudo must opt in explicitly. Shell sessions set the terminal title to `isx:<containername>` so you always know which environment you're in.
 
 Branches can optionally enable GUI/audio passthrough (Wayland + PipeWire with GPU acceleration, Linux only), restricted networking, or an inbox mount to share files read-only from the host. Resource limits (CPU, memory, disk) are auto-detected from the host but can be overridden. The interactive TUI (`isx` with no arguments) provides a Midnight Commander-style interface with modal dialogs for branching, renaming, and building, plus F3 detail views and F9 tool actions.
 
@@ -180,7 +192,7 @@ With this configuration, `isx branch` adds a git remote named after the instance
 
 **Docker and Podman are built for shipping applications** — minimal filesystems, single-process isolation, fast startup. isx solves a different problem: full **system containers** powered by [Incus](https://linuxcontainers.org/incus/) that behave like real machines. Each environment runs its own init system, has real networking (`ping`, `strace`, nested Podman/Docker), and supports GUI and audio passthrough (Linux only). Templates pre-install your baseline tools and repos, but the environment is a real Linux system — agents and users can freely `dnf install`, `pip install`, build from source, or run Docker Compose just like on a workstation.
 
-This matters for agents in particular: an agent boxed into an app container hits walls constantly (no systemd services, no nested containers for Testcontainers, no debugging tools). An agent on an isx branch works exactly as it would on a developer workstation — because that's what it has.
+This matters for agents in particular: an agent boxed into an app container hits walls constantly (no systemd services and no way to opt into nested containers or debugging facilities). An isx template can expose those facilities declaratively when its workload needs them, while keeping other templates hardened.
 
 For untrusted code, KVM virtual machines (`--vm`) provide hardware-level isolation with a separate kernel.
 
@@ -201,7 +213,7 @@ tools:
   - maven-3
 ```
 
-Three images are built-in (`tpl-minimal`, `tpl-dev`, `tpl-java`). The root image (`tpl-minimal`) uses a custom Fedora base from [`Sanne/incus-spawn-images`](https://github.com/Sanne/incus-spawn-images). Use `isx update-base` to check for new base image releases, pin a specific version, or track the latest:
+Four images are built in: hardened `tpl-minimal`, privileged development template `tpl-dev`, `tpl-java`, and hardened `tpl-bb`. The root image (`tpl-minimal`) uses a custom Fedora base from [`Sanne/incus-spawn-images`](https://github.com/Sanne/incus-spawn-images). Use `isx update-base` to check for new base image releases, pin a specific version, or track the latest:
 
 ```shell
 isx update-base              # interactive — shows versions, prompts for action
@@ -242,6 +254,7 @@ Image schema fields (all optional except `name`):
 - `vm_image_url` -- download URL for the VM base image (qcow2 tarball). Only used when `type` is `vm` or `kvm`. Supports `{arch}` and `{tag}` placeholders
 - `vm_image_sha256` -- per-architecture SHA256 checksums for the VM base image
 - `parent` -- parent image name (omit for root images)
+- `security` -- exact inherited privilege policy (see below)
 - `packages` -- dnf packages to install
 - `tools` -- tool names to run (resolved from YAML or Java, see [Custom Tools](#custom-tools))
 - `repos` -- git repositories to clone as agentuser (see below)
@@ -251,6 +264,21 @@ Image schema fields (all optional except `name`):
 - `shell-command` -- command to run instead of the login shell (see below)
 - `default-action` -- tool action to run when pressing Enter on an instance in the TUI (see below)
 - `description` -- human-readable description for the TUI
+
+Security is deny-by-default and inherited field by field. Every root starts with all three values disabled; a child inherits omitted values and may explicitly turn any inherited value off. At the end of every build, isx scrubs inherited or pre-baked privilege state and recreates only the selected capabilities:
+
+```yaml
+security:
+  sudo: false
+  nested-containers: false
+  permissive-capabilities: false
+```
+
+- `sudo` installs the passwordless sudo rule for `agentuser`. When disabled, the rule and any `wheel`/`sudo` membership are removed.
+- `nested-containers` enables the Incus nesting/idmap/setxattr/tun configuration and subordinate UID/GID ranges required by rootless Podman.
+- `permissive-capabilities` retains all container capabilities and installs relaxed development sysctls for ping, dmesg, perf, and ptrace.
+
+These settings are template-build policy, not branch-time switches. `tpl-dev` explicitly enables all three to preserve the full workstation/Podman experience, while `tpl-minimal` remains hardened. `tpl-bb` derives directly from `tpl-minimal` and adds Git, curl, Node.js (Fedora 44 provides Node 22.19 or newer), and npm for bb host bootstrap; it includes no provider tool or credentials and keeps all security options disabled. Unknown image or `security` fields are rejected rather than silently ignored.
 
 ```shell
 # Build a specific image (builds missing parents automatically)
@@ -607,6 +635,46 @@ Configuration entries can also use `value` for hardcoded literals (no prompt dur
 
 Tool YAML files with `proxy:` blocks must be placed in `~/.config/incus-spawn/tools/` or a configured search path -- project-local tools (`.incus-spawn/tools/`) cannot declare proxy rules because the proxy daemon runs independently of any project directory.
 
+#### Command-backed proxy credentials
+
+Commands that mint short-lived credentials belong only in the protected, machine-local `~/.config/incus-spawn/command-credentials.yaml`; they are not supported in tool definitions, project YAML, or `config.yaml`. An absent file or an explicit `rules: []` disables the feature. Any other present file is strict and fail-closed: it must be a regular non-symlink file with no group or other permissions (`chmod 600`), and zero-byte files, malformed YAML, duplicate keys, unknown fields, unsafe values, and route collisions prevent the proxy from starting.
+
+Each rule targets one exact lowercase DNS host. The route is always HTTPS on port 443; schemes, ports, wildcards, and subdomains are not configurable. For example:
+
+```yaml
+rules:
+  - id: example-gateway
+    host: credential.example.test
+    argv:
+      - /usr/local/bin/credential-helper
+      - print
+    validation-regex: 'token_[A-Za-z0-9]{16,}'
+    carriers:
+      bearer:
+        placeholder: container-placeholder
+      header:
+        name: x-api-key
+        placeholder: container-placeholder
+    timeout-seconds: 15
+    max-output-bytes: 8192
+    body-limit-bytes: 16777216
+    cache-ttl-seconds: 300
+    failure-ttl-seconds: 5
+    label: Example credential gateway
+    remediation: Repair host credential access
+```
+
+A file may contain at most 128 rules. `id` is a unique 1–63 character lowercase identifier. `argv` contains 1–32 entries and its executable must be absolute; the proxy passes it directly to `ProcessBuilder`, never through a shell. The command inherits no environment. It receives only `HOME`, `USER`, `LOGNAME`, `TMPDIR`, and the fixed safe `PATH` `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`; stderr is discarded. `timeout-seconds` is 1–60, `max-output-bytes` is 1–65536, `body-limit-bytes` is 1–67108864, `cache-ttl-seconds` is 1–86400, and `failure-ttl-seconds` is 1–300. Stdout must be exactly one UTF-8 line matching the configured `validation-regex`.
+
+At least one carrier is required. The Bearer carrier matches only `Authorization: Bearer <configured-placeholder>`; the optional raw carrier matches one named end-to-end header with exactly its configured placeholder. A placeholder that matches the credential validation regex is rejected as non-inert. Requests with missing, duplicate, unsupported, or non-exact carriers fail locally, as do bodies above the configured declared or observed limit. The credential is kept only in a generation-aware, single-flight memory cache; acquisition failures use the configured negative-cache TTL. A 401 drains the response, conditionally invalidates that generation, and retries once. Command-backed exchanges bypass debug capture and deny WebSocket upgrades. `/health`, the TUI, and `isx doctor` report only the configured generic label, failure detail, and remediation, never argv or command output.
+
+Rule hosts participate in leaf certificate generation, routing, and the complete bridge DNS set. They may not collide with built-in routes, exact tool routes, or tool wildcard routes. Rules are loaded once when the proxy starts: ordinary `config.yaml`/CA reloads retain the loaded rules. After editing this file, apply it with:
+
+```shell
+isx proxy restart
+isx proxy configure-dns
+```
+
 ### Remote IDE Access
 
 Both VS Code and JetBrains IntelliJ can connect to containers with their UI running natively on the host and all backend processing (indexing, builds, terminals, extensions) running inside the container. SSH keys are managed automatically: `isx init` generates a dedicated passphraseless key pair at `~/.config/incus-spawn/ssh/`, and each branch injects it into the container along with your personal `~/.ssh` key. Container host keys are pre-validated so `ssh <instance-name>` just works — no passphrase prompt, no host key warning. Entries are cleaned up when instances are destroyed.
@@ -816,6 +884,7 @@ jbang app install isx@Sanne/incus-spawn
 ## Configuration
 
 - `~/.config/incus-spawn/config.yaml` -- auth credentials and global settings
+- `~/.config/incus-spawn/command-credentials.yaml` -- protected startup-only command-backed proxy credential rules
 - `~/.config/incus-spawn/ssh/` -- managed SSH key pair, per-instance config, and known_hosts
 - `~/.config/incus-spawn/images/*.yaml` -- user-level template definitions
 - `~/.config/incus-spawn/tools/*.yaml` -- user-level tool definitions
@@ -843,6 +912,45 @@ Resolution order (later sources override earlier ones with the same name):
 2. User (`~/.config/incus-spawn/`)
 3. Search paths (in listed order)
 4. Project-local (`.incus-spawn/`)
+
+### Worker pools
+
+A process can select a named worker pool with `ISX_POOL`. Pool selection is fixed for the life of the process; unset preserves the original single-VM behavior and every legacy path. A set value must name a valid entry in `config.yaml`, or the command exits before doing any work. Pool and reference names use lowercase letters, digits, and hyphens and must start with a letter; reference names are limited to 22 characters so `isx-reference-<name>` fits the virtio-fs tag limit.
+
+```yaml
+worker-pools:
+  compile:
+    cpus: 8
+    memory-mib: 12288
+    swap: 16G
+    runtime-root: ~/isx/runtime
+    workspace-root: ~/isx/workspaces
+    reference-roots:
+      maven: ~/.m2
+      sources: ~/src-reference
+```
+
+Every field is required; `reference-roots` may be `{}`. Export paths must be absolute or start with `~/`, and roots may not duplicate, contain, or be contained by another root after canonicalization. The runtime and workspace roots are created when the pool is prepared; reference roots must already exist as directories. `runtime-root` and every reference root are read-only exports, while `workspace-root` is read-write. Paths containing a comma, newline, or NUL cannot be represented by vfkit's device syntax and are rejected.
+
+```shell
+ISX_POOL=compile isx vm start
+ISX_POOL=compile isx
+```
+
+Named pools use their configured CPU, memory, and swap values, ignoring `ISX_VM_CPUS`, `ISX_VM_MEMORY`, and `ISX_VM_SWAP`. Their VM state and instance locks live under `~/.local/state/incus-spawn/pools/<name>/`, and each pool gets a deterministic locally administered MAC address. Configuration, credentials, CA material, proxy state and logs, appliance downloads, and caches remain shared globally.
+
+Named macOS pools are demand-started. Installing the global proxy from a named-pool process does not register that pool, or the legacy whole-home VM, as a login service; it removes a stale `dev.incusspawn.vm` LaunchAgent if one exists. The proxy LaunchAgent stores no pool selection or credentials. It binds to an atomically persisted global VM-facing host gateway, so launchd can start it without an appliance connection. After starting another pool, apply that pool's complete current domain set without restarting the global proxy:
+
+```shell
+ISX_POOL=tests isx vm start
+ISX_POOL=tests isx proxy configure-dns
+```
+
+On macOS, a named pool replaces the legacy whole-home share with one virtio-fs device per declared root. The guest mounts runtime at `/host/runtime` and references at `/host/references/<name>`, all read-only, and workspace at `/host/workspace`, read-write. Host paths used by resources, inboxes, repository references, and VM download staging must canonicalize beneath one of those roots; undeclared paths and symlinks that escape a root are rejected. Changing the resolved export plan while its VM is running requires `ISX_POOL=<name> isx vm restart` so host path translation cannot target mounts from a different launch.
+
+Named pools require the companion incus-spawn vfkit fork, which extends `--device virtio-fs,...` with the `readonly` field and passes it to `VZSharedDirectory`. Upstream vfkit does not implement that field and named-pool launch fails closed. The guest also mounts read-only exports with `mount -o ro`, but that guest flag is defense in depth, not a substitute for the virtualization-layer restriction.
+
+The pool mount layout also requires an appliance built from this fork. Development wrappers can set `ISX_APPLIANCE_DIR` to those artifacts and `ISX_APPLIANCE_VERSION` to the same opaque version embedded in `/etc/isx-version`; the latter keeps pool root-disk replacement deterministic without pretending a local appliance is an upstream release.
 
 ## FAQ
 
@@ -884,6 +992,7 @@ Beyond security, a shared project directory is also **misleading**. The agent's 
 | [`isx templates`](#isx-templates) | Manage template definitions |
 | [`isx project`](#isx-project) | Manage project templates |
 | [`isx proxy`](#isx-proxy) | Manage the MITM authentication proxy |
+| [`isx automation`](#isx-automation) | Versioned non-interactive lifecycle, workspace-mount, and exec API |
 | [`isx doctor`](#isx-doctor) | Diagnose host, proxy, VM, and tunnel health |
 | [`isx clean`](#isx-clean) | Remove cached data, state, or configuration |
 | [`isx vm`](#isx-vm) | Manage the VM appliance (macOS only) |
@@ -1072,8 +1181,9 @@ Manage the MITM authentication proxy.
 | `stop` | Stop the proxy (handles both systemd and manual processes) |
 | `restart` | Restart the proxy service |
 | `status` | Check if the proxy is running |
-| `install` | Install as a systemd user service (auto-starts on boot) |
-| `uninstall` | Stop and remove the systemd proxy service |
+| `install` | Install as a user service (systemd or launchd) |
+| `uninstall` | Stop and remove the proxy service |
+| `configure-dns` | Apply current proxy DNS overrides to the selected Incus appliance |
 | `logs` | Follow the proxy log in real time |
 | `dump` | Run a pass-through proxy for host-side traffic capture |
 
@@ -1088,6 +1198,12 @@ Manage the MITM authentication proxy.
 | `--gateway-ip <ip>` | Incus bridge gateway IP (skips auto-detection) |
 | `--debug` | Log full request/response details |
 
+#### `isx proxy configure-dns`
+
+    isx proxy configure-dns
+
+Writes and verifies the complete current built-in, resolved tool-proxy, and command-credential domain set on the selected appliance bridge. It does not install or restart the global proxy. On macOS, run it after demand-starting each additional named pool.
+
 #### `isx proxy dump`
 
     isx proxy dump [options]
@@ -1095,6 +1211,70 @@ Manage the MITM authentication proxy.
 | Option | Description |
 |--------|-------------|
 | `--port <port>` | Local HTTP port (default: `19080`) |
+
+### `isx automation`
+
+A versioned, non-interactive API for machine providers. It is available on Linux and macOS, never prompts, and does not emit `BuildOutput` formatting. The host and, on macOS, the appliance VM must already be initialized and running.
+
+    isx automation <create|inspect|start|stop|mount|unmount|delete|exec> [options]
+
+Lifecycle and mount commands emit exactly one JSON object on stdout. Every response includes `"protocol":"isx-automation"`, `"version":1`, `ok`, and `operation`. Successful responses also report `changed` and `exists`; an existing instance is represented only by the whitelisted `name`, `state`, `instance_type`, and `template` fields. Mount source and target paths are never added to the response or instance resource. Errors contain a stable `error.code` and a human-readable `error.message`; unexpected backend details are not returned.
+
+```shell
+isx automation create --name bb-worker-17 --template tpl-bb --key allocation-17
+isx automation inspect --name bb-worker-17 --key allocation-17
+isx automation start --name bb-worker-17 --key allocation-17
+isx automation stop --name bb-worker-17 --key allocation-17
+isx automation delete --name bb-worker-17 --key allocation-17
+# Reconcile an allocation whose instance name was not durably recorded:
+isx automation delete --key allocation-17 --template tpl-bb
+```
+
+`create`, `start`, `stop`, and `delete` are idempotent when the stored ownership key matches. `start` reports success only after every readiness command recorded by the source template succeeds; calling it for an already-running instance revalidates the same contracts. Mutations reject an instance owned by another key. Creation accepts only a stopped isx template on a same-pool CoW-capable storage pool; the new instance remains stopped. The copy request records `user.incus-spawn.automation-key` and its source template atomically, allowing a caller to reconcile a lost create response. A key-only delete succeeds unchanged when no allocation remains and fails closed if corrupted metadata maps the key to more than one instance. Key-only deletion requires `--template`; a matching key with another source template is rejected rather than deleted.
+
+`mount` attaches a host workspace leaf to an owned running or stopped instance; `unmount` requires the same complete expectation before detaching it:
+
+```shell
+isx automation mount \
+  --name bb-worker-17 --key allocation-17 \
+  --device bb-workspace-17 \
+  --source /srv/bb-workspaces/allocation-17 \
+  --target /home/agentuser/work \
+  --access read-write
+
+isx automation unmount \
+  --name bb-worker-17 --key allocation-17 \
+  --device bb-workspace-17 \
+  --source /srv/bb-workspaces/allocation-17 \
+  --target /home/agentuser/work \
+  --access read-write
+```
+
+The device name must start with a lowercase letter and contain at most 63 lowercase letters, digits, or hyphens. Source and target must be absolute, contain no `..`, NUL, or newline; the source must identify an existing physical path, and the target cannot be `/`. An existing instance-owned device is accepted only when its complete unexpanded Incus map exactly matches the translated source, target, access, and disk type; extra fields, malformed devices, and read-only/read-write changes are conflicts. A repeated exact mount and a repeated absent unmount are unchanged. Unmount rechecks the full expected map in the same Incus read-modify-write that removes the device, rather than deleting by name alone.
+
+On named macOS pools, the physical source is canonicalized through the running VM's fingerprint-checked `VmHostExports` plan. Read-write attachment is limited to the declared workspace export; workspace leaves may be downgraded to read-only, while runtime and reference exports remain read-only. Symlink escapes, undeclared paths, and leaf aliases resolving to an export root fail closed. Incus receives the exact translated leaf, not the enclosing workspace root, and an inner `readonly=true` for read-only requests. Legacy macOS pools support read-only attachment only because the appliance mounts their whole-home share read-only; unlike named-pool read-only exports, that legacy restriction is not VZ-enforced.
+
+`exec` accepts argv and environment as JSON rather than a shell command:
+
+```shell
+printf 'raw stdin\n' | isx automation exec \
+  --name bb-worker-17 \
+  --key allocation-17 \
+  --argv-json '["printf","%s\\n"," empty and whitespace preserved "]' \
+  --env-json '{"CI":"true"}' \
+  --timeout-ms 300000
+```
+
+`--argv-json` must be a non-empty array of strings and is passed to Incus exactly, including empty, whitespace-only, dash-prefixed, quoted, and newline-containing arguments. No shell joins or reparses it. `--env-json` is optional and must be an object whose values are strings. UID and GID default to `1000`; cwd and `HOME` default to `/home/agentuser` and can be overridden with `--uid`, `--gid`, `--cwd`, and `HOME` in `--env-json`. Stdin is forwarded byte-for-byte and is never logged or included in protocol output.
+
+Exec stdout and stderr are NDJSON frames containing base64 data, followed by one `result` or `error` frame:
+
+```json
+{"protocol":"isx-automation","version":1,"type":"stdout","data":"aGVsbG8K"}
+{"protocol":"isx-automation","version":1,"type":"result","exit_code":0,"termination":"exited"}
+```
+
+A finite `--timeout-ms` or process shutdown (SIGINT/SIGTERM) requests `DELETE` on the Incus exec operation. The final error frame reports `termination` and whether operation deletion was attempted and accepted. Acceptance means only that Incus accepted the operation deletion request. Live macOS/vsock and Incus verification must still establish whether this kills the complete guest process tree; callers must not assume that stronger property until it has been verified.
 
 ### `isx doctor`
 
@@ -1139,7 +1319,7 @@ Manage the incus-spawn VM appliance. macOS only.
 | `start` | Start the VM (creates disk image on first run) |
 | `stop` | Stop the VM (graceful shutdown) |
 | `restart` | Stop and restart the VM (applies pending appliance updates) |
-| `status` | Show VM status and system diagnostics |
+| `status` | Show VM status, selected worker-pool resources, and system diagnostics |
 | `resize` | Grow the VM data disk that backs the storage pool |
 | `console` | Follow VM serial console output |
 | `check-version` | Check whether the running appliance matches the installed version |

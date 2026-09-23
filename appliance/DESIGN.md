@@ -87,18 +87,19 @@ BusyBox init handles PID 1 responsibilities (zombie reaping, signal forwarding) 
 
 1. Mount virtual filesystems (`/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`, `/run`, `/tmp`)
 2. Remount root with `noatime,commit=300`
-3. Set hostname
-4. Apply sysctl settings (IP forwarding for Incus bridge NAT)
-5. Bring up loopback and DHCP on the first network interface (`udhcpc`)
-6. Seed clock from kernel cmdline (`isx.time`) and start `qemu-ga` for vfkit timesync
-7. Start `chronyd` for NTP clock sync (see [Clock Synchronization](#clock-synchronization))
-8. Start `dbus-daemon` (required by Incus)
-9. Start `lxcfs` (required by Incus for /proc virtualization)
-10. Start `incusd`
-11. Run `incus-spawn-vm-init` (bridge, storage pool, iptables)
-12. Run smoke test if `isx.smoke_test` is on kernel cmdline
-13. Schedule diagnostics dump (30s delay, background)
-14. Echo `=== ISX READY ===` marker
+3. Mount host virtio-fs devices (named typed exports, or legacy `hostfs`)
+4. Set hostname
+5. Apply sysctl settings (IP forwarding for Incus bridge NAT)
+6. Bring up loopback and DHCP on the first network interface (`udhcpc`)
+7. Seed clock from kernel cmdline (`isx.time`) and start `qemu-ga` for vfkit timesync
+8. Start `chronyd` for NTP clock sync (see [Clock Synchronization](#clock-synchronization))
+9. Start `dbus-daemon` (required by Incus)
+10. Start `lxcfs` (required by Incus for /proc virtualization)
+11. Start `incusd`
+12. Run `incus-spawn-vm-init` (bridge, storage pool, iptables)
+13. Run smoke test if `isx.smoke_test` is on kernel cmdline
+14. Schedule diagnostics dump (30s delay, background)
+15. Echo `=== ISX READY ===` marker
 
 ### Clock Synchronization
 
@@ -106,9 +107,9 @@ The VM has no hardware RTC. Three layers keep the guest clock accurate:
 
 1. **Boot-time seed**: The kernel cmdline carries `isx.time=<epoch>` (stamped by the host at VM start). `rcS` sets the system clock from this immediately, so TLS works before NTP is reachable.
 
-2. **QEMU Guest Agent (vfkit)**: `qemu-ga` listens on virtio-vsock port 1024. vfkit's `--timesync` is supposed to send `guest-set-time` on host wake, but does not do so reliably after macOS sleep. This layer is kept as a best-effort complement.
+2. **QEMU Guest Agent (vfkit)**: `qemu-ga` binds virtio-vsock port 1024 on `VMADDR_CID_ANY`; binding reserved host CID 2 from the guest would leave the port unserved. vfkit checks the guest clock at startup, immediately after a macOS wake notification, and once per minute. Each check uses a fresh connection with bounded retries; vfkit advances a lagging guest with a small transport allowance, leaves small positive skew alone to avoid backward jitter, and corrects a pathologically ahead guest once. This ordering matters because VirtioFS stamps shared-file mtimes from the Mac clock. The periodic check repairs missed wake notifications and stale pre-sleep connections without relying on guest networking.
 
-3. **chrony (NTP)**: `chronyd` polls `pool.ntp.org` and steps the clock whenever the offset exceeds 1 second (`makestep 1 -1`). After a host sleep, the guest network recovers within ~30 seconds (udhcpc DHCP), then chrony detects the drift and corrects it within a few seconds via `iburst`. This is the primary post-resume clock correction mechanism and works regardless of vfkit behavior.
+3. **chrony (NTP)**: `chronyd` polls `pool.ntp.org` and steps the clock whenever the offset exceeds 1 second (`makestep 1 -1`). It remains an independent fallback when public NTP is reachable, but correctness after host sleep does not depend on UDP NTP, DNS, or VPN policy.
 
 On QEMU with KVM, `kvmclock` (CONFIG_PARAVIRT_CLOCK) keeps the guest in sync natively. chrony provides an additional safety net and handles non-KVM QEMU scenarios.
 
@@ -161,6 +162,9 @@ vfkit --cpus 2 --memory 2048 \
   --device virtio-blk,path=disk.img \
   --device virtio-net,nat \
   --device virtio-serial,logFilePath=vm.log \
+  --device virtio-fs,sharedDir=/Users/me/isx/runtime,mountTag=isx-runtime,readonly \
+  --device virtio-fs,sharedDir=/Users/me/isx/workspace,mountTag=isx-workspace \
+  --device virtio-fs,sharedDir=/Users/me/.m2,mountTag=isx-reference-maven,readonly \
   --device virtio-vsock,port=8443,socketURL=~/.local/state/incus-spawn/vm.incus.sock,connect \
   --device virtio-vsock,port=1025,socketURL=~/.local/state/incus-spawn/vm.agent.sock,connect \
   --restful-uri tcp://localhost:$PORT
@@ -170,6 +174,7 @@ vfkit --cpus 2 --memory 2048 \
 - Console on `hvc0` (virtio-serial), not `ttyS0`
 - REST API for lifecycle management (stop via `POST /vm/state {"state":"Stop"}`)
 - NAT networking with DHCP (interface appears as `enp0s1`)
+- **typed host exports**: named pools mount `isx-runtime` at `/host/runtime` and `isx-reference-<name>` at `/host/references/<name>` read-only, and `isx-workspace` at `/host/workspace` read-write. The bounded, safe sorted reference names arrive in `isx.reference_names`; a missing device or invalid name aborts appliance initialization instead of leaving an empty directory in its place. This requires the companion incus-spawn vfkit extension: its `virtio-fs,...,readonly` field passes `true` to `VZSharedDirectory`. Upstream vfkit rejects the field and named pools fail closed. The matching guest `mount -o ro` flags are defense in depth and are not sufficient without virtualization-layer enforcement. Without `isx.host_exports=named`, `rcS` retains the legacy read-only `hostfs` mount at `/host`.
 - **vsock tunnel**: the `virtio-vsock` device exposes the VM's vsock port 8443 as a Unix domain socket on the host. Inside the VM, socat bridges this to the Incus daemon's Unix socket, giving the host direct plain-HTTP access to the Incus API without TCP or TLS. This bypasses corporate VPN socket filters (e.g. Cisco AnyConnect) that block non-Apple-signed binaries from TCP connections to the VM subnet
 - **control agent channel**: a second `virtio-vsock` device (port 1025 → `vm.agent.sock`) exposes the allowlisted in-VM control agent on an independent channel, so the host can introspect and recover the forwarder even when the Incus tunnel itself is wedged. See "Control agent and forwarder recovery" below.
 

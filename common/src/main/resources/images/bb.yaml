@@ -1,0 +1,8 @@
+name: tpl-bb
+description: Hardened bb bootstrap host
+parent: tpl-minimal
+packages:
+  - git
+  - curl
+  - nodejs
+  - npm

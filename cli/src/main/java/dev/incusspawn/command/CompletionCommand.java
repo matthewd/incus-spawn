@@ -189,6 +189,9 @@ public class CompletionCommand extends BaseCommand {
             _isx_shell() {
               _arguments \\
                 '(-h --help)'{-h,--help}'[Show help]' \\
+                '--root[Open a root shell in an automation-owned instance]' \\
+                '--ownership-digest=[SHA-256 digest of the expected automation ownership key]:digest' \\
+                '--cwd=[Absolute initial directory inside the instance]:directory:_files -/' \\
                 '1:clone name:_isx_instances'
             }
 
@@ -243,8 +246,9 @@ public class CompletionCommand extends BaseCommand {
                 'stop:stop the proxy'
                 'restart:restart the proxy service'
                 'status:check if the proxy is running'
-                'install:install the proxy as a systemd user service'
-                'uninstall:stop and remove the systemd proxy service'
+                'install:install the proxy as a user service'
+                'uninstall:stop and remove the proxy user service'
+                'configure-dns:apply proxy DNS overrides to the selected Incus appliance'
                 'logs:follow the proxy log file in real time'
                 'dump:run a local pass-through proxy to capture host-side API traffic'
               )
@@ -264,8 +268,41 @@ public class CompletionCommand extends BaseCommand {
                       _arguments \\
                         '(-h --help)'{-h,--help}'[Show help]' \\
                         '--port=[Local HTTP port]:port' ;;
-                    stop|restart|status|install|uninstall|logs)
+                    stop|restart|status|install|uninstall|configure-dns|logs)
                       _arguments '(-h --help)'{-h,--help}'[Show help]' ;;
+                  esac ;;
+              esac
+            }
+
+            _isx_automation() {
+              local state line; typeset -A opt_args
+              _arguments -C \\
+                '(-h --help)'{-h,--help}'[Show help]' \\
+                '1: :->subcmd' \\
+                '*:: :->args'
+
+              local -a _automation_subcmds
+              _automation_subcmds=(
+                'create:create a stopped owned CoW instance'
+                'inspect:inspect whitelisted instance state'
+                'start:idempotently start an owned instance'
+                'stop:idempotently stop an owned instance'
+                'mount:attach an exact owned host workspace device'
+                'unmount:detach only an exactly matching workspace device'
+                'delete:idempotently delete or reconcile by key'
+                'exec:execute exact argv with NDJSON streaming'
+              )
+
+              case $state in
+                subcmd) _describe -t subcmds 'automation subcommand' _automation_subcmds ;;
+                args)
+                  case $line[1] in
+                    create) _arguments '--name=[Instance name]:name' '--template=[Template]:template:_isx_template_names' '--key=[Ownership key]:key' ;;
+                    inspect) _arguments '--name=[Instance name]:name' '--key=[Ownership key]:key' ;;
+                    start|stop) _arguments '--name=[Instance name]:name' '--key=[Ownership key]:key' ;;
+                    mount|unmount) _arguments '--name=[Instance name]:name' '--key=[Ownership key]:key' '--device=[Safe deterministic device name]:device' '--source=[Absolute physical host source]:source:_files' '--target=[Absolute container target]:target' '--access=[Attachment access]:access:(read-only read-write)' ;;
+                    delete) _arguments '--name=[Optional instance name]:name' '--key=[Ownership key]:key' '--template=[Expected source template]:template:_isx_templates' ;;
+                    exec) _arguments '--name=[Instance name]:name' '--key=[Ownership key]:key' '--argv-json=[JSON argv array]:json' '--env-json=[JSON environment object]:json' '--uid=[Guest UID]:uid' '--gid=[Guest GID]:gid' '--cwd=[Guest working directory]:directory' '--timeout-ms=[Timeout in milliseconds]:milliseconds' ;;
                   esac ;;
               esac
             }
@@ -367,6 +404,7 @@ public class CompletionCommand extends BaseCommand {
                     'destroy:destroy a clone environment'
                     'update-all:update all templates (packages, git repos, dependencies)'
                     'proxy:manage the MITM authentication proxy'
+                    'automation:versioned non-interactive automation API'
                     'completion:print shell completion script'
                     'templates:manage template definitions'
                     'instances:list connectable instance names'
@@ -394,6 +432,7 @@ public class CompletionCommand extends BaseCommand {
                     run)        _isx_run ;;
                     project)    _isx_project ;;
                     proxy)      _isx_proxy ;;
+                    automation) _isx_automation ;;
                     completion) _isx_completion ;;
                     templates)  _isx_templates ;;
                     instances)  _arguments '(-h --help)'{-h,--help}'[Show help]' ;;
@@ -425,14 +464,14 @@ public class CompletionCommand extends BaseCommand {
               local cur prev words cword
               _init_completion || return
 
-              local commands="init build clean project branch shell run list destroy update-all update-base proxy completion templates instances vm git-remote-helper ssh-proxy doctor help"
+              local commands="init build clean project branch shell run list destroy update-all update-base proxy automation completion templates instances vm git-remote-helper ssh-proxy doctor help"
 
               # Determine which subcommand is active
               local cmd=""
               local i
               for (( i=1; i < cword; i++ )); do
                 case "${words[i]}" in
-                  init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|completion|templates|instances|vm|git-remote-helper|ssh-proxy|doctor|help)
+                  init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|automation|completion|templates|instances|vm|git-remote-helper|ssh-proxy|doctor|help)
                     cmd="${words[i]}"
                     break ;;
                 esac
@@ -507,7 +546,10 @@ public class CompletionCommand extends BaseCommand {
                       COMPREPLY=( $(compgen -W "$(_isx_list_instances) --help" -- "$cur") )
                       return ;;
                   esac
-                  COMPREPLY=( $(compgen -W "--help" -- "$cur") )
+                  case "$prev" in
+                    --ownership-digest|--cwd) return ;;
+                  esac
+                  COMPREPLY=( $(compgen -W "--help --root --ownership-digest --cwd" -- "$cur") )
                   ;;
                 run)
                   case "$prev" in
@@ -544,12 +586,12 @@ public class CompletionCommand extends BaseCommand {
                   fi
                   ;;
                 proxy)
-                  local proxy_subcmds="start stop restart status install uninstall logs dump"
+                  local proxy_subcmds="start stop restart status install uninstall configure-dns logs dump"
                   local proxy_cmd=""
                   local j
                   for (( j=i+1; j < cword; j++ )); do
                     case "${words[j]}" in
-                      start|stop|restart|status|install|uninstall|logs|dump) proxy_cmd="${words[j]}"; break ;;
+                      start|stop|restart|status|install|uninstall|configure-dns|logs|dump) proxy_cmd="${words[j]}"; break ;;
                     esac
                   done
                   if [[ -z "$proxy_cmd" ]]; then
@@ -559,6 +601,32 @@ public class CompletionCommand extends BaseCommand {
                       start) COMPREPLY=( $(compgen -W "--help --port --health-port --gateway-ip --debug" -- "$cur") ) ;;
                       dump) COMPREPLY=( $(compgen -W "--help --port" -- "$cur") ) ;;
                       *) COMPREPLY=( $(compgen -W "--help" -- "$cur") ) ;;
+                    esac
+                  fi
+                  ;;
+                automation)
+                  local automation_subcmds="create inspect start stop mount unmount delete exec"
+                  local automation_cmd=""
+                  local j
+                  for (( j=i+1; j < cword; j++ )); do
+                    case "${words[j]}" in
+                      create|inspect|start|stop|mount|unmount|delete|exec) automation_cmd="${words[j]}"; break ;;
+                    esac
+                  done
+                  if [[ -z "$automation_cmd" ]]; then
+                    COMPREPLY=( $(compgen -W "$automation_subcmds --help" -- "$cur") )
+                  else
+                    case "$automation_cmd" in
+                      create) COMPREPLY=( $(compgen -W "--help --name --template --key" -- "$cur") ) ;;
+                      inspect|start|stop) COMPREPLY=( $(compgen -W "--help --name --key" -- "$cur") ) ;;
+                      delete) COMPREPLY=( $(compgen -W "--help --name --key --template" -- "$cur") ) ;;
+                      mount|unmount)
+                        if [[ "$prev" == "--access" ]]; then
+                          COMPREPLY=( $(compgen -W "read-only read-write" -- "$cur") )
+                        else
+                          COMPREPLY=( $(compgen -W "--help --name --key --device --source --target --access" -- "$cur") )
+                        fi ;;
+                      exec) COMPREPLY=( $(compgen -W "--help --name --key --argv-json --env-json --uid --gid --cwd --timeout-ms" -- "$cur") ) ;;
                     esac
                   fi
                   ;;
@@ -654,7 +722,7 @@ public class CompletionCommand extends BaseCommand {
 
             # Helper: true when no subcommand has been typed yet
             function __isx_no_subcommand
-              not string match -qr -- '^(init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|completion|templates|instances|vm|git-remote-helper|ssh-proxy|doctor|help)$' (commandline -opc)[2..-1]
+              not string match -qr -- '^(init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|automation|completion|templates|instances|vm|git-remote-helper|ssh-proxy|doctor|help)$' (commandline -opc)[2..-1]
             end
 
             # Helper: true when a specific subcommand is active
@@ -675,6 +743,7 @@ public class CompletionCommand extends BaseCommand {
             complete -c isx -f -n __isx_no_subcommand -a destroy      -d 'Destroy a clone environment'
             complete -c isx -f -n __isx_no_subcommand -a update-all   -d 'Update all templates (packages, git repos, dependencies)'
             complete -c isx -f -n __isx_no_subcommand -a proxy        -d 'Manage the MITM authentication proxy'
+            complete -c isx -f -n __isx_no_subcommand -a automation   -d 'Versioned non-interactive automation API'
             complete -c isx -f -n __isx_no_subcommand -a completion   -d 'Print shell completion script'
             complete -c isx -f -n __isx_no_subcommand -a templates    -d 'Manage template definitions'
             complete -c isx -f -n __isx_no_subcommand -a instances    -d 'List connectable instance names'
@@ -737,6 +806,9 @@ public class CompletionCommand extends BaseCommand {
             # ── shell ────────────────────────────────────────────────────────────────────
 
             complete -c isx -f -n '__isx_using_subcommand shell' -a '(__isx_instances)' -d 'Clone name'
+            complete -c isx -f -n '__isx_using_subcommand shell' -l root -d 'Open a root shell in an automation-owned instance'
+            complete -c isx -f -n '__isx_using_subcommand shell' -l ownership-digest -d 'SHA-256 digest of the expected automation ownership key'
+            complete -c isx -F -n '__isx_using_subcommand shell' -l cwd -d 'Absolute initial directory inside the instance'
 
             # ── run ─────────────────────────────────────────────────────────────────────
 
@@ -765,20 +837,39 @@ public class CompletionCommand extends BaseCommand {
 
             # ── proxy ────────────────────────────────────────────────────────────────────
 
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a start     -d 'Start the MITM authentication proxy'
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a stop      -d 'Stop the proxy'
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a restart   -d 'Restart the proxy service'
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a status    -d 'Check if the proxy is running'
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a install   -d 'Install the proxy as a systemd user service'
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a uninstall -d 'Stop and remove the systemd proxy service'
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a logs      -d 'Follow the proxy log file in real time'
-            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|logs|dump)\\b" (commandline -opc)' -a dump      -d 'Run a local pass-through proxy for API traffic capture'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a start         -d 'Start the MITM authentication proxy'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a stop          -d 'Stop the proxy'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a restart       -d 'Restart the proxy service'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a status        -d 'Check if the proxy is running'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a install       -d 'Install the proxy as a user service'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a uninstall     -d 'Stop and remove the proxy user service'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a configure-dns -d 'Apply proxy DNS overrides to the selected Incus appliance'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a logs          -d 'Follow the proxy log file in real time'
+            complete -c isx -f -n '__isx_using_subcommand proxy; and not string match -qr -- "\\b(start|stop|restart|status|install|uninstall|configure-dns|logs|dump)\\b" (commandline -opc)' -a dump          -d 'Run a local pass-through proxy for API traffic capture'
 
             complete -c isx -f -n '__isx_using_subcommand proxy; and __isx_using_subcommand start' -l port        -d 'MITM TLS proxy port'
             complete -c isx -f -n '__isx_using_subcommand proxy; and __isx_using_subcommand start' -l health-port -d 'Health check HTTP port'
             complete -c isx -f -n '__isx_using_subcommand proxy; and __isx_using_subcommand start' -l gateway-ip  -d 'Incus bridge gateway IP (skips Incus API lookup)'
             complete -c isx -f -n '__isx_using_subcommand proxy; and __isx_using_subcommand start' -l debug       -d 'Log full API request/response details'
             complete -c isx -f -n '__isx_using_subcommand proxy; and __isx_using_subcommand dump'  -l port        -d 'Local HTTP port'
+
+            # ── automation ───────────────────────────────────────────────────────────────
+
+            complete -c isx -f -n '__isx_using_subcommand automation; and not string match -qr -- "\\b(create|inspect|start|stop|mount|unmount|delete|exec)\\b" (commandline -opc)' -a 'create inspect start stop mount unmount delete exec'
+            complete -c isx -f -n '__isx_using_subcommand automation' -l name       -d 'Instance name'
+            complete -c isx -f -n '__isx_using_subcommand automation' -l key        -d 'Caller ownership key'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand create' -l template -d 'Existing stopped template' -a '(__isx_templates)'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand delete' -l template -d 'Expected source template' -a '(__isx_templates)'
+            complete -c isx -f -n '__isx_using_subcommand automation; and string match -qr -- "\\b(mount|unmount)\\b" (commandline -opc)' -l device -d 'Safe deterministic Incus device name'
+            complete -c isx -F -n '__isx_using_subcommand automation; and string match -qr -- "\\b(mount|unmount)\\b" (commandline -opc)' -l source -d 'Absolute physical host source path'
+            complete -c isx -f -n '__isx_using_subcommand automation; and string match -qr -- "\\b(mount|unmount)\\b" (commandline -opc)' -l target -d 'Absolute non-root container target path'
+            complete -c isx -f -n '__isx_using_subcommand automation; and string match -qr -- "\\b(mount|unmount)\\b" (commandline -opc)' -l access -d 'Attachment access mode' -a 'read-only read-write'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand exec' -l argv-json  -d 'Exact JSON argv array'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand exec' -l env-json   -d 'JSON environment object'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand exec' -l uid        -d 'Guest UID'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand exec' -l gid        -d 'Guest GID'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand exec' -l cwd        -d 'Guest working directory'
+            complete -c isx -f -n '__isx_using_subcommand automation; and __isx_using_subcommand exec' -l timeout-ms -d 'Finite timeout in milliseconds'
 
             # ── completion ───────────────────────────────────────────────────────────────
 

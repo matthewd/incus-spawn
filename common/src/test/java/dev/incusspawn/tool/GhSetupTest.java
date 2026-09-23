@@ -30,20 +30,18 @@ class GhSetupTest {
     }
 
     @Test
-    void envEntriesSetsGhToken() {
+    void envEntriesSetBothGitHubTokenConventionsToPlaceholders() {
         var entries = new GhSetup().envEntries(Map.of());
 
+        assertEquals(2, entries.size());
         assertTrue(entries.stream().anyMatch(e ->
-                "GH_TOKEN".equals(e.getName()) && "gho_placeholder".equals(e.getValue())
+                "GITHUB_TOKEN".equals(e.getName())
+                        && GhSetup.PLACEHOLDER_TOKEN.equals(e.getValue())
                         && e.getStrategy() == EnvEntry.Strategy.SET));
-    }
-
-    @Test
-    void envEntriesUsesEnvVarNotHostsYml() {
-        var entries = new GhSetup().envEntries(Map.of());
-
-        assertEquals(1, entries.size());
-        assertEquals("GH_TOKEN", entries.get(0).getName());
+        assertTrue(entries.stream().anyMatch(e ->
+                "GH_TOKEN".equals(e.getName())
+                        && GhSetup.PLACEHOLDER_TOKEN.equals(e.getValue())
+                        && e.getStrategy() == EnvEntry.Strategy.SET));
     }
 
     @Test

@@ -2087,7 +2087,7 @@ public class ListCommand extends BaseCommand {
         int centreW = 0;
         var pi = proxyInfo;
         if (pi != null && pi.hasAuthError()) {
-            var label = "  ⚠ Auth expired — run: " + pi.authRemediationHint();
+            var label = "  ⚠ Auth unavailable — " + pi.authRemediationHint();
             int need = label.length();
             if (area.width() - leftW - gaugeW - need >= 1) {
                 centre.add(Span.styled(label, Style.EMPTY.bold().fg(theme.statusWarning()).bg(bg)));
@@ -5008,7 +5008,8 @@ public class ListCommand extends BaseCommand {
                 }
                 if (!t.definitionSha.isEmpty() && !storedSourceTemplates.contains(t.name)) {
                     var def = imageDefs.get(t.name);
-                    if (def != null && !t.definitionSha.equals(def.contentFingerprint(toolFpCache))) {
+                    if (def != null && !t.definitionSha.equals(
+                            def.contentFingerprint(toolFpCache, imageDefs))) {
                         symbols.append('△');
                         anyDefinitionChanged = true;
                         defChanged.add(t.name);
@@ -5215,8 +5216,7 @@ public class ListCommand extends BaseCommand {
     private void tryFixStaleDns() {
         if (dnsVerified) return;
         dnsVerified = true;
-        var toolProxyDomains = dev.incusspawn.proxy.ToolProxyResolver.resolvedDomains(SpawnConfig.load());
-        var allDomains = ProxyConfig.interceptedDomains(toolProxyDomains);
+        var allDomains = ProxyConfig.resolvedInterceptedDomains(SpawnConfig.load());
         if (ProxyConfig.isBridgeDnsComplete(incus, allDomains)) return;
         setStatusMessage("Updating bridge DNS overrides...");
         var thread = new Thread(() -> {

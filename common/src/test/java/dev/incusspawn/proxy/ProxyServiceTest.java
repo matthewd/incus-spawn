@@ -268,4 +268,96 @@ class ProxyServiceTest {
         assertFalse(block.contains("grep -qw"),
                 "word-boundary match would false-positive on hyphenated group names");
     }
+
+    // --- macOS global proxy service --------------------------------------------
+
+    @Test
+    void macOsProxyPlistPinsPersistedGatewayWithoutPoolOrCredentials() {
+        var plist = ProxyService.generateProxyPlist("/opt/homebrew/bin/isx", "192.168.64.1");
+
+        assertTrue(plist.contains("<string>--gateway-ip</string>"));
+        assertTrue(plist.contains("<string>192.168.64.1</string>"));
+        assertFalse(plist.contains("ISX_POOL"), "the singleton proxy must not inherit a pool");
+        assertFalse(plist.contains("ANTHROPIC_API_KEY"));
+        assertFalse(plist.contains("GH_TOKEN"));
+        assertFalse(plist.contains("OPENAI_API_KEY"));
+    }
+
+    @Test
+    void macOsProxyPlistPinsGatewayForStandaloneBinary() throws IOException {
+        var isx = tempDir.resolve("bin/isx");
+        var proxy = tempDir.resolve("bin/isx-proxy");
+        Files.createDirectories(isx.getParent());
+        Files.writeString(proxy, "proxy");
+        proxy.toFile().setExecutable(true);
+
+        var plist = ProxyService.generateProxyPlist(isx.toString(), "10.20.30.1");
+
+        assertTrue(plist.contains("<string>" + proxy + "</string>"));
+        assertTrue(plist.contains("<string>--gateway-ip</string>"));
+        assertTrue(plist.contains("<string>10.20.30.1</string>"));
+    }
+
+    @Test
+    void gatewayValidationAcceptsOnlyPrivateHostAddresses() {
+        assertTrue(ProxyService.isSafeGatewayIp("10.0.0.1"));
+        assertTrue(ProxyService.isSafeGatewayIp("172.31.4.1"));
+        assertTrue(ProxyService.isSafeGatewayIp("192.168.64.1"));
+        assertFalse(ProxyService.isSafeGatewayIp("127.0.0.1"));
+        assertFalse(ProxyService.isSafeGatewayIp("169.254.1.1"));
+        assertFalse(ProxyService.isSafeGatewayIp("192.168.64.0"));
+        assertFalse(ProxyService.isSafeGatewayIp("192.168.64.255"));
+        assertFalse(ProxyService.isSafeGatewayIp("8.8.8.8"));
+        assertFalse(ProxyService.isSafeGatewayIp("192.168.64.1</string>"));
+    }
+
+    @Test
+    void discoveredGatewayAtomicallyReplacesGlobalState() throws IOException {
+        var state = tempDir.resolve("state/proxy-gateway-ip");
+        ProxyService.persistGatewayIp(state, "192.168.64.1");
+        assertEquals("192.168.64.1", ProxyService.readPersistedGatewayIp(state));
+
+        assertEquals("192.168.65.1",
+                ProxyService.selectMacOsGatewayIp("192.168.65.1", state));
+        assertEquals("192.168.65.1\n", Files.readString(state));
+        try (var files = Files.list(state.getParent())) {
+            assertEquals(1, files.count(), "atomic staging file must be removed");
+        }
+    }
+
+    @Test
+    void persistedGatewayIsFallbackWhenLiveDiscoveryIsUnavailable() throws IOException {
+        var state = tempDir.resolve("state/proxy-gateway-ip");
+        ProxyService.persistGatewayIp(state, "192.168.64.1");
+
+        assertEquals("192.168.64.1", ProxyService.selectMacOsGatewayIp(null, state));
+        assertEquals("192.168.64.1", ProxyService.selectMacOsGatewayIp("not-an-ip", state));
+    }
+
+    @Test
+    void gatewaySelectionFailsClosedWithoutSafeLiveOrPersistedValue() throws IOException {
+        var state = tempDir.resolve("state/proxy-gateway-ip");
+        Files.createDirectories(state.getParent());
+        Files.writeString(state, "--debug\n");
+
+        assertNull(ProxyService.selectMacOsGatewayIp(null, state));
+        assertNull(ProxyService.selectMacOsGatewayIp("8.8.8.8", state));
+    }
+
+    @Test
+    void legacySelectionWritesVmPlistAndNamedSelectionRemovesIt() throws IOException {
+        var plist = tempDir.resolve("Library/LaunchAgents/dev.incusspawn.vm.plist");
+        Files.createDirectories(plist.getParent());
+
+        ProxyService.reconcileMacOsVmPlist(plist, true, "/usr/local/bin/isx",
+                "/usr/local/bin:/usr/bin", tempDir.resolve("state"));
+        assertTrue(Files.exists(plist));
+        assertTrue(Files.readString(plist).contains("<string>vm</string>"));
+        assertTrue(Files.readString(plist).contains("<string>start</string>"));
+
+        ProxyService.reconcileMacOsVmPlist(plist, false, "/usr/local/bin/isx",
+                "/usr/local/bin:/usr/bin", tempDir.resolve("state"));
+        assertFalse(Files.exists(plist),
+                "a named-pool install must remove the whole-home login VM plist");
+    }
 }

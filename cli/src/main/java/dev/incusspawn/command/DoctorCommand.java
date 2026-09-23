@@ -867,10 +867,16 @@ public class DoctorCommand extends BaseCommand {
         }
     }
 
-    private Finding checkProxyAuth(ProxyHealthCheck.ProxyInfo info) {
+    Finding checkProxyAuth(ProxyHealthCheck.ProxyInfo info) {
         if (info == null) return null;
         if (!info.hasAuthError()) return Finding.ok("Proxy auth", "credentials valid");
         var hint = info.authRemediationHint();
+        var commandProblem = info.commandCredentialProblem();
+        if (commandProblem != null) {
+            return Finding.fail("Proxy auth (" + commandProblem.label() + ")",
+                    commandProblem.detail(),
+                    new Remediation(commandProblem.remediation(), false, null));
+        }
         return Finding.fail("Proxy auth", info.authError(),
                 new Remediation("Run '" + hint + "'", false,
                         () -> runInteractive(hint.split("\\s+"))));
@@ -904,9 +910,7 @@ public class DoctorCommand extends BaseCommand {
 
     private Finding checkBridgeDns(IncusClient incus) {
         try {
-            var toolProxyDomains = dev.incusspawn.proxy.ToolProxyResolver.resolvedDomains(
-                    SpawnConfig.load());
-            var allDomains = ProxyConfig.interceptedDomains(toolProxyDomains);
+            var allDomains = ProxyConfig.resolvedInterceptedDomains(SpawnConfig.load());
             if (ProxyConfig.isBridgeDnsComplete(incus, allDomains)) {
                 return Finding.ok("Bridge DNS overrides",
                         "all " + allDomains.size() + " domains configured");
@@ -1054,6 +1058,9 @@ public class DoctorCommand extends BaseCommand {
             // Same-directory collisions are always a mistake and make builds ambiguous;
             // cross-layer overrides are intentional but surfacing them explains the
             // "built image doesn't match the file I'm editing" confusion.
+            for (var error : loaded.parseErrors()) {
+                findings.add(Finding.warn("Invalid image definition", error, null));
+            }
             addDefinitionFindings(findings, loaded.conflicts(), loaded.overrides());
             var toolLoader = RuntimeServices.toolDefLoader();
             addDefinitionFindings(findings, toolLoader.conflicts(), toolLoader.overrides());
@@ -1219,7 +1226,7 @@ public class DoctorCommand extends BaseCommand {
                 copyLogTail(Environment.clientLogFile(), bundleDir.resolve("client.log"), 1000);
                 if (Platform.isMacOS()) {
                     copyLogTail(Environment.vmLogFile(), bundleDir.resolve("vm.log"), 1000);
-                    copyLogTail(Environment.vmStateDir().resolve("proxy-service.log"),
+                    copyLogTail(Environment.proxyServiceLogFile(),
                             bundleDir.resolve("proxy-service.log"), 1000);
                 }
                 Files.writeString(bundleDir.resolve("proxy-status.txt"), collectProxyStatus());

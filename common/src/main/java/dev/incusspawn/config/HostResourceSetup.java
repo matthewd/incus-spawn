@@ -10,6 +10,7 @@ import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.incus.Metadata;
 import dev.incusspawn.tool.DownloadCache;
 import dev.incusspawn.util.BuildOutput;
+import dev.incusspawn.vm.VmHostExports;
 import dev.incusspawn.Platform;
 
 import java.io.IOException;
@@ -52,15 +53,69 @@ public final class HostResourceSetup {
     }
 
     public static String translateForVm(String hostPath) {
-        if (!Platform.isMacOS()) return hostPath;
-        var home = System.getProperty("user.home");
-        if (hostPath.startsWith(home + "/")) {
-            return "/host" + hostPath.substring(home.length());
+        return translateForVm(hostPath, WorkerPoolConfig.AccessMode.READ_ONLY).appliancePath();
+    }
+
+    /** Translate a host path while preserving and enforcing the requested appliance access. */
+    public static VmHostExports.Translation translateForVm(
+            String hostPath, WorkerPoolConfig.AccessMode requestedAccess) {
+        if (!Platform.isMacOS()) {
+            return new VmHostExports.Translation(hostPath, requestedAccess, requestedAccess);
         }
-        if (hostPath.equals(home)) {
-            return "/host";
+        var selection = WorkerPoolSelection.current();
+        if (!selection.isLegacy()) {
+            var exports = namedVmExports(selection);
+            exports.requirePersistedFingerprint(Environment.vmExportPlanFingerprint());
+            return exports.translate(hostPath, Environment.home(), requestedAccess);
         }
-        return hostPath;
+        return translateLegacyVmHostPath(hostPath, Environment.home(), requestedAccess);
+    }
+
+    static VmHostExports.Translation translateLegacyVmHostPath(
+            String hostPath, Path configuredHome, WorkerPoolConfig.AccessMode requestedAccess) {
+        if (requestedAccess == WorkerPoolConfig.AccessMode.READ_WRITE) {
+            throw new IllegalStateException(
+                    "read-write host attachment on macOS requires a named worker pool workspace export");
+        }
+        final Path home;
+        final Path source;
+        try {
+            home = configuredHome.toRealPath();
+            source = Path.of(hostPath).toRealPath();
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                    "legacy macOS host attachment requires an existing physical path", e);
+        }
+        if (!source.startsWith(home)) {
+            throw new IllegalStateException(
+                    "legacy macOS host attachment source is outside the exported home");
+        }
+        var relative = home.relativize(source);
+        var translated = relative.toString().isEmpty()
+                ? "/host" : "/host/" + relative;
+        return new VmHostExports.Translation(translated, requestedAccess,
+                WorkerPoolConfig.AccessMode.READ_ONLY);
+    }
+
+    /**
+     * Create VM download staging inside the named pool's controlled runtime export. Legacy and
+     * non-macOS callers retain their previous temporary-directory location.
+     */
+    public static Path createVmStagingDirectory(Path legacyParent, String prefix) throws IOException {
+        if (!Platform.isMacOS() || WorkerPoolSelection.current().isLegacy()) {
+            return legacyParent == null
+                    ? Files.createTempDirectory(prefix)
+                    : Files.createTempDirectory(legacyParent, prefix);
+        }
+        var exports = namedVmExports(WorkerPoolSelection.current());
+        exports.requirePersistedFingerprint(Environment.vmExportPlanFingerprint());
+        return exports.createRuntimeStagingDirectory(prefix);
+    }
+
+    private static VmHostExports namedVmExports(WorkerPoolSelection selection) {
+        var name = selection.name().orElseThrow();
+        var pool = selection.pool().orElseThrow();
+        return VmHostExports.create(name, pool, Environment.home());
     }
 
     static String deviceName(String containerPath) {
@@ -164,11 +219,22 @@ public final class HostResourceSetup {
 
     public static void applyForInstance(IncusClient incus, String container, List<ImageDef.HostResource> resources,
                                         boolean isVm) {
+        applyForInstance(incus, container, resources, isVm, true);
+    }
+
+    public static void applyForInstanceQuietly(
+            IncusClient incus, String container, List<ImageDef.HostResource> resources, boolean isVm) {
+        applyForInstance(incus, container, resources, isVm, false);
+    }
+
+    private static void applyForInstance(
+            IncusClient incus, String container, List<ImageDef.HostResource> resources,
+            boolean isVm, boolean report) {
         for (var hr : resources) {
             switch (effectiveMode(hr, isVm)) {
                 case "readonly" -> {
                     removeExistingDevice(incus, container, deviceNameForMode(hr));
-                    applyReadonly(incus, container, hr, isVm);
+                    applyReadonly(incus, container, hr, isVm, report);
                 }
                 case "overlay" -> {
                     if (Platform.isMacOS()) {
@@ -275,6 +341,11 @@ public final class HostResourceSetup {
     }
 
     private static void applyReadonly(IncusClient incus, String container, ImageDef.HostResource hr, boolean isVm) {
+        applyReadonly(incus, container, hr, isVm, true);
+    }
+
+    private static void applyReadonly(
+            IncusClient incus, String container, ImageDef.HostResource hr, boolean isVm, boolean report) {
         var expandedSource = expandHostTilde(hr.getSource());
         if (!Files.exists(Path.of(expandedSource))) {
             System.err.println("Warning: host-resource source not found: " + hr.getSource() + " (skipping)");
@@ -288,7 +359,9 @@ public final class HostResourceSetup {
                 "readonly=true"));
         addShiftIfSupported(args, isVm);
         incus.deviceAdd(container, devName, "disk", args.toArray(String[]::new));
-        BuildOutput.note("Mounted " + hr.getSource() + " -> " + containerPath + " (readonly)");
+        if (report) {
+            BuildOutput.note("Mounted " + hr.getSource() + " -> " + containerPath + " (readonly)");
+        }
     }
 
     private static void applyOverlay(IncusClient incus, Container container, ImageDef.HostResource hr, boolean isVm) {

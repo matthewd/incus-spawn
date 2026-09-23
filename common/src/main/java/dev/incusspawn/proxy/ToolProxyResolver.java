@@ -82,6 +82,30 @@ public final class ToolProxyResolver {
                 .collect(Collectors.toUnmodifiableSet());
     }
 
+    /** All exact and wildcard routes declared by tool definitions, credentialed or not. */
+    public static DeclaredRoutes declaredRoutes() {
+        var exact = new java.util.LinkedHashSet<String>();
+        var wildcardSuffixes = new java.util.LinkedHashSet<String>();
+        for (var tool : new ToolDefLoader().allToolSetups().values()) {
+            var proxy = tool.proxy();
+            if (proxy == null) continue;
+            for (var auth : proxy.getAuth()) {
+                if (auth.getDomains() == null) continue;
+                for (var domain : auth.getDomains()) {
+                    if (domain == null || domain.isBlank()) continue;
+                    if (domain.startsWith("*.")) {
+                        wildcardSuffixes.add(domain.substring(1));
+                    } else {
+                        exact.add(domain);
+                    }
+                }
+            }
+        }
+        return new DeclaredRoutes(Set.copyOf(exact), List.copyOf(wildcardSuffixes));
+    }
+
+    public record DeclaredRoutes(Set<String> exactDomains, List<String> wildcardSuffixes) {}
+
     public record UnresolvedToolProxy(String toolName, String configKey) {}
 
     /**

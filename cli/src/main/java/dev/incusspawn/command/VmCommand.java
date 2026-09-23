@@ -31,6 +31,18 @@ import java.nio.file.Files;
 )
 public class VmCommand extends BaseCommand {
 
+    private static CommandResult waitForIncus() {
+        BuildOutput.stepStart("Waiting for Incus daemon...");
+        if (VmManager.waitUntilReady(60)) {
+            BuildOutput.stepDone();
+            return CommandResult.SUCCESS;
+        }
+        BuildOutput.stepFail("VM exited or Incus did not become reachable within 60s.");
+        System.err.println("Serial log: " + Environment.vmLogFile());
+        System.err.println("Launch log: " + Environment.vmLaunchLogFile());
+        return CommandResult.valueOf(1);
+    }
+
     @Override
     protected CommandResult doExecute() throws Exception {
         System.out.println(commandInvocation.getHelpInfo());
@@ -46,7 +58,8 @@ public class VmCommand extends BaseCommand {
         @Override
         protected CommandResult doExecute() throws Exception {
             BuildOutput.header("Starting VM");
-            return VmManager.start() ? CommandResult.SUCCESS : CommandResult.valueOf(1);
+            if (!VmManager.start()) return CommandResult.valueOf(1);
+            return waitForIncus();
         }
     }
 
@@ -90,7 +103,8 @@ public class VmCommand extends BaseCommand {
                 return CommandResult.SUCCESS;
             }
             BuildOutput.header("Restarting VM");
-            return VmManager.restart() ? CommandResult.SUCCESS : CommandResult.valueOf(1);
+            if (!VmManager.restart()) return CommandResult.valueOf(1);
+            return waitForIncus();
         }
     }
 

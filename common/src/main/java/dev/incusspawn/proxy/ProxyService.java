@@ -4,12 +4,16 @@ import dev.incusspawn.Environment;
 import dev.incusspawn.incus.Container;
 import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.Platform;
+import dev.incusspawn.config.WorkerPoolSelection;
+import dev.incusspawn.vm.VmManager;
+import dev.incusspawn.vm.VmNetwork;
 
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
@@ -360,8 +364,8 @@ public final class ProxyService {
             }
 
             if (needsReinstall) {
-                if (Platform.isMacOS()) {
-                    updateMacOsProxyPlist();
+                if (Platform.isMacOS() && !updateMacOsProxyPlist()) {
+                    return false;
                 }
                 return restartLocked();
             }
@@ -441,19 +445,27 @@ public final class ProxyService {
         return false;
     }
 
-    public static void upgradeIfNeeded() {
+    public static boolean upgradeIfNeeded() {
         try (var ignored = acquireProxyLock()) {
             if (Platform.isMacOS()) {
-                if (needsMacOsPlistUpdate()) {
-                    updateMacOsProxyPlist();
-                    restartLocked();
+                if (!WorkerPoolSelection.current().isLegacy()
+                        && !removeLegacyVmLaunchAgent(getUid())) {
+                    return false;
                 }
-                return;
+                // An explicit install/upgrade refreshes global state from the running selection;
+                // when no appliance is reachable this validates the persisted fallback.
+                if (resolveMacOsGatewayIp() == null) return false;
+                if (needsMacOsPlistUpdate()) {
+                    if (!updateMacOsProxyPlist()) return false;
+                    return restartLocked();
+                }
+                return true;
             }
             if (regenerateServiceFiles()) {
                 System.out.println("Updated proxy service configuration.");
                 runQuiet("systemctl", "--user", "restart", SERVICE_NAME);
             }
+            return true;
         }
     }
 
@@ -702,7 +714,10 @@ public final class ProxyService {
         }
     }
 
-    private static String generateProxyPlist(String isxPath) {
+    static String generateProxyPlist(String isxPath, String gatewayIp) {
+        if (!isSafeGatewayIp(gatewayIp)) {
+            throw new IllegalArgumentException("Unsafe macOS proxy gateway IP: " + gatewayIp);
+        }
         var path = System.getenv("PATH");
         if (path == null || path.isBlank()) {
             path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
@@ -717,6 +732,8 @@ public final class ProxyService {
                     + "            <string>proxy</string>\n"
                     + "            <string>start</string>";
         }
+        programArgs += "\n            <string>--gateway-ip</string>\n"
+                + "            <string>" + gatewayIp + "</string>";
         return """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -741,95 +758,217 @@ public final class ProxyService {
                 """.formatted(PROXY_LABEL, programArgs, path, serviceLog, serviceLog);
     }
 
+    static String generateVmPlist(String isxPath, String path, Path logDir) {
+        return """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                <dict>
+                    <key>Label</key><string>%s</string>
+                    <key>ProgramArguments</key>
+                    <array>
+                        <string>%s</string>
+                        <string>vm</string>
+                        <string>start</string>
+                    </array>
+                    <key>RunAtLoad</key><true/>
+                    <key>EnvironmentVariables</key>
+                    <dict>
+                        <key>PATH</key><string>%s</string>
+                    </dict>
+                    <key>StandardOutPath</key><string>%s/vm-service.log</string>
+                    <key>StandardErrorPath</key><string>%s/vm-service.log</string>
+                </dict>
+                </plist>
+                """.formatted(VM_LABEL, isxPath, path, logDir, logDir);
+    }
+
+    /** A launchd listener must be a private, non-network/broadcast IPv4 host address. */
+    static boolean isSafeGatewayIp(String value) {
+        if (value == null) return false;
+        var parts = value.split("\\.", -1);
+        if (parts.length != 4) return false;
+        var octets = new int[4];
+        for (int i = 0; i < parts.length; i++) {
+            if (parts[i].isEmpty() || !parts[i].chars().allMatch(Character::isDigit)) return false;
+            try {
+                octets[i] = Integer.parseInt(parts[i]);
+            } catch (NumberFormatException e) {
+                return false;
+            }
+            if (octets[i] < 0 || octets[i] > 255) return false;
+        }
+        if (octets[3] == 0 || octets[3] == 255) return false;
+        return octets[0] == 10
+                || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
+                || (octets[0] == 192 && octets[1] == 168);
+    }
+
+    /** Atomically replace the global gateway state read while generating the launchd plist. */
+    static void persistGatewayIp(Path stateFile, String gatewayIp) throws IOException {
+        if (!isSafeGatewayIp(gatewayIp)) {
+            throw new IllegalArgumentException("Unsafe macOS proxy gateway IP: " + gatewayIp);
+        }
+        Files.createDirectories(stateFile.getParent());
+        var temporary = Files.createTempFile(
+                stateFile.getParent(), stateFile.getFileName().toString(), ".tmp");
+        try {
+            Files.writeString(temporary, gatewayIp + "\n");
+            Files.move(temporary, stateFile,
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    static String readPersistedGatewayIp(Path stateFile) {
+        try {
+            var gatewayIp = Files.readString(stateFile).strip();
+            return isSafeGatewayIp(gatewayIp) ? gatewayIp : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** Prefer a live selected-pool discovery, falling back only to valid global state. */
+    static String selectMacOsGatewayIp(String discovered, Path stateFile) throws IOException {
+        if (isSafeGatewayIp(discovered)) {
+            persistGatewayIp(stateFile, discovered);
+            return discovered;
+        }
+        return readPersistedGatewayIp(stateFile);
+    }
+
+    private static String resolveMacOsGatewayIp() {
+        var selection = WorkerPoolSelection.current();
+        var discovered = (selection.isLegacy() || VmManager.isRunning())
+                ? VmNetwork.discoverHostBridgeIp() : null;
+        if (discovered != null && !isSafeGatewayIp(discovered)) {
+            System.err.println("  Warning: ignoring unsafe VM-facing bridge address: " + discovered);
+        }
+        try {
+            var gatewayIp = selectMacOsGatewayIp(discovered, Environment.proxyGatewayFile());
+            if (gatewayIp != null) return gatewayIp;
+        } catch (IOException e) {
+            System.err.println("  Could not persist the macOS proxy gateway: " + e.getMessage());
+            return null;
+        }
+        System.err.println("  Could not discover a safe VM-facing macOS bridge IP, and no valid persisted gateway exists.");
+        System.err.println("  Start the selected VM, then retry: isx proxy install");
+        return null;
+    }
+
     private static boolean needsMacOsPlistUpdate() {
         if (!Files.exists(proxyPlistFile())) return true;
         var isxPath = resolveIsxPath();
         if (isxPath == null) return false;
+        var gatewayIp = readPersistedGatewayIp(Environment.proxyGatewayFile());
+        if (gatewayIp == null) return true;
         try {
             var content = Files.readString(proxyPlistFile());
-            return !content.equals(generateProxyPlist(isxPath));
+            return !content.equals(generateProxyPlist(isxPath, gatewayIp));
         } catch (IOException e) {
             return false;
         }
     }
 
-    private static void updateMacOsProxyPlist() {
+    private static boolean updateMacOsProxyPlist() {
         var isxPath = resolveIsxPath();
-        if (isxPath == null) return;
+        if (isxPath == null) return false;
+        var gatewayIp = resolveMacOsGatewayIp();
+        if (gatewayIp == null) return false;
         try {
             Files.createDirectories(proxyPlistFile().getParent());
-            Files.writeString(proxyPlistFile(), generateProxyPlist(isxPath));
+            Files.writeString(proxyPlistFile(), generateProxyPlist(isxPath, gatewayIp));
+            return true;
         } catch (IOException e) {
             System.err.println("Warning: could not update proxy plist: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** Write or remove the historical login VM plist according to the immutable selection. */
+    static void reconcileMacOsVmPlist(Path plist, boolean legacySelection,
+                                      String isxPath, String path, Path logDir) throws IOException {
+        if (legacySelection) {
+            Files.writeString(plist, generateVmPlist(isxPath, path, logDir));
+        } else {
+            Files.deleteIfExists(plist);
+        }
+    }
+
+    private static boolean removeLegacyVmLaunchAgent(String uid) {
+        runQuiet("launchctl", "bootout", "gui/" + uid + "/" + VM_LABEL);
+        runQuiet("launchctl", "bootout", "gui/" + uid, vmPlistFile().toString());
+        try {
+            Files.deleteIfExists(vmPlistFile());
+            return true;
+        } catch (IOException e) {
+            System.err.println("  Could not remove legacy VM LaunchAgent: " + e.getMessage());
+            return false;
         }
     }
 
     public static boolean installMacOs() {
+        var legacySelection = WorkerPoolSelection.current().isLegacy();
+        var uid = getUid();
+        if (!legacySelection && !removeLegacyVmLaunchAgent(uid)) {
+            return false;
+        }
+
         var isxPath = resolveIsxPath();
         if (isxPath == null) {
             System.err.println("Could not find 'isx' in PATH.");
             return false;
         }
 
-        var logDir = Environment.vmStateDir();
+        var logDir = Environment.stateDir();
+        var path = System.getenv("PATH");
+        if (path == null || path.isBlank()) {
+            path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+        }
         try {
             Files.createDirectories(launchAgentsDir());
             Files.createDirectories(logDir);
-
-            var path = System.getenv("PATH");
-            if (path == null || path.isBlank()) {
-                path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-            }
-
-            // VM agent — starts the VM on login
-            var vmPlist = """
-                    <?xml version="1.0" encoding="UTF-8"?>
-                    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                    <plist version="1.0">
-                    <dict>
-                        <key>Label</key><string>%s</string>
-                        <key>ProgramArguments</key>
-                        <array>
-                            <string>%s</string>
-                            <string>vm</string>
-                            <string>start</string>
-                        </array>
-                        <key>RunAtLoad</key><true/>
-                        <key>EnvironmentVariables</key>
-                        <dict>
-                            <key>PATH</key><string>%s</string>
-                        </dict>
-                        <key>StandardOutPath</key><string>%s/vm-service.log</string>
-                        <key>StandardErrorPath</key><string>%s/vm-service.log</string>
-                    </dict>
-                    </plist>
-                    """.formatted(VM_LABEL, isxPath, path, logDir, logDir);
-            Files.writeString(vmPlistFile(), vmPlist);
-
-            var proxyPlist = generateProxyPlist(isxPath);
-            Files.writeString(proxyPlistFile(), proxyPlist);
+            reconcileMacOsVmPlist(vmPlistFile(), legacySelection, isxPath, path, logDir);
         } catch (IOException e) {
-            System.err.println("Failed to write launchd plist: " + e.getMessage());
+            System.err.println("Failed to prepare launchd plist: " + e.getMessage());
             return false;
         }
 
-        var uid = getUid();
-        System.out.println("  Installing VM service...");
-        runQuiet("launchctl", "bootout", "gui/" + uid, vmPlistFile().toString());
-        runQuiet("launchctl", "bootstrap", "gui/" + uid, vmPlistFile().toString());
+        if (legacySelection) {
+            // Preserve the historical whole-home VM's login-start behavior exactly.
+            System.out.println("  Installing VM service...");
+            runQuiet("launchctl", "bootout", "gui/" + uid, vmPlistFile().toString());
+            runQuiet("launchctl", "bootstrap", "gui/" + uid, vmPlistFile().toString());
+        }
 
-        // Configure bridge DNS now (from Terminal) so the launchd proxy service
-        // doesn't need to reach the Incus VM API at startup — macOS Sequoia blocks
-        // local network access from ad-hoc-signed binaries under launchd.
+        var gatewayIp = resolveMacOsGatewayIp();
+        if (gatewayIp == null) return false;
+        try {
+            Files.writeString(proxyPlistFile(), generateProxyPlist(isxPath, gatewayIp));
+        } catch (IOException e) {
+            System.err.println("Failed to write proxy launchd plist: " + e.getMessage());
+            return false;
+        }
+
+        // Configure the currently selected appliance from the terminal. The launchd service has
+        // an explicit gateway and deliberately carries no pool selection or Incus dependency.
         System.out.println("  Configuring bridge DNS...");
         try {
-            ProxyConfig.configureBridgeDns(new IncusClient());
+            var incus = new IncusClient();
+            var domains = ProxyConfig.currentInterceptedDomains();
+            ProxyConfig.configureBridgeDns(incus, domains);
+            if (!ProxyConfig.isBridgeDnsComplete(incus, domains)) {
+                throw new IllegalStateException("bridge did not retain the complete override set");
+            }
         } catch (Exception e) {
             System.err.println("  Warning: could not configure bridge DNS: " + e.getMessage());
-            System.err.println("  Is the VM running? The proxy will retry DNS at startup.");
+            System.err.println("  When the selected VM is running, run: isx proxy configure-dns");
         }
 
         System.out.println("  Installing proxy service...");
+        runQuiet("launchctl", "bootout", "gui/" + uid + "/" + PROXY_LABEL);
         runQuiet("launchctl", "bootout", "gui/" + uid, proxyPlistFile().toString());
         waitForProxyExit();
         runQuiet("launchctl", "bootstrap", "gui/" + uid, proxyPlistFile().toString());
@@ -837,26 +976,34 @@ public final class ProxyService {
         if (isActive()) {
             if (ProxyHealthCheck.awaitHealthy(5)) {
                 ProxyLog.info("Service installed and running");
-                System.out.println("  Services installed and running.");
+                System.out.println(legacySelection
+                        ? "  Services installed and running."
+                        : "  Proxy service installed and running; named pools remain demand-started.");
                 return true;
             }
             ProxyLog.info("Service installed but not healthy");
-            System.err.println("  Services installed but proxy is not responding.");
+            System.err.println("  Proxy service is installed but not responding.");
             System.err.println("  Check logs with: isx proxy logs");
             return false;
-        } else {
+        } else if (legacySelection) {
             ProxyLog.info("Service installed (waiting for VM)");
             System.out.println("  Services installed (proxy will start when VM is ready).");
             return true;
+        } else {
+            ProxyLog.info("Service installed but not active");
+            System.err.println("  Proxy service was installed but launchd did not start it.");
+            System.err.println("  Check logs with: isx proxy logs");
+            return false;
         }
     }
 
     public static void uninstallMacOs() {
         var uid = getUid();
+        runQuiet("launchctl", "bootout", "gui/" + uid + "/" + PROXY_LABEL);
         runQuiet("launchctl", "bootout", "gui/" + uid, proxyPlistFile().toString());
-        runQuiet("launchctl", "bootout", "gui/" + uid, vmPlistFile().toString());
+        removeLegacyVmLaunchAgent(uid);
         try { Files.deleteIfExists(proxyPlistFile()); } catch (IOException ignored) {}
-        try { Files.deleteIfExists(vmPlistFile()); } catch (IOException ignored) {}
+        try { Files.deleteIfExists(Environment.proxyGatewayFile()); } catch (IOException ignored) {}
         System.out.println("  macOS services uninstalled.");
     }
 

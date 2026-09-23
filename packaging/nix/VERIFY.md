@@ -116,7 +116,7 @@ Expected output: a `/nix/store/...-incus-spawn-X.Y.Z` path and a `./result` syml
 
 # Built-in templates
 ./result/bin/isx templates
-# Expected: tpl-minimal, tpl-dev, tpl-java
+# Expected: tpl-minimal, tpl-dev, tpl-java, tpl-bb
 
 # Shell completions
 ./result/bin/isx completion bash | wc -l   # should be > 100
