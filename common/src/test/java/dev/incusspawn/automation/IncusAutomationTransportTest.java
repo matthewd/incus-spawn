@@ -148,13 +148,27 @@ class IncusAutomationTransportTest {
 
         assertEquals("", output.toString(StandardCharsets.UTF_8));
         assertTrue(incus.started);
-        assertTrue(incus.waitedUntilReady);
-        assertArrayEquals(
-                new String[]{"sh", "-c", "pg_isready -q"},
-                incus.lastReadinessCommand);
+        assertEquals(0, incus.nameOnlyRemoveCount);
+        assertEquals("sh", incus.lastReadinessCommand[0]);
+        assertEquals("-c", incus.lastReadinessCommand[1]);
+        assertTrue(incus.lastReadinessCommand[2].contains("pg_isready -q"));
         assertEquals(tempDir.toString(), incus.lastAdded.get("source"));
         assertEquals("/home/agentuser/.common", incus.lastAdded.get("path"));
         assertEquals("true", incus.lastAdded.get("readonly"));
+    }
+
+    @Test
+    void startFailsBeforeMutationWhenStrictMetadataIsUnavailable() {
+        var incus = new FakeIncusClient();
+        incus.instancePresent = false;
+        var transport = new IncusAutomationTransport(incus,
+                (source, access) -> "/host/references/common");
+
+        var failure = assertThrows(AutomationException.class,
+                () -> transport.start("worker-1"));
+
+        assertEquals("instance_not_found", failure.code());
+        assertFalse(incus.started);
     }
 
     @Test
@@ -228,10 +242,10 @@ class IncusAutomationTransportTest {
         private boolean failAdd;
         private boolean allowHostResourceDevices;
         private boolean started;
-        private boolean waitedUntilReady;
         private String hostResourcesJson = "";
         private String buildSourceJson = "";
         private boolean toolReady = true;
+        private boolean instancePresent = true;
         private String[] lastReadinessCommand;
 
         private FakeIncusClient() {
@@ -244,7 +258,18 @@ class IncusAutomationTransportTest {
 
         @Override
         public Optional<com.fasterxml.jackson.databind.JsonNode> findInstanceMetadata(String name) {
-            return Optional.of(metadata.deepCopy());
+            return instancePresent ? Optional.of(instanceMetadata(name)) : Optional.empty();
+        }
+
+        @Override
+        public com.fasterxml.jackson.databind.JsonNode instanceMetadata(String name) {
+            if (!instancePresent) throw new AssertionError("missing instance has no metadata");
+            var current = metadata.deepCopy();
+            var config = current.withObject("config");
+            config.put(Metadata.HOST_RESOURCES, hostResourcesJson);
+            config.put(Metadata.BUILD_SOURCE, buildSourceJson);
+            config.put(Metadata.AUTOMATION_KEY, "allocation-17");
+            return current;
         }
 
         @Override
@@ -304,6 +329,11 @@ class IncusAutomationTransportTest {
         }
 
         @Override
+        public ExecResult shellExec(String container, String... command) {
+            return new ExecResult(toolReady ? 0 : 1, "", "");
+        }
+
+        @Override
         public boolean isVm(String name) {
             return false;
         }
@@ -315,7 +345,7 @@ class IncusAutomationTransportTest {
 
         @Override
         public void waitForReady(String name) {
-            waitedUntilReady = true;
+            throw new AssertionError("automation readiness must use one trusted template probe");
         }
 
         @Override

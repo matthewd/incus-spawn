@@ -245,6 +245,9 @@ class IncusApi {
         if (!getResp.isSuccess()) throw new IncusException("Failed to get instance " + instanceName);
 
         var metadata = getResp.body().path("metadata");
+        if (expected == null && !metadata.path("devices").has(deviceName)) {
+            return getResp;
+        }
         if (expected != null) {
             requireAutomationMutationOwner(metadata, automationKey, instanceName);
             if (!exactTextObject(metadata.path("devices").path(deviceName), expected)) {

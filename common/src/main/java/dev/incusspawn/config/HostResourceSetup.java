@@ -219,21 +219,31 @@ public final class HostResourceSetup {
 
     public static void applyForInstance(IncusClient incus, String container, List<ImageDef.HostResource> resources,
                                         boolean isVm) {
-        applyForInstance(incus, container, resources, isVm, true);
+        applyForInstance(incus, container, resources, isVm, true, null);
     }
 
     public static void applyForInstanceQuietly(
             IncusClient incus, String container, List<ImageDef.HostResource> resources, boolean isVm) {
-        applyForInstance(incus, container, resources, isVm, false);
+        applyForInstance(incus, container, resources, isVm, false, null);
+    }
+
+    public static void applyForInstanceQuietly(
+            IncusClient incus, String container, List<ImageDef.HostResource> resources, boolean isVm,
+            JsonNode instanceMetadata) {
+        applyForInstance(incus, container, resources, isVm, false, instanceMetadata);
     }
 
     private static void applyForInstance(
             IncusClient incus, String container, List<ImageDef.HostResource> resources,
-            boolean isVm, boolean report) {
+            boolean isVm, boolean report, JsonNode instanceMetadata) {
         for (var hr : resources) {
             switch (effectiveMode(hr, isVm)) {
                 case "readonly" -> {
-                    removeExistingDevice(incus, container, deviceNameForMode(hr));
+                    var deviceName = deviceNameForMode(hr);
+                    if (instanceMetadata == null
+                            || instanceMetadata.path("devices").has(deviceName)) {
+                        removeExistingDevice(incus, container, deviceName);
+                    }
                     applyReadonly(incus, container, hr, isVm, report);
                 }
                 case "overlay" -> {
@@ -244,7 +254,11 @@ public final class HostResourceSetup {
                                 + "  or remove the host-resource entry to skip it entirely.\n"
                                 + "  Tracking: https://github.com/Sanne/incus-spawn/issues/157");
                     }
-                    removeExistingDevice(incus, container, deviceNameForMode(hr));
+                    var deviceName = deviceNameForMode(hr);
+                    if (instanceMetadata == null
+                            || instanceMetadata.path("devices").has(deviceName)) {
+                        removeExistingDevice(incus, container, deviceName);
+                    }
                     applyOverlayDevice(incus, container, hr, isVm);
                 }
                 case "copy" -> {} // already baked into the template

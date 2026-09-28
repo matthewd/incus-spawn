@@ -116,6 +116,36 @@ class AutomationServiceTest {
     }
 
     @Test
+    void freshReadinessFailureIsNotReconciledAsACompletedStart() {
+        var transport = new FakeTransport();
+        transport.put(instance("worker-1", "Stopped", Metadata.TYPE_CLONE,
+                "allocation-17", "tpl-bb"));
+        transport.failReadiness = true;
+        var service = new AutomationService(transport);
+
+        var failure = assertThrows(AutomationService.AutomationException.class,
+                () -> service.start("worker-1", "allocation-17"));
+        assertEquals("tool_not_ready", failure.code());
+        assertEquals(1, transport.startCount);
+        assertEquals(1, transport.readyCount);
+    }
+
+    @Test
+    void lostStartResponseStillConvergesPostStartState() {
+        var transport = new FakeTransport();
+        transport.put(instance("worker-1", "Stopped", Metadata.TYPE_CLONE,
+                "allocation-17", "tpl-bb"));
+        transport.failAfterStart = true;
+        var service = new AutomationService(transport);
+
+        var result = service.start("worker-1", "allocation-17");
+
+        assertFalse(result.changed());
+        assertEquals(1, transport.startCount);
+        assertEquals(1, transport.readyCount);
+    }
+
+    @Test
     void runningMachinesMustStillSatisfyReadiness() {
         var transport = new FakeTransport();
         transport.put(instance("worker-1", "Running", Metadata.TYPE_CLONE,
@@ -338,6 +368,7 @@ class AutomationServiceTest {
         private String deletedName;
         private Map<String, String> lastAtomicConfig;
         private boolean failAfterCopy;
+        private boolean failAfterStart;
         private boolean failReadiness;
         private final Map<String, MountRequest> mounts = new LinkedHashMap<>();
         private final java.util.Set<String> malformedDevices = new java.util.HashSet<>();
@@ -379,6 +410,7 @@ class AutomationServiceTest {
         public void start(String name) {
             startCount++;
             updateStatus(name, "Running");
+            if (failAfterStart) throw new IllegalStateException("response lost");
         }
 
         @Override

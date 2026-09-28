@@ -69,6 +69,17 @@ class IncusApiAutomationDeviceTest {
     }
 
     @Test
+    void nameOnlyRemoveDoesNotPutWhenTheDeviceIsAlreadyAbsent() {
+        var transport = new DeviceTransport("{}");
+        var api = new IncusApi(transport);
+
+        var response = api.removeDevice("worker-1", "missing");
+
+        assertTrue(response.isSuccess());
+        assertEquals(0, transport.putCount);
+    }
+
+    @Test
     void exactRemoveChecksAllFieldsInTheRemovalReadModifyWrite() {
         var transport = new DeviceTransport("""
                 {

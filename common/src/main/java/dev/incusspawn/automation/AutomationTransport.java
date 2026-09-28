@@ -135,9 +135,10 @@ public interface AutomationTransport {
     /** Create a stopped CoW copy and include every supplied config key in the copy request. */
     void copyStopped(String template, String name, Map<String, String> atomicConfig);
 
+    /** Start a stopped instance; post-start convergence is owned by {@link #awaitReady}. */
     void start(String name);
 
-    /** Wait until every readiness contract carried by the instance template succeeds. */
+    /** Converge readiness and automation-owned access for a running instance. */
     void awaitReady(String name);
 
     void stop(String name);

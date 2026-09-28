@@ -11,6 +11,7 @@ import dev.incusspawn.incus.Metadata;
 import dev.incusspawn.incus.StaticIpAllocator;
 import dev.incusspawn.proxy.ProxyConfig;
 import dev.incusspawn.ssh.SshKeyManager;
+import dev.incusspawn.tool.ToolDef;
 import dev.incusspawn.util.BuildOutput;
 
 import java.io.IOException;
@@ -457,15 +458,30 @@ public final class InstanceLifecycle {
     public static String awaitToolReadinessQuietly(
             IncusClient incus, String name, String buildSourceJson) {
         var buildSource = BuildSource.fromJson(buildSourceJson);
-        if (buildSource == null) return null;
+        var readyTools = buildSource == null
+                ? List.<ToolDef>of()
+                : buildSource.getTools().values().stream()
+                        .filter(tool -> tool.getReady() != null && !tool.getReady().isBlank())
+                        .toList();
+        if (readyTools.isEmpty()) {
+            return incus.pollUntilReady(name, 30, "echo", "ready") ? null : "container";
+        }
 
-        for (var tool : buildSource.getTools().values()) {
-            if (tool.getReady() == null || tool.getReady().isBlank()) continue;
-            if (!incus.pollUntilReady(name, 30, "sh", "-c", tool.getReady())) {
+        var script = new StringBuilder("set -e\n");
+        for (var tool : readyTools) {
+            script.append("(\n").append(tool.getReady()).append("\n)\n");
+        }
+        if (incus.pollUntilReady(name, 30, "sh", "-c", script.toString())) return null;
+
+        // The batched happy path keeps readiness to one guest exec. Probe only after a
+        // timeout so diagnostics can still name the failed trusted tool without exposing
+        // its command through the automation protocol.
+        for (var tool : readyTools) {
+            if (!incus.shellExec(name, "sh", "-c", tool.getReady()).success()) {
                 return tool.getName();
             }
         }
-        return null;
+        return "template";
     }
 
     public static void awaitToolReadiness(IncusClient incus, String name, String buildSourceJson) {
@@ -592,9 +608,9 @@ public final class InstanceLifecycle {
 
     /** Configure automation-owned SSH without emitting human output on protocol stdout. */
     public static void prepareAutomationSsh(
-            IncusClient incus, String name, String automationKey) {
-        if (!hasSshCapability(incus, name)) return;
-        injectSshKeyIfAvailable(incus, name, null, false);
+            IncusClient incus, String name, String automationKey, boolean sshCapable) {
+        if (!sshCapable) return;
+        injectSshKeyIfAvailable(incus, name, true, false);
         try {
             SshKeyManager.ensureSshConfigInclude();
             SshKeyManager.addOwnedHostEntry(name, automationKey);
@@ -640,8 +656,13 @@ public final class InstanceLifecycle {
      * containers that don't have sshd installed.
      */
     public static boolean hasSshCapability(IncusClient incus, String name) {
-        return !incus.configGet(name, "user.incus-spawn.ssh-setup").isEmpty()
-                || hasSshdTool(incus.configGet(name, Metadata.BUILD_SOURCE));
+        return hasSshCapability(
+                incus.configGet(name, "user.incus-spawn.ssh-setup"),
+                incus.configGet(name, Metadata.BUILD_SOURCE));
+    }
+
+    public static boolean hasSshCapability(String sshSetup, String buildSourceJson) {
+        return !sshSetup.isEmpty() || hasSshdTool(buildSourceJson);
     }
 
     static boolean hasSshdTool(String buildSourceJson) {

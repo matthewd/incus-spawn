@@ -77,21 +77,42 @@ public final class IncusAutomationTransport implements AutomationTransport {
 
     @Override
     public void start(String name) {
+        var metadata = strictMetadata(name);
+        var config = metadata.path("config");
         var resources = HostResourceSetup.deserialize(
-                incus.configGet(name, Metadata.HOST_RESOURCES));
+                config.path(Metadata.HOST_RESOURCES).asText(""));
         if (!resources.isEmpty()) {
-            HostResourceSetup.applyForInstanceQuietly(incus, name, resources, incus.isVm(name));
+            var isVm = "virtual-machine".equals(metadata.path("type").asText(""));
+            HostResourceSetup.applyForInstanceQuietly(
+                    incus, name, resources, isVm, metadata);
         }
         incus.start(name);
-        incus.waitForReady(name);
-        InstanceLifecycle.prepareAutomationSsh(
-                incus, name, incus.configGet(name, Metadata.AUTOMATION_KEY));
     }
 
     @Override
     public void awaitReady(String name) {
+        var metadata = strictMetadata(name);
+        var config = metadata.path("config");
+        var buildSource = config.path(Metadata.BUILD_SOURCE).asText("");
+        requireReady(name, buildSource);
+        InstanceLifecycle.prepareAutomationSsh(
+                incus,
+                name,
+                config.path(Metadata.AUTOMATION_KEY).asText(""),
+                InstanceLifecycle.hasSshCapability(
+                        config.path("user.incus-spawn.ssh-setup").asText(""),
+                        buildSource));
+    }
+
+    private JsonNode strictMetadata(String name) {
+        return incus.findInstanceMetadata(name).orElseThrow(() ->
+                new AutomationException("instance_not_found",
+                        "Instance disappeared during automation start"));
+    }
+
+    private void requireReady(String name, String buildSource) {
         var unreadyTool = InstanceLifecycle.awaitToolReadinessQuietly(
-                incus, name, incus.configGet(name, Metadata.BUILD_SOURCE));
+                incus, name, buildSource);
         if (unreadyTool != null) {
             throw new AutomationException("tool_not_ready",
                     "Instance tool '" + unreadyTool + "' did not become ready");
