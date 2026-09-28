@@ -574,6 +574,11 @@ public final class ProxyService {
     }
 
     static String resolveIsxPath() {
+        var configured = System.getenv("ISX_EXECUTABLE");
+        if (configured != null && !configured.isBlank()) {
+            var path = Path.of(configured).toAbsolutePath().normalize();
+            if (Files.isExecutable(path)) return path.toString();
+        }
         try {
             var pb = new ProcessBuilder("which", "isx");
             pb.redirectErrorStream(true);
