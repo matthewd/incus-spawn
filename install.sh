@@ -114,7 +114,7 @@ if $NATIVE; then
         PLIST="$(cd "$SCRIPT_DIR" && pwd)/cli/src/main/resources/Info.plist"
         NATIVE_ARGS="$NATIVE_ARGS -Dmacos.info.plist=$PLIST"
     fi
-    "$SCRIPT_DIR/mvnw" package $NATIVE_ARGS
+    (cd "$SCRIPT_DIR" && ./mvnw package $NATIVE_ARGS)
     echo "Installing to ${INSTALL_DIR}/${BINARY_NAME}..."
     RUNNER=$(ls -t "$SCRIPT_DIR"/cli/target/incus-spawn-*-runner 2>/dev/null | head -1)
     if [ -z "$RUNNER" ] || [ ! -f "$RUNNER" ]; then
@@ -150,7 +150,7 @@ else
         exit 1
     fi
     echo "Building JVM package..."
-    "$SCRIPT_DIR/mvnw" package -DskipTests -q
+    (cd "$SCRIPT_DIR" && ./mvnw package -DskipTests -q)
     echo "Installing to ${INSTALL_DIR}/${BINARY_NAME}..."
     # Create a wrapper script that runs the quarkus app jar
     JARFILE=$(ls "$SCRIPT_DIR"/cli/target/quarkus-app/quarkus-run.jar 2>/dev/null)
