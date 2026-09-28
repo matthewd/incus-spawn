@@ -278,7 +278,7 @@ public final class ProxyService {
             var uid = getUid();
             runQuiet("launchctl", "bootout", "gui/" + uid + "/" + PROXY_LABEL);
             waitForProxyExit();
-            runQuiet("launchctl", "bootstrap", "gui/" + uid, proxyPlistFile().toString());
+            if (!bootstrapMacOsProxy(uid, log)) return false;
         } else {
             // A unit halted by RestartPreventExitStatus sits in 'failed' state, and repeated
             // restart attempts can trip systemd's start rate limit — reset makes recovery
@@ -305,7 +305,7 @@ public final class ProxyService {
             if (isActive()) return true;
             if (Platform.isMacOS()) {
                 var uid = getUid();
-                runQuiet("launchctl", "bootstrap", "gui/" + uid, proxyPlistFile().toString());
+                if (!bootstrapMacOsProxy(uid, message -> {})) return false;
                 runQuiet("launchctl", "kickstart", "gui/" + uid + "/" + PROXY_LABEL);
             } else {
                 runQuiet("systemctl", "--user", "reset-failed", SERVICE_NAME);
@@ -467,6 +467,33 @@ public final class ProxyService {
             }
             return true;
         }
+    }
+
+    private static boolean bootstrapMacOsProxy(
+            String uid, java.util.function.Consumer<String> log) {
+        String failure = null;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            failure = runForFailure(
+                    "launchctl", "bootstrap", "gui/" + uid, proxyPlistFile().toString());
+            if (failure == null) {
+                for (int activeAttempt = 0; activeAttempt < 20; activeAttempt++) {
+                    if (isMacOsServiceActive()) return true;
+                    try { Thread.sleep(100); } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+                failure = "launchd accepted the proxy job but did not make it active";
+                break;
+            }
+            try { Thread.sleep(100); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        log.accept("Could not bootstrap proxy service with launchd"
+                + (failure == null || failure.isBlank() ? "." : ": " + failure));
+        return false;
     }
 
     private static void waitForProxyExit() {
@@ -976,7 +1003,7 @@ public final class ProxyService {
         runQuiet("launchctl", "bootout", "gui/" + uid + "/" + PROXY_LABEL);
         runQuiet("launchctl", "bootout", "gui/" + uid, proxyPlistFile().toString());
         waitForProxyExit();
-        runQuiet("launchctl", "bootstrap", "gui/" + uid, proxyPlistFile().toString());
+        if (!bootstrapMacOsProxy(uid, System.err::println)) return false;
 
         if (isActive()) {
             if (ProxyHealthCheck.awaitHealthy(5)) {
@@ -1024,6 +1051,21 @@ public final class ProxyService {
             return uid;
         } catch (Exception e) {
             throw new RuntimeException("Cannot determine current UID — launchd service install/uninstall requires a valid UID", e);
+        }
+    }
+
+    private static String runForFailure(String... command) {
+        try {
+            var pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            var process = pb.start();
+            var output = new String(process.getInputStream().readAllBytes()).strip();
+            return process.waitFor() == 0 ? null : output;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "interrupted";
+        } catch (Exception e) {
+            return e.getMessage();
         }
     }
 
