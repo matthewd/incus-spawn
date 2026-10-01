@@ -163,6 +163,33 @@ class SpawnConfigTest {
     }
 
     @Test
+    void sshIncludeTargetDefaultsToPrimaryUserConfig() throws Exception {
+        var config = YAML.readValue("{}", SpawnConfig.class);
+        assertEquals("~/.ssh/config", config.getSsh().getIncludeInto());
+    }
+
+    @Test
+    void deserializeSshIncludeTarget() throws Exception {
+        var yaml = """
+                ssh:
+                  include-into: ~/.ssh/config.local
+                """;
+        var config = YAML.readValue(yaml, SpawnConfig.class);
+        assertEquals("~/.ssh/config.local", config.getSsh().getIncludeInto());
+    }
+
+    @Test
+    void sshIncludeTargetRejectsRelativePaths() throws Exception {
+        var yaml = """
+                ssh:
+                  include-into: config.local
+                """;
+        var config = YAML.readValue(yaml, SpawnConfig.class);
+        var exception = assertThrows(IllegalStateException.class, config::validate);
+        assertTrue(exception.getMessage().contains("ssh.include-into"));
+    }
+
+    @Test
     void deserializeSearchPaths() throws Exception {
         var yaml = """
                 searchPaths:

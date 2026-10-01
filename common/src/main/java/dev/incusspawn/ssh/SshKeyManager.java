@@ -1,6 +1,7 @@
 package dev.incusspawn.ssh;
 
 import dev.incusspawn.Environment;
+import dev.incusspawn.config.SpawnConfig;
 import dev.incusspawn.util.BuildOutput;
 
 import java.io.IOException;
@@ -124,18 +125,19 @@ public final class SshKeyManager {
     }
 
     /**
-     * Idempotently prepend an Include directive to ~/.ssh/config pointing
-     * to the incus-spawn managed SSH config.
+     * Idempotently prepend an Include directive to the user SSH configuration file selected by
+     * {@code ssh.include-into}, pointing to the incus-spawn managed SSH config.
      *
      * @return true if the Include is present (already existed or was added), false on failure
      */
     public static boolean ensureSshConfigInclude() {
         try {
-            var sshDir = Environment.home().resolve(".ssh");
+            var home = Environment.home();
+            var sshConfig = SpawnConfig.loadStrict().getSsh().resolveIncludeInto(home);
+            var sshDir = home.resolve(".ssh");
             Files.createDirectories(sshDir);
             Files.setPosixFilePermissions(sshDir, PosixFilePermissions.fromString("rwx------"));
-
-            var sshConfig = sshDir.resolve("config");
+            Files.createDirectories(sshConfig.getParent());
             // Resolve symlinks so dotfile-managed configs are updated in place
             var resolvedConfig = Files.exists(sshConfig)
                     ? sshConfig.toRealPath()
@@ -156,8 +158,8 @@ public final class SshKeyManager {
             var newContent = INCLUDE_LINE + "\n\n" + content;
             writeAtomically(resolvedConfig, newContent);
             return true;
-        } catch (IOException e) {
-            System.err.println("  Warning: failed to update ~/.ssh/config: " + e.getMessage());
+        } catch (IOException | IllegalStateException e) {
+            System.err.println("  Warning: failed to update SSH configuration: " + e.getMessage());
             return false;
         }
     }

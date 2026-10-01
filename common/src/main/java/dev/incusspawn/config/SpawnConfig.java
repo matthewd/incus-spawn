@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import dev.incusspawn.Environment;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 
 /**
@@ -29,6 +30,7 @@ public class SpawnConfig {
     private GitHubConfig github = new GitHubConfig();
     private BobConfig bob = new BobConfig();
     private OpenaiConfig openai = new OpenaiConfig();
+    private SshConfig ssh = new SshConfig();
     private java.util.List<String> features = java.util.List.of();
     private java.util.List<String> searchPaths = java.util.List.of();
     @JsonProperty("host-path")
@@ -114,6 +116,42 @@ public class SpawnConfig {
         public boolean hasAuth() { return !apiKey.isBlank(); }
     }
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class SshConfig {
+        public static final String DEFAULT_INCLUDE_INTO = "~/.ssh/config";
+
+        @JsonProperty("include-into")
+        private String includeInto = DEFAULT_INCLUDE_INTO;
+
+        public String getIncludeInto() { return includeInto; }
+        public void setIncludeInto(String includeInto) {
+            this.includeInto = includeInto == null ? "" : includeInto.strip();
+        }
+
+        public Path resolveIncludeInto(Path home) {
+            validate();
+            var resolved = includeInto.startsWith("~/")
+                    ? home.resolve(includeInto.substring(2)).normalize()
+                    : Path.of(includeInto).normalize();
+            if (resolved.getParent() == null) {
+                throw new IllegalStateException("'ssh.include-into' must name a file: " + includeInto);
+            }
+            return resolved;
+        }
+
+        private void validate() {
+            try {
+                if (!includeInto.startsWith("~/") && !Path.of(includeInto).isAbsolute()) {
+                    throw new IllegalStateException(
+                            "'ssh.include-into' must be an absolute path or start with '~/': "
+                                    + includeInto);
+                }
+            } catch (InvalidPathException e) {
+                throw new IllegalStateException("invalid 'ssh.include-into' path", e);
+            }
+        }
+    }
+
     public java.util.List<String> getFeatures() { return features; }
     public void setFeatures(java.util.List<String> features) { this.features = features == null ? java.util.List.of() : features; }
     public boolean isFeatureEnabled(String feature) {
@@ -132,6 +170,8 @@ public class SpawnConfig {
     public void setBob(BobConfig bob) { this.bob = bob; }
     public OpenaiConfig getOpenai() { return openai; }
     public void setOpenai(OpenaiConfig openai) { this.openai = openai; }
+    public SshConfig getSsh() { return ssh; }
+    public void setSsh(SshConfig ssh) { this.ssh = ssh == null ? new SshConfig() : ssh; }
     public java.util.List<String> getSearchPaths() { return searchPaths; }
     public void setSearchPaths(java.util.List<String> searchPaths) { this.searchPaths = searchPaths == null ? java.util.List.of() : searchPaths; }
     public String getHostPath() { return hostPath; }
@@ -273,6 +313,7 @@ public class SpawnConfig {
         if (!hostPath.isEmpty() && !hostPaths.isEmpty()) {
             throw new IllegalStateException("Cannot specify both 'host-path' and 'host-paths' in config.yaml");
         }
+        ssh.validate();
         for (var entry : workerPools.entrySet()) {
             if (entry.getValue() == null) {
                 throw new IllegalStateException("worker pool '" + entry.getKey() + "' definition is required");

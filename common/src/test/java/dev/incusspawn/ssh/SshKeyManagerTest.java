@@ -198,6 +198,44 @@ class SshKeyManagerTest {
     }
 
     @Test
+    void ensureSshConfigIncludeUsesConfiguredLocalFragment() throws IOException {
+        var sshDir = tempDir.resolve(".ssh");
+        Files.createDirectories(sshDir);
+        var primaryConfig = sshDir.resolve("config");
+        var primaryContent = "Include config.local\n\nHost existing\n    HostName 1.2.3.4\n";
+        Files.writeString(primaryConfig, primaryContent);
+
+        var configDir = tempDir.resolve(".config/incus-spawn");
+        Files.createDirectories(configDir);
+        Files.writeString(configDir.resolve("config.yaml"), """
+                ssh:
+                  include-into: ~/.ssh/config.local
+                """);
+
+        assertTrue(SshKeyManager.ensureSshConfigInclude());
+        assertTrue(SshKeyManager.ensureSshConfigInclude());
+
+        assertEquals(primaryContent, Files.readString(primaryConfig),
+                "Primary SSH config should not be changed");
+        var localContent = Files.readString(sshDir.resolve("config.local"));
+        assertEquals(1, localContent.lines().filter(l ->
+                l.equals("Include ~/.config/incus-spawn/ssh/config")).count());
+    }
+
+    @Test
+    void invalidConfiguredIncludeTargetDoesNotFallBackToPrimaryConfig() throws IOException {
+        var configDir = tempDir.resolve(".config/incus-spawn");
+        Files.createDirectories(configDir);
+        Files.writeString(configDir.resolve("config.yaml"), """
+                ssh:
+                  include-into: config.local
+                """);
+
+        assertFalse(SshKeyManager.ensureSshConfigInclude());
+        assertFalse(Files.exists(tempDir.resolve(".ssh/config")));
+    }
+
+    @Test
     void fullCleanupFlow() {
         SshKeyManager.addHostEntry("my-instance");
         SshKeyManager.addHostEntry("other-instance");

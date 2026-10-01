@@ -8,6 +8,7 @@ paths:
 # Configuration Loading
 
 - `SpawnConfig`: global config from `~/.config/incus-spawn/config.yaml`
+- `SpawnConfig.SshConfig`: `ssh.include-into` selects the absolute-or-tilde user SSH file that incus-spawn may modify; it defaults to `~/.ssh/config`, while inclusion of any alternate fragment remains user-managed
 - `ImageDef.loadAll()`: discovers all image definitions across resolution layers, rejects unknown image/security fields, and resolves each inheritable security field after all overrides are known
 - `ToolDefLoader`: discovers tools across resolution layers
 - `ProjectConfig`: per-project config from `incus-spawn.yaml` or `.incus-spawn/incus-spawn.yaml`

@@ -830,8 +830,8 @@ public class InitCommand extends BaseCommand {
         startStep("SSH Key Pair",
                 "Generates a dedicated SSH key pair used only by isx",
                 "to connect to containers. This is separate from your personal",
-                "SSH keys and won't interfere with them. Your ~/.ssh/config is",
-                "updated automatically.");
+                "SSH keys and won't interfere with them. Your configured SSH",
+                "include file is updated automatically.");
         try {
             if (SshKeyManager.exists()) {
                 System.out.println("  SSH key pair already exists.");
@@ -841,7 +841,7 @@ public class InitCommand extends BaseCommand {
             if (SshKeyManager.ensureSshConfigInclude()) {
                 System.out.println("  SSH configuration ready.");
             } else {
-                System.out.println("  SSH key generated but ~/.ssh/config could not be updated.");
+                System.out.println("  SSH key generated but the SSH include file could not be updated.");
                 System.out.println("  Add manually: Include ~/.config/incus-spawn/ssh/config");
             }
         } catch (Exception e) {

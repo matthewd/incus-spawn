@@ -366,7 +366,7 @@ incus-spawn manages a dedicated SSH key pair and per-instance SSH configuration 
 
 **Lifecycle:**
 
-1. **`isx init`** generates the ed25519 key pair (via `ssh-keygen`) and prepends an `Include ~/.config/incus-spawn/ssh/config` directive to `~/.ssh/config` (idempotent, resolves symlinks for dotfile managers). The key pair is also created lazily at first branch for users upgrading from older versions.
+1. **`isx init`** generates the ed25519 key pair (via `ssh-keygen`) and prepends an `Include ~/.config/incus-spawn/ssh/config` directive to the user SSH file selected by `ssh.include-into` (idempotent, resolves symlinks for dotfile managers). The setting defaults to `~/.ssh/config`; users whose primary config already includes a machine-local fragment can select that fragment without allowing isx to modify the primary file. The key pair is also created lazily at first branch for users upgrading from older versions.
 2. **`isx branch`** (via `InstanceLifecycle.injectSshKeyIfAvailable`): injects both the managed public key and any personal `~/.ssh/*.pub` key into the container's `authorized_keys`. Then regenerates the container's SSH host keys (`ssh-keygen -A` + sshd restart) so CoW-branched instances get unique keys, harvests the new host public key into the managed `known_hosts`, and writes a `Host <instance-name>` block to the managed config with `HostName`, `User agentuser`, `IdentityFile`, `IdentitiesOnly yes`, `UserKnownHostsFile`, and `StrictHostKeyChecking yes`. After this, `ssh <instance-name>` just works.
 3. **`isx destroy`** (and TUI delete): removes the Host block from the managed config and the host key entry from the managed known_hosts.
 
@@ -375,6 +375,7 @@ incus-spawn manages a dedicated SSH key pair and per-instance SSH configuration 
 - **Dual known_hosts**: the primary store is `~/.config/incus-spawn/ssh/known_hosts`, referenced via `UserKnownHostsFile` in the managed SSH config. Host keys are also written to `~/.ssh/known_hosts` because IntelliJ's built-in SSH client does not honor `UserKnownHostsFile` or `Include` directives — without the standard-file entry, IntelliJ Gateway prompts for host key confirmation on every connection. Entries in both files are cleaned up on instance destroy.
 - **Host key regeneration**: CoW clones inherit the template's host keys, so all branches would share the same host key. `harvestHostKey` regenerates them before harvesting to give each instance a unique key.
 - **Both keys injected**: the managed key (passphraseless) ensures tools always work, while the user's personal key is also injected so interactive SSH sessions can use their preferred key.
+- **Explicit include destination**: isx does not infer ownership by recursively interpreting OpenSSH `Include`, `Host`, and `Match` semantics. `ssh.include-into` identifies the file isx may modify; inclusion of a non-default fragment from the primary config remains user-managed.
 - **Atomic writes**: all config and known_hosts updates use temp-file-then-rename with restrictive permissions to avoid partial writes.
 - **Non-fatal**: SSH setup failures never block init or branching — they warn and fall back to manual `ssh agentuser@<ip>`.
 

@@ -909,6 +909,15 @@ my-templates/
     gradle.yaml
 ```
 
+By default, isx prepends its managed `Include` directive to `~/.ssh/config`. If that file is managed separately and already includes a machine-local fragment, configure isx to write to the fragment instead:
+
+```yaml
+ssh:
+  include-into: ~/.ssh/config.local
+```
+
+The configured path must be absolute or start with `~/`. It is created when necessary, but its inclusion from the primary SSH config remains user-managed; place that include before any `Host` or `Match` blocks so the generated per-instance settings take effect.
+
 Resolution order (later sources override earlier ones with the same name):
 1. Built-in (bundled with isx)
 2. User (`~/.config/incus-spawn/`)
