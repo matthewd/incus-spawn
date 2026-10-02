@@ -116,9 +116,24 @@ public final class Environment {
         return home().resolve(".cache/incus-spawn/rubygems");
     }
 
+    /**
+     * Stable lock state is deliberately a sibling of the recursively deletable VM/pool state.
+     * Lock files are persistent inodes and must never be unlinked while a process may hold them.
+     */
+    public static Path lifecycleLockRoot() {
+        return stateDir().resolveSibling("incus-spawn-locks");
+    }
+
     public static Path lockDir() {
-        return RuntimeConstants.WORKER_POOL.instanceLockDir(
-                stateDir(), home().resolve(".cache/incus-spawn/locks"));
+        return RuntimeConstants.WORKER_POOL.instanceLockDir(lifecycleLockRoot());
+    }
+
+    public static Path vmLockFile() {
+        return RuntimeConstants.WORKER_POOL.vmLockFile(lifecycleLockRoot());
+    }
+
+    public static Path poolManagementLockFile() {
+        return lifecycleLockRoot().resolve("pool-management.lock");
     }
 
     public static Path m2Repository() {
@@ -215,16 +230,21 @@ public final class Environment {
     }
 
     public static Path vmVsockSocket() {
-        return vmStateDir().resolve("vm.incus.sock");
+        return RuntimeConstants.WORKER_POOL.vmVsockSocket(stateDir());
     }
 
     /** Host-side Unix socket for the in-VM control agent (introspection/recovery). */
     public static Path vmAgentSocket() {
-        return vmStateDir().resolve("vm.agent.sock");
+        return RuntimeConstants.WORKER_POOL.vmAgentSocket(stateDir());
     }
 
     public static Path vmDiskImage() {
         return vmStateDir().resolve("disk.img");
+    }
+
+    /** Pool-local sealed kernel for a materialized pool. Static and legacy pools use the artifact. */
+    public static Path vmKernelImage() {
+        return vmStateDir().resolve("vmlinuz");
     }
 
     public static Path vmDataImage() {

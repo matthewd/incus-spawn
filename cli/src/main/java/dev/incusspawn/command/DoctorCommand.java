@@ -8,6 +8,7 @@ import dev.incusspawn.RuntimeServices;
 import dev.incusspawn.config.ImageDef;
 import dev.incusspawn.config.LayeredDefinitions;
 import dev.incusspawn.config.SpawnConfig;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.incus.FirewalldCheck;
 import dev.incusspawn.incus.UfwCheck;
 import dev.incusspawn.incus.IncusClient;
@@ -717,6 +718,9 @@ public class DoctorCommand extends BaseCommand {
     private Finding checkApplianceVersion() {
         var running = VmManager.runningApplianceVersion();
         if (running == null) return Finding.ok("Appliance version", "(unknown)");
+        if (WorkerPoolSelection.current().isMaterialized()) {
+            return Finding.ok("Sealed appliance version", running);
+        }
         var installed = VmManager.applianceVersion();
         if (running.equals(installed)) return Finding.ok("Appliance version", running);
         return Finding.warn("Appliance outdated",
@@ -752,6 +756,9 @@ public class DoctorCommand extends BaseCommand {
         }
         var f = validateBtrfsSuperblock(diskImage);
         if (f.status() == Status.FAIL) {
+            if (WorkerPoolSelection.current().isMaterialized()) {
+                return new Finding(f.status(), f.label(), f.detail(), null);
+            }
             return new Finding(f.status(), f.label(), f.detail(),
                     new Remediation("Delete the corrupted image (re-extracted on next start)", true, () -> {
                         Files.deleteIfExists(diskImage);

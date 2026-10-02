@@ -34,8 +34,8 @@ import java.util.List;
 public final class RuntimeConstants {
 
     /**
-     * Worker pool selected once from {@code ISX_POOL}. Invalid selections are retained in a
-     * fail-closed state so command entry points can report the original configuration error.
+     * Static or materialized worker pool selected once from its environment selector. Invalid
+     * selections are retained fail-closed so entry points can report the original state error.
      */
     public static final WorkerPoolSelection WORKER_POOL = WorkerPoolSelection.fromEnvironment();
 

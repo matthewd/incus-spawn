@@ -43,9 +43,12 @@ command -v "$ISX" >/dev/null 2>&1 || die "isx not found on PATH (set ISX=/path/t
 [ -f "$BUILD_DIR/vmlinuz" ] || die "$BUILD_DIR/vmlinuz not found. Run ./appliance/build.sh first."
 [ -f "$BUILD_DIR/disk.img.gz" ] || \
     die "$BUILD_DIR/disk.img.gz not found. Run ./appliance/build.sh first."
+[ -s "$BUILD_DIR/version" ] || die "$BUILD_DIR/version not found. Run ./appliance/build.sh first."
 
-# Point isx at the locally-built artifacts instead of the downloaded release.
+# Point isx at the locally-built artifacts and their matching host-side version marker.
 export ISX_APPLIANCE_DIR="$BUILD_DIR"
+export ISX_APPLIANCE_VERSION="$(tr -d '\r\n' < "$BUILD_DIR/version")"
+[ -n "$ISX_APPLIANCE_VERSION" ] || die "$BUILD_DIR/version is empty"
 
 echo "==> Stopping any running VM..."
 "$ISX" vm stop || true

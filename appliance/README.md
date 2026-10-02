@@ -14,7 +14,7 @@ Minimal Alpine Linux VM with Incus pre-installed. See [DESIGN.md](DESIGN.md) for
 ./appliance/build.sh
 ```
 
-Produces `rootfs.tar.zst` (~42 MB), `disk.img.gz`, and `vmlinuz` (~5 MB). The kernel is cached — delete `vmlinuz` to force a rebuild.
+Produces `rootfs.tar.zst` (~42 MB), `disk.img.gz`, `vmlinuz` (~5 MB), and a `version` marker matching the embedded `/etc/isx-version`. The kernel is cached — delete `vmlinuz` to force a rebuild.
 
 On macOS the build runs in a podman container that cannot create loop devices, so `build.sh` assembles `disk.img.gz` on the host afterwards via the podman machine VM (this requires `podman machine` to be running: `podman machine start`).
 
@@ -43,8 +43,9 @@ isx                                 # launch the TUI against the new build
 
 `test-with-isx.sh` stops any running VM, clears the previously extracted root
 disk so the new build is used, recreates the data disk, points `isx` at
-`appliance/build` via `ISX_APPLIANCE_DIR`, boots it with `isx vm start`, and
-waits until the daemon is reachable.
+`appliance/build` via `ISX_APPLIANCE_DIR`, exports the build's `version` marker
+as `ISX_APPLIANCE_VERSION`, boots it with `isx vm start`, and waits until the
+daemon is reachable.
 
 The data disk holds Incus's state (`/var/lib/incus`). A data disk written by a
 *different* appliance build can leave `incusd` unable to start on the fresh

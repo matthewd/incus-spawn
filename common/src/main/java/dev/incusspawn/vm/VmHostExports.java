@@ -15,27 +15,34 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Resolved host exports for one named worker-pool VM.
  *
  * <p>The planner has no process-global inputs: callers provide the frozen pool configuration and
  * host home directory. Runtime and workspace roots are the only roots it may create. Reference
- * roots must already be directories. Every path exposed to vfkit is canonical, and translation
+ * and materialized direct roots must already be directories. Every path exposed to vfkit is
+ * canonical, and translation
  * canonicalizes the requested path before selecting the longest containing export.
  */
 public final class VmHostExports {
 
     public static final String RUNTIME_TAG = "isx-runtime";
     public static final String WORKSPACE_TAG = "isx-workspace";
+    public static final String DIRECT_TAG = "isx-direct";
     public static final String REFERENCE_TAG_PREFIX = "isx-reference-";
     public static final Path RUNTIME_GUEST_PATH = Path.of("/host/runtime");
     public static final Path WORKSPACE_GUEST_PATH = Path.of("/host/workspace");
+    public static final Path DIRECT_GUEST_PATH = Path.of("/host/direct");
     public static final Path REFERENCES_GUEST_PATH = Path.of("/host/references");
     private static final int MAX_REFERENCE_PARAMETER_LENGTH = 1024;
 
+    public enum ExportKind { RUNTIME, WORKSPACE, DIRECT, REFERENCE, LEGACY }
+
     /** One canonical host export and its deterministic guest identity. */
     public record Export(
+            ExportKind kind,
             String name,
             Path hostPath,
             String mountTag,
@@ -47,11 +54,24 @@ public final class VmHostExports {
         }
     }
 
-    /** Appliance path plus both the requested and enclosing-export access modes. */
+    /** Appliance path plus access and exact enclosing-export provenance. */
     public record Translation(
             String appliancePath,
             WorkerPoolConfig.AccessMode requestedAccess,
-            WorkerPoolConfig.AccessMode exportAccess) {
+            WorkerPoolConfig.AccessMode exportAccess,
+            ExportKind exportKind,
+            boolean exactExportRoot) {
+
+        public Translation(
+                String appliancePath,
+                WorkerPoolConfig.AccessMode requestedAccess,
+                WorkerPoolConfig.AccessMode exportAccess) {
+            this(appliancePath, requestedAccess, exportAccess, ExportKind.LEGACY, false);
+        }
+
+        public boolean exactDirectRoot() {
+            return exportKind == ExportKind.DIRECT && exactExportRoot;
+        }
     }
 
     private final String poolName;
@@ -73,11 +93,16 @@ public final class VmHostExports {
 
         var specs = new ArrayList<ExportSpec>();
         specs.add(new ExportSpec(
-                "runtime-root", pool.runtimeRoot().path(), RUNTIME_TAG, RUNTIME_GUEST_PATH,
-                pool.runtimeRoot().accessMode(), true));
+                ExportKind.RUNTIME, "runtime-root", pool.runtimeRoot().path(), RUNTIME_TAG,
+                RUNTIME_GUEST_PATH, pool.runtimeRoot().accessMode(), true));
         specs.add(new ExportSpec(
-                "workspace-root", pool.workspaceRoot().path(), WORKSPACE_TAG, WORKSPACE_GUEST_PATH,
-                pool.workspaceRoot().accessMode(), true));
+                ExportKind.WORKSPACE, "workspace-root", pool.workspaceRoot().path(), WORKSPACE_TAG,
+                WORKSPACE_GUEST_PATH, pool.workspaceRoot().accessMode(), true));
+        if (pool.directRoot() != null) {
+            specs.add(new ExportSpec(
+                    ExportKind.DIRECT, "direct-root", pool.directRoot().path(), DIRECT_TAG,
+                    DIRECT_GUEST_PATH, pool.directRoot().accessMode(), false));
+        }
         pool.referenceRoots().entrySet().stream()
                 .sorted(java.util.Map.Entry.comparingByKey())
                 .forEach(entry -> {
@@ -86,10 +111,13 @@ public final class VmHostExports {
                                 + "' in worker pool '" + poolName + "'");
                     }
                     specs.add(new ExportSpec(
-                            entry.getKey(), entry.getValue().path(), REFERENCE_TAG_PREFIX + entry.getKey(),
-                            REFERENCES_GUEST_PATH.resolve(entry.getKey()), entry.getValue().accessMode(), false));
+                            ExportKind.REFERENCE, entry.getKey(), entry.getValue().path(),
+                            REFERENCE_TAG_PREFIX + entry.getKey(),
+                            REFERENCES_GUEST_PATH.resolve(entry.getKey()),
+                            entry.getValue().accessMode(), false));
                 });
-        var referenceParameter = specs.stream().skip(2).map(ExportSpec::name)
+        var referenceParameter = specs.stream()
+                .filter(spec -> spec.kind == ExportKind.REFERENCE).map(ExportSpec::name)
                 .collect(java.util.stream.Collectors.joining(","));
         if (referenceParameter.length() > MAX_REFERENCE_PARAMETER_LENGTH) {
             throw new IllegalStateException("worker pool '" + poolName
@@ -126,11 +154,74 @@ public final class VmHostExports {
                 throw invalid(poolName, root.spec.name, "is not a directory: " + canonical);
             }
             requireVfkitSafePath(canonical.toString());
-            exports.add(new Export(root.spec.name, canonical, root.spec.mountTag,
+            exports.add(new Export(root.spec.kind, root.spec.name, canonical, root.spec.mountTag,
                     root.spec.guestPath, root.spec.accessMode));
         }
         rejectExportOverlaps(poolName, exports);
         return new VmHostExports(poolName, exports);
+    }
+
+    /** Reconstruct a descriptor-bound export plan without consulting host-root filesystem state. */
+    public static VmHostExports createFrozen(
+            String poolName, WorkerPoolConfig.Selected pool) {
+        if (!WorkerPoolConfig.isSafeName(poolName)) {
+            throw new IllegalStateException("unsafe worker pool name '" + poolName + "'");
+        }
+        var exports = new ArrayList<Export>();
+        exports.add(frozenExport(
+                poolName, ExportKind.RUNTIME, "runtime-root", pool.runtimeRoot().path(),
+                RUNTIME_TAG, RUNTIME_GUEST_PATH, pool.runtimeRoot().accessMode()));
+        exports.add(frozenExport(
+                poolName, ExportKind.WORKSPACE, "workspace-root", pool.workspaceRoot().path(),
+                WORKSPACE_TAG, WORKSPACE_GUEST_PATH, pool.workspaceRoot().accessMode()));
+        if (pool.directRoot() != null) {
+            exports.add(frozenExport(
+                    poolName, ExportKind.DIRECT, "direct-root", pool.directRoot().path(),
+                    DIRECT_TAG, DIRECT_GUEST_PATH, pool.directRoot().accessMode()));
+        }
+        pool.referenceRoots().entrySet().stream()
+                .sorted(java.util.Map.Entry.comparingByKey())
+                .forEach(entry -> {
+                    if (!WorkerPoolConfig.isSafeReferenceName(entry.getKey())) {
+                        throw new IllegalStateException("unsafe reference export name '"
+                                + entry.getKey() + "' in worker pool '" + poolName + "'");
+                    }
+                    exports.add(frozenExport(
+                            poolName, ExportKind.REFERENCE, entry.getKey(), entry.getValue().path(),
+                            REFERENCE_TAG_PREFIX + entry.getKey(),
+                            REFERENCES_GUEST_PATH.resolve(entry.getKey()),
+                            entry.getValue().accessMode()));
+                });
+        var referenceParameter = exports.stream()
+                .filter(export -> export.kind() == ExportKind.REFERENCE).map(Export::name)
+                .collect(java.util.stream.Collectors.joining(","));
+        if (referenceParameter.length() > MAX_REFERENCE_PARAMETER_LENGTH) {
+            throw new IllegalStateException("worker pool '" + poolName
+                    + "' reference export names exceed the safe kernel-parameter length");
+        }
+        rejectExportOverlaps(poolName, exports);
+        return new VmHostExports(poolName, exports);
+    }
+
+    private static Export frozenExport(
+            String poolName,
+            ExportKind kind,
+            String name,
+            String value,
+            String mountTag,
+            Path guestPath,
+            WorkerPoolConfig.AccessMode accessMode) {
+        final Path path;
+        try {
+            path = Path.of(value);
+        } catch (InvalidPathException e) {
+            throw invalid(poolName, name, "is not a valid host path");
+        }
+        if (!path.isAbsolute() || !path.normalize().equals(path)) {
+            throw invalid(poolName, name, "is not a normalized absolute path");
+        }
+        requireVfkitSafePath(path.toString());
+        return new Export(kind, name, path, mountTag, guestPath, accessMode);
     }
 
     public String poolName() {
@@ -142,15 +233,25 @@ public final class VmHostExports {
     }
 
     public Export runtime() {
-        return exports.get(0);
+        return export(ExportKind.RUNTIME);
     }
 
     public Export workspace() {
-        return exports.get(1);
+        return export(ExportKind.WORKSPACE);
+    }
+
+    public Optional<Export> direct() {
+        return exports.stream().filter(candidate -> candidate.kind() == ExportKind.DIRECT).findFirst();
     }
 
     public List<String> referenceNames() {
-        return exports.stream().skip(2).map(Export::name).toList();
+        return exports.stream().filter(candidate -> candidate.kind() == ExportKind.REFERENCE)
+                .map(Export::name).toList();
+    }
+
+    private Export export(ExportKind kind) {
+        return exports.stream().filter(candidate -> candidate.kind() == kind).findFirst()
+                .orElseThrow();
     }
 
     public String fingerprint() {
@@ -170,7 +271,7 @@ public final class VmHostExports {
     /**
      * Translate an existing physical host path while proving that its enclosing export permits the
      * requested access. Read-only requests may use any export. Read-write requests are restricted
-     * to the workspace export even if a future configuration type marks another export writable.
+     * to workspace and the descriptor-only materialized direct export.
      */
     public Translation translate(
             String hostPath, Path home, WorkerPoolConfig.AccessMode requestedAccess) {
@@ -200,8 +301,9 @@ public final class VmHostExports {
                 .orElseThrow(() -> new IllegalStateException("host path '" + hostPath
                         + "' is not declared by worker pool '" + poolName + "' exports"));
         if (requestedAccess == WorkerPoolConfig.AccessMode.READ_WRITE
-                && (export != workspace()
-                || export.accessMode() != WorkerPoolConfig.AccessMode.READ_WRITE)) {
+                && (export.accessMode() != WorkerPoolConfig.AccessMode.READ_WRITE
+                || (export.kind() != ExportKind.WORKSPACE
+                && export.kind() != ExportKind.DIRECT))) {
             throw new IllegalStateException("host path '" + hostPath + "' belongs to read-only export '"
                     + export.name() + "' in worker pool '" + poolName + "'");
         }
@@ -210,9 +312,11 @@ public final class VmHostExports {
             throw new IllegalStateException("host path '" + hostPath + "' resolves to the root of export '"
                     + export.name() + "' in worker pool '" + poolName + "'");
         }
+        var exactExportRoot = canonical.equals(export.hostPath());
         var appliancePath = export.guestPath()
                 .resolve(export.hostPath().relativize(canonical)).normalize().toString();
-        return new Translation(appliancePath, requestedAccess, export.accessMode());
+        return new Translation(appliancePath, requestedAccess, export.accessMode(),
+                export.kind(), exactExportRoot);
     }
 
     /** Create VM-only staging under the controlled, read-only-to-the-guest runtime export. */
@@ -257,8 +361,8 @@ public final class VmHostExports {
 
     private IllegalStateException changedPlan(Path stateFile) {
         return new IllegalStateException("worker pool '" + poolName + "' export configuration differs "
-                + "from the running VM (state: " + stateFile + "). Run 'isx vm restart' with "
-                + "ISX_POOL=" + poolName + " to apply the current exports.");
+                + "from the running VM (state: " + stateFile + "). Run 'isx vm restart' under "
+                + "the same worker-pool selection to apply the current exports.");
     }
 
     private static ResolvedSpec resolve(String poolName, ExportSpec spec, Path home) {
@@ -269,8 +373,9 @@ public final class VmHostExports {
             throw invalid(poolName, spec.name, "is not a directory: " + configured);
         }
         if (!spec.controlled && (!Files.exists(configured) || !Files.isDirectory(configured))) {
-            throw invalid(poolName, "reference-roots." + spec.name,
-                    "must already exist as a directory: " + configured);
+            var field = spec.kind == ExportKind.REFERENCE
+                    ? "reference-roots." + spec.name : spec.name;
+            throw invalid(poolName, field, "must already exist as a directory: " + configured);
         }
         return new ResolvedSpec(spec, configured, canonical);
     }
@@ -375,6 +480,7 @@ public final class VmHostExports {
     }
 
     private record ExportSpec(
+            ExportKind kind,
             String name,
             String configuredPath,
             String mountTag,

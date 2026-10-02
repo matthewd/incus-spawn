@@ -12,7 +12,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Map;
+import java.util.Set;
 import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -42,6 +45,10 @@ public class FlockInstanceLockManager implements InstanceLockManager {
     private record HeldLock(FileChannel channel, FileLock lock) {}
 
     private static final int STRIPE_COUNT = 64;
+    private static final Set<PosixFilePermission> DIRECTORY_PERMISSIONS = Set.of(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.OWNER_EXECUTE);
 
     private final Map<String, HeldLock> heldLocks = new ConcurrentHashMap<>();
     private final Object[] lockStripes;
@@ -79,7 +86,8 @@ public class FlockInstanceLockManager implements InstanceLockManager {
 
     private FileChannel getGlobalChannel() throws IOException {
         if (globalChannel == null) {
-            Files.createDirectories(lockDir);
+            Files.createDirectories(lockDir,
+                    PosixFilePermissions.asFileAttribute(DIRECTORY_PERMISSIONS));
             globalChannel = FileChannel.open(
                     lockDir.resolve(".global.lock"),
                     StandardOpenOption.CREATE,

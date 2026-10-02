@@ -151,6 +151,80 @@ class VmHostExportsTest {
     }
 
     @Test
+    void materializedPoolAddsOneDistinctWritableDirectExport() throws Exception {
+        var direct = Files.createDirectories(home.resolve("project"));
+        var base = selected(home.resolve("runtime").toString(),
+                home.resolve("workspace").toString(), Map.of());
+        var materialized = new WorkerPoolConfig.Selected(
+                base.cpus(), base.memoryMib(), base.swap(), base.runtimeRoot(),
+                base.workspaceRoot(), base.referenceRoots(),
+                new WorkerPoolConfig.ReadWriteExport(direct.toRealPath().toString()));
+
+        var plan = VmHostExports.create("job-one", materialized, home);
+
+        var export = plan.direct().orElseThrow();
+        assertEquals(VmHostExports.ExportKind.DIRECT, export.kind());
+        assertEquals("isx-direct", export.mountTag());
+        assertEquals(Path.of("/host/direct"), export.guestPath());
+        assertFalse(export.readOnly());
+        var exact = plan.translate(direct.toString(), home,
+                WorkerPoolConfig.AccessMode.READ_WRITE);
+        assertEquals("/host/direct", exact.appliancePath());
+        assertTrue(exact.exactExportRoot());
+        assertTrue(exact.exactDirectRoot());
+
+        assertTrue(VmHostExports.create("compile", base, home).direct().isEmpty(),
+                "a static pool must never gain a direct export");
+    }
+
+    @Test
+    void frozenMaintenancePlanDoesNotInspectRootsAndHasADistinctFingerprint() throws Exception {
+        var base = selected(
+                home.resolve("missing-runtime").toString(),
+                home.resolve("missing-workspace").toString(),
+                Map.of("reference", new WorkerPoolConfig.ReadOnlyExport(
+                        home.resolve("missing-reference").toString())));
+        var materialized = new WorkerPoolConfig.Selected(
+                base.cpus(), base.memoryMib(), base.swap(), base.runtimeRoot(),
+                base.workspaceRoot(), base.referenceRoots(),
+                new WorkerPoolConfig.ReadWriteExport(
+                        home.resolve("missing-direct").toString()));
+        var withoutDirect = new WorkerPoolConfig.Selected(
+                base.cpus(), base.memoryMib(), base.swap(), base.runtimeRoot(),
+                base.workspaceRoot(), base.referenceRoots());
+
+        var normalPlan = VmHostExports.createFrozen("job-one", materialized);
+        var maintenancePlan = VmHostExports.createFrozen("job-one", withoutDirect);
+
+        assertTrue(normalPlan.direct().isPresent());
+        assertTrue(maintenancePlan.direct().isEmpty());
+        assertNotEquals(normalPlan.fingerprint(), maintenancePlan.fingerprint());
+        assertFalse(Files.exists(home.resolve("missing-direct")));
+    }
+
+    @Test
+    void directRootMustPreexistAndCannotOverlapOtherExports() throws Exception {
+        var base = selected(home.resolve("runtime").toString(),
+                home.resolve("workspace").toString(), Map.of());
+        var missing = new WorkerPoolConfig.Selected(
+                base.cpus(), base.memoryMib(), base.swap(), base.runtimeRoot(),
+                base.workspaceRoot(), base.referenceRoots(),
+                new WorkerPoolConfig.ReadWriteExport(home.resolve("missing-direct").toString()));
+        assertThrows(IllegalStateException.class,
+                () -> VmHostExports.create("job-one", missing, home));
+
+        var workspace = Files.createDirectories(home.resolve("workspace"));
+        var project = Files.createDirectories(workspace.resolve("project"));
+        var overlapping = new WorkerPoolConfig.Selected(
+                base.cpus(), base.memoryMib(), base.swap(), base.runtimeRoot(),
+                new WorkerPoolConfig.ReadWriteExport(workspace.toString()), base.referenceRoots(),
+                new WorkerPoolConfig.ReadWriteExport(project.toString()));
+        var error = assertThrows(IllegalStateException.class,
+                () -> VmHostExports.create("job-one", overlapping, home));
+        assertTrue(error.getMessage().contains("overlap"));
+    }
+
+    @Test
     void boundsReferenceTagsAndKernelParameter() throws Exception {
         var tooLong = "reference-name-longer-than-tag-limit";
         var reference = Files.createDirectories(home.resolve("reference"));

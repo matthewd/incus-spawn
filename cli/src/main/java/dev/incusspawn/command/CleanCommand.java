@@ -3,6 +3,7 @@ package dev.incusspawn.command;
 import dev.incusspawn.Environment;
 import dev.incusspawn.RuntimeServices;
 import dev.incusspawn.config.ImageDef;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.vm.VmManager;
 import org.aesh.command.CommandDefinition;
@@ -20,6 +21,8 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.function.BooleanSupplier;
 
 @CommandDefinition(
         name = "clean",
@@ -178,6 +181,25 @@ public class CleanCommand extends BaseCommand {
         return CommandResult.SUCCESS;
     }
 
+    static CommandResult withStateCleanupLocks(Callable<CommandResult> operation)
+            throws Exception {
+        return VmManager.withLifecycleLock(operation::call);
+    }
+
+    static boolean stateCleanupHasRunningVm() {
+        return stateCleanupHasRunningVm(WorkerPoolSelection.current(),
+                VmManager::isRunning, VmManager::anyVmRunning);
+    }
+
+    static boolean stateCleanupHasRunningVm(
+            WorkerPoolSelection selection,
+            BooleanSupplier selectedVmRunning,
+            BooleanSupplier anyVmRunning) {
+        return selection.isLegacy()
+                ? anyVmRunning.getAsBoolean()
+                : selectedVmRunning.getAsBoolean();
+    }
+
     static void cleanDnfCacheVolume(boolean dryRun) {
         try {
             var incus = RuntimeServices.incus();
@@ -239,13 +261,15 @@ public class CleanCommand extends BaseCommand {
 
         @Override
         protected CommandResult doExecute() throws Exception {
-            if (VmManager.isRunning()) {
-                System.err.println("Error: VM is currently running. Stop it first with 'isx vm stop'.");
-                return CommandResult.valueOf(1);
-            }
-            return cleanDirs(
-                    List.of(Environment.vmStateDir(), Environment.dataDir()),
-                    dryRun, skipConfirmation, "state");
+            return withStateCleanupLocks(() -> {
+                if (stateCleanupHasRunningVm()) {
+                    System.err.println("Error: VM is currently running. Stop it first with 'isx vm stop'.");
+                    return CommandResult.valueOf(1);
+                }
+                return cleanDirs(
+                        List.of(Environment.vmStateDir(), Environment.dataDir()),
+                        dryRun, skipConfirmation, "state");
+            });
         }
     }
 
@@ -312,45 +336,47 @@ public class CleanCommand extends BaseCommand {
 
         @Override
         protected CommandResult doExecute() throws Exception {
-            if (VmManager.isRunning()) {
-                System.err.println("Error: VM is currently running. Stop it first with 'isx vm stop'.");
-                return CommandResult.valueOf(1);
-            }
+            return withStateCleanupLocks(() -> {
+                if (stateCleanupHasRunningVm()) {
+                    System.err.println("Error: VM is currently running. Stop it first with 'isx vm stop'.");
+                    return CommandResult.valueOf(1);
+                }
 
-            var dirs = List.of(
-                    Environment.cacheDir(),
-                    Environment.vmStateDir(),
-                    Environment.dataDir(),
-                    Environment.configDir());
-            var infos = collectInfo(dirs);
-            if (infos.isEmpty()) {
-                System.out.println("Nothing to clean — no incus-spawn data found.");
-                return CommandResult.SUCCESS;
-            }
+                var dirs = List.of(
+                        Environment.cacheDir(),
+                        Environment.vmStateDir(),
+                        Environment.dataDir(),
+                        Environment.configDir());
+                var infos = collectInfo(dirs);
+                if (infos.isEmpty()) {
+                    System.out.println("Nothing to clean — no incus-spawn data found.");
+                    return CommandResult.SUCCESS;
+                }
 
-            long total = infos.stream().mapToLong(i -> i.size).sum();
-            int totalFiles = infos.stream().mapToInt(i -> i.files).sum();
+                long total = infos.stream().mapToLong(i -> i.size).sum();
+                int totalFiles = infos.stream().mapToInt(i -> i.files).sum();
 
-            if (dryRun) {
-                System.out.println("Would delete:");
+                if (dryRun) {
+                    System.out.println("Would delete:");
+                    printSummary(infos);
+                    return CommandResult.SUCCESS;
+                }
+
+                System.out.println("Will delete ALL incus-spawn data:");
                 printSummary(infos);
+                System.out.println();
+                System.out.println("WARNING: This includes your SSH keys, CA certificate, and configuration.");
+                System.out.println("You will need to run 'isx init' again and rebuild all templates.");
+
+                if (!confirm("Delete everything?", skipConfirmation)) return CommandResult.SUCCESS;
+
+                for (var info : infos) {
+                    deleteDir(info.path);
+                }
+                System.out.println("Freed " + formatSize(total) + " from " + totalFiles + " files.");
+                cleanDnfCacheVolume(dryRun);
                 return CommandResult.SUCCESS;
-            }
-
-            System.out.println("Will delete ALL incus-spawn data:");
-            printSummary(infos);
-            System.out.println();
-            System.out.println("WARNING: This includes your SSH keys, CA certificate, and configuration.");
-            System.out.println("You will need to run 'isx init' again and rebuild all templates.");
-
-            if (!confirm("Delete everything?", skipConfirmation)) return CommandResult.SUCCESS;
-
-            for (var info : infos) {
-                deleteDir(info.path);
-            }
-            System.out.println("Freed " + formatSize(total) + " from " + totalFiles + " files.");
-            cleanDnfCacheVolume(dryRun);
-            return CommandResult.SUCCESS;
+            });
         }
     }
 
@@ -389,6 +415,13 @@ public class CleanCommand extends BaseCommand {
             if (name.endsWith("-failed-build")) result.add(name);
         }
         return result;
+    }
+
+    static boolean poolCleanupComplete(
+            List<String> failedBuilds,
+            List<IncusClient.ImageInfo> unusedImages,
+            boolean dnfCacheExists) {
+        return failedBuilds.isEmpty() && unusedImages.isEmpty() && !dnfCacheExists;
     }
 
     static List<IncusClient.ImageInfo> findUnusedImages(IncusClient incus) {
@@ -496,13 +529,17 @@ public class CleanCommand extends BaseCommand {
         @Option(name = "skip-confirmation", hasValue = false, description = "Skip the confirmation prompt")
         boolean skipConfirmation;
 
+        @Option(name = "require-complete", hasValue = false,
+                description = "Fail if any targeted pool artifact remains")
+        boolean requireComplete;
+
         @Override
         protected CommandResult doExecute() throws Exception {
             var incus = RuntimeServices.incus();
             var pool = incus.findCowPool();
             if (pool == null) {
                 System.out.println("No CoW storage pool found.");
-                return CommandResult.SUCCESS;
+                return requireComplete ? CommandResult.valueOf(1) : CommandResult.SUCCESS;
             }
 
             BuildOutput.header("Reclaim pool space");
@@ -522,6 +559,17 @@ public class CleanCommand extends BaseCommand {
             if (found && !dryRun) {
                 var newUsage = incus.getStoragePoolUsage(pool);
                 BuildOutput.success("Reclaimed — " + newUsage);
+            }
+
+            if (requireComplete && !dryRun) {
+                var failedBuilds = findFailedBuilds(incus);
+                var unusedImages = findUnusedImages(incus);
+                var dnfCacheExists = incus.storageVolumeExists(
+                        pool, BuildCommand.DNF_CACHE_VOLUME);
+                if (!poolCleanupComplete(failedBuilds, unusedImages, dnfCacheExists)) {
+                    System.err.println("Error: pool cleanup is incomplete; refusing to continue.");
+                    return CommandResult.valueOf(1);
+                }
             }
 
             return CommandResult.SUCCESS;

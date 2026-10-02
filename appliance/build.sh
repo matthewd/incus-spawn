@@ -85,8 +85,9 @@ if [ -z "${ISX_INSIDE_CONTAINER:-}" ]; then
 
     echo
     echo "Build complete!"
-    ls -lh "$TARGET_DIR/rootfs.tar.zst" "$TARGET_DIR/disk.img.gz" "$TARGET_DIR/vmlinuz" 2>/dev/null || \
-        ls -lh "$TARGET_DIR/rootfs.tar.zst" "$TARGET_DIR/vmlinuz"
+    ls -lh "$TARGET_DIR/rootfs.tar.zst" "$TARGET_DIR/disk.img.gz" \
+        "$TARGET_DIR/vmlinuz" "$TARGET_DIR/version" 2>/dev/null || \
+        ls -lh "$TARGET_DIR/rootfs.tar.zst" "$TARGET_DIR/vmlinuz" "$TARGET_DIR/version"
     exit 0
 fi
 
@@ -163,6 +164,8 @@ fi
 
 echo "==> Embedding version: $ISX_VERSION"
 echo "$ISX_VERSION" > "$ROOTFS_DIR/etc/isx-version"
+printf '%s\n' "$ISX_VERSION" > "$TARGET_DIR/version"
+chmod 644 "$TARGET_DIR/version"
 
 echo "==> Final cleanup..."
 rm -rf "$ROOTFS_DIR/usr/share/man" "$ROOTFS_DIR/usr/share/doc" "$ROOTFS_DIR/usr/share/info"

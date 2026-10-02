@@ -15,10 +15,11 @@ A minimal Alpine Linux VM image with Incus pre-installed, built from a declarati
 4. Install packages via chroot (`apk add --no-cache`)
 5. Run `config.sh` to strip bloat and configure the appliance
 6. Clean stale state (`/run/*`, `/var/lib/incus/*`) to prevent PID/lock file issues on first boot
-7. Pack the rootfs into a zstd-compressed tarball (`rootfs.tar.zst`)
-8. Build a custom minimal kernel from vanilla kernel.org source (`kernel/build-kernel.sh`)
+7. Embed the build version in `/etc/isx-version` and emit the matching host `version` marker
+8. Pack the rootfs into a zstd-compressed tarball (`rootfs.tar.zst`)
+9. Build a custom minimal kernel from vanilla kernel.org source (`kernel/build-kernel.sh`)
 
-Output artifacts: `vmlinuz` (~11 MB), `rootfs.tar.zst` (~30-40 MB). No initrd.
+Output artifacts: `vmlinuz` (~11 MB), `rootfs.tar.zst` (~30-40 MB), `disk.img.gz`, and `version`. No initrd.
 
 No disk images are created during build -- the tarball is unpacked into a btrfs disk image on first use (see Disk Lifecycle below).
 
@@ -174,7 +175,7 @@ vfkit --cpus 2 --memory 2048 \
 - Console on `hvc0` (virtio-serial), not `ttyS0`
 - REST API for lifecycle management (stop via `POST /vm/state {"state":"Stop"}`)
 - NAT networking with DHCP (interface appears as `enp0s1`)
-- **typed host exports**: named pools mount `isx-runtime` at `/host/runtime` and `isx-reference-<name>` at `/host/references/<name>` read-only, and `isx-workspace` at `/host/workspace` read-write. The bounded, safe sorted reference names arrive in `isx.reference_names`; a missing device or invalid name aborts appliance initialization instead of leaving an empty directory in its place. This requires the companion incus-spawn vfkit extension: its `virtio-fs,...,readonly` field passes `true` to `VZSharedDirectory`. Upstream vfkit rejects the field and named pools fail closed. The matching guest `mount -o ro` flags are defense in depth and are not sufficient without virtualization-layer enforcement. Without `isx.host_exports=named`, `rcS` retains the legacy read-only `hostfs` mount at `/host`.
+- **typed host exports**: named pools mount `isx-runtime` at `/host/runtime` and `isx-reference-<name>` at `/host/references/<name>` read-only, and `isx-workspace` at `/host/workspace` read-write. A materialized pool's `isx.direct_root=1` marker adds the statically attached `isx-direct` device at `/host/direct`, read-write; static named pools omit both marker and device. The bounded, safe sorted reference names arrive in `isx.reference_names`; a missing device or invalid name aborts appliance initialization instead of leaving an empty directory in its place. This requires the companion incus-spawn vfkit extension: its `virtio-fs,...,readonly` field passes `true` to `VZSharedDirectory`. Upstream vfkit rejects the field and named pools fail closed. The matching guest `mount -o ro` flags are defense in depth and are not sufficient without virtualization-layer enforcement. Without `isx.host_exports=named`, `rcS` retains the legacy read-only `hostfs` mount at `/host`.
 - **vsock tunnel**: the `virtio-vsock` device exposes the VM's vsock port 8443 as a Unix domain socket on the host. Inside the VM, socat bridges this to the Incus daemon's Unix socket, giving the host direct plain-HTTP access to the Incus API without TCP or TLS. This bypasses corporate VPN socket filters (e.g. Cisco AnyConnect) that block non-Apple-signed binaries from TCP connections to the VM subnet
 - **control agent channel**: a second `virtio-vsock` device (port 1025 → `vm.agent.sock`) exposes the allowlisted in-VM control agent on an independent channel, so the host can introspect and recover the forwarder even when the Incus tunnel itself is wedged. See "Control agent and forwarder recovery" below.
 
@@ -249,7 +250,7 @@ Backend selection: vfkit on macOS, QEMU on Linux (with KVM when available). Crea
 
 ### CI (`.github/workflows/`)
 
-**Build** (`build-appliance.yml`): separate jobs for x86_64 (`ubuntu-latest`) and aarch64 (`ubuntu-24.04-arm`). Artifacts cached by version + content hash of `appliance/**` files (release builds get a unique cache key per version so two releases with identical appliance sources don't share a stale image). The release workflow passes the tag via a `version` input; `build.sh` embeds it in `/etc/isx-version`, and a post-build step verifies the embedded version matches. Includes kernel compilation (~3-5 minutes with minimal config).
+**Build** (`build-appliance.yml`): separate jobs for x86_64 (`ubuntu-latest`) and aarch64 (`ubuntu-24.04-arm`). Artifacts cached by version + content hash of `appliance/**` files (release builds get a unique cache key per version so two releases with identical appliance sources don't share a stale image). The release workflow passes the tag via a `version` input; `build.sh` embeds it in `/etc/isx-version`, writes the same value to the host `version` marker, and a post-build step verifies the embedded version matches. Includes kernel compilation (~3-5 minutes with minimal config).
 
 **Integration** (`test-integration.yml`): restores cached build artifacts, creates a btrfs disk image from the tarball, boots via QEMU with KVM, verifies the VM reaches `ISX READY` state, and runs the Incus smoke test.
 

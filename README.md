@@ -948,7 +948,7 @@ ISX_POOL=compile isx vm start
 ISX_POOL=compile isx
 ```
 
-Named pools use their configured CPU, memory, and swap values, ignoring `ISX_VM_CPUS`, `ISX_VM_MEMORY`, and `ISX_VM_SWAP`. Their VM state and instance locks live under `~/.local/state/incus-spawn/pools/<name>/`, and each pool gets a deterministic locally administered MAC address. Configuration, credentials, CA material, proxy state and logs, appliance downloads, and caches remain shared globally.
+Named pools use their configured CPU, memory, and swap values, ignoring `ISX_VM_CPUS`, `ISX_VM_MEMORY`, and `ISX_VM_SWAP`. Their VM state lives under `~/.local/state/incus-spawn/pools/<name>/`, their stable instance and VM locks live under `~/.local/state/incus-spawn-locks/static-<name>/`, and each pool gets a deterministic locally administered MAC address. Configuration, credentials, CA material, proxy state and logs, appliance downloads, and caches remain shared globally.
 
 Named macOS pools are demand-started. Installing the global proxy from a named-pool process does not register that pool, or the legacy whole-home VM, as a login service; it removes a stale `dev.incusspawn.vm` LaunchAgent if one exists. The proxy LaunchAgent stores no pool selection or credentials. It binds to an atomically persisted global VM-facing host gateway, so launchd can start it without an appliance connection. After starting another pool, apply that pool's complete current domain set without restarting the global proxy:
 
@@ -961,7 +961,37 @@ On macOS, a named pool replaces the legacy whole-home share with one virtio-fs d
 
 Named pools require the companion incus-spawn vfkit fork, which extends `--device virtio-fs,...` with the `readonly` field and passes it to `VZSharedDirectory`. Upstream vfkit does not implement that field and named-pool launch fails closed. The guest also mounts read-only exports with `mount -o ro`, but that guest flag is defense in depth, not a substitute for the virtualization-layer restriction.
 
-The pool mount layout also requires an appliance built from this fork. Development wrappers can set `ISX_APPLIANCE_DIR` to those artifacts and `ISX_APPLIANCE_VERSION` to the same opaque version embedded in `/etc/isx-version`; the latter keeps pool root-disk replacement deterministic without pretending a local appliance is an upstream release.
+The pool mount layout also requires an appliance built from this fork. `appliance/build.sh` writes the opaque build version both into `/etc/isx-version` and to the output directory's `version` marker. Development wrappers set `ISX_APPLIANCE_DIR` to those artifacts and `ISX_APPLIANCE_VERSION` to that marker; the latter keeps pool root-disk replacement deterministic without pretending a local appliance is an upstream release.
+
+#### Sealed and materialized direct pools
+
+On macOS, a stopped static named pool can be sealed as an owner-protected seed generation. Its root-disk and kernel artifact version markers must both match the current isx appliance version; otherwise start and stop the seed once before sealing so the direct-export boot support is present. Before and after each APFS clone, sealing checks the root and Incus data disks by logical size and btrfs superblock magic, without reading their 4 GiB/60 GiB logical contents. It records those disk-image properties, the appliance kernel's size and SHA-256 digest, the canonical export plan, and the disk version. It does not copy swap. The command emits one line of versioned JSON containing the opaque generation and its full metadata identity:
+
+```shell
+ISX_POOL=compile isx pool seal
+```
+
+Materialization must run with the same static seed selected. It validates and APFS-clones the sealed root, data, and kernel into a new pool, validates each destination, creates a pool-local workspace and a fresh sparse swap image, and freezes one pre-existing canonical project directory as the direct root. A direct root is rejected if it overlaps in either direction with ISX configuration, state, cache, appliance, registry, or pool-workspace roots, or if vfkit cannot encode it safely. A seed reference equal to or nested beneath the direct root is omitted from the materialized export plan because the direct export already covers it; a direct root nested beneath a broader seed reference remains rejected. Omitting both generation options selects the seed's current `latest` pointer; supplying either requires the exact pair returned by `seal`.
+
+```shell
+ISX_POOL=compile isx pool materialize \
+  --name job-17 \
+  --direct-root /Users/me/src/project \
+  --generation g-0123456789abcdef0123456789abcdef \
+  --generation-identity <64-lowercase-hex-digest>
+```
+
+The materialize response contains the materialized pool's full identity. Selection is deliberately separate from `ISX_POOL` and requires both values; a missing value, an unsafe name, a changed descriptor, unsafe state ownership or permissions, or missing pool artifact fails before command dispatch. Canonical export roots are revalidated before VM launch and host-path translation, while management commands against an already-running VM can still remove owned state after the user-controlled direct root has moved or disappeared. Static and materialized selectors cannot be combined. The internal `ISX_MATERIALIZED_POOL_MAINTENANCE=1` marker permits only automation deletion and the matching no-Direct VM maintenance launch; ordinary materialized operation uses neither.
+
+```shell
+ISX_MATERIALIZED_POOL=job-17 \
+ISX_MATERIALIZED_POOL_IDENTITY=<identity-from-materialize> \
+isx automation create --help
+```
+
+Materialized state lives under `~/.local/state/incus-spawn/direct-pools/pools/<name>/`. Its ephemeral vsock endpoints use compact identity-derived filenames directly under `~/.local/state/incus-spawn/` so generated pool names cannot exceed macOS's Unix-socket path limit. Bounded management, VM, and per-instance locks live separately under `~/.local/state/incus-spawn-locks/`, so recursive state cleanup cannot unlink a held lock; clean, resize, lifecycle, seal, and materialize operations serialize in management-then-VM order where both apply. Its boot root and kernel stay pinned to the sealed generation, while its cloned Incus data disk remains pool-local and mutable; ordinary appliance upgrades do not replace the pinned boot artifacts. Before every launch, ISX rechecks physical root/data/swap file types, disk-image shape, swap size, and the pool-local kernel digest. The owner-only directories, file modes, and digest-bound metadata detect accidental or out-of-band changes, but do not claim to make files unchangeable by the host user who owns them. The descriptor identity also scopes the deterministic VM MAC, so recreating a name from different material does not reuse the old network identity.
+
+A materialized VM adds exactly one launch-time `isx-direct` virtio-fs export at `/host/direct`, read-write, in addition to its frozen runtime and reference exports and its pool-local workspace. No static YAML field can add that export. Automation mounts retain the leaf-only rule for every normal export; the one exception is an exact, read-write mount of the descriptor's direct root. The export set remains fixed for the VM process and is still covered by the persisted launch fingerprint.
 
 ## FAQ
 
@@ -976,6 +1006,8 @@ Two attack surfaces make this dangerous even for "just the project directory":
 2. **IDE auto-execution.** VS Code, IntelliJ, and most editors auto-execute project configuration the moment you open a directory: `.vscode/settings.json` (task auto-run), `.idea/` workspace files, ESLint/TypeScript/Pyright configs that load plugins. An agent writing to the project directory can trigger code execution on your host just by the folder being open — no build command required.
 
 These risks are compounded by a **race condition**: with a live read-write mount, files can change between review and execution. You inspect a git hook or build script, decide it's safe, and run your build — but the agent modified the file between your review and your command. Unlike `git fetch`, which gives you a specific immutable commit to review and act on, a live mount means your review is never final.
+
+Materialized direct pools are an explicit orchestration-only exception for callers that intentionally accept this host-write risk. They freeze one exact canonical direct root into an identity-bound descriptor; they do not make a static pool's workspace or any other export broader. They should not be treated as preserving the normal sandbox boundary.
 
 Beyond security, a shared project directory is also **misleading**. The agent's code runs against the container's execution context — container-local SNAPSHOT dependencies, container-local `node_modules`, container-local pip packages. None of that comes through the mount. The source code on the host *looks* like a complete project, but when you build it locally it may behave differently or break entirely because the dependency state is invisible. The project directory is only a partial view of the agent's environment.
 
@@ -1007,6 +1039,7 @@ Beyond security, a shared project directory is also **misleading**. The agent's 
 | [`isx doctor`](#isx-doctor) | Diagnose host, proxy, VM, and tunnel health |
 | [`isx clean`](#isx-clean) | Remove cached data, state, or configuration |
 | [`isx vm`](#isx-vm) | Manage the VM appliance (macOS only) |
+| [`isx pool`](#isx-pool) | Seal and materialize direct worker pools (macOS only) |
 | [`isx help`](#isx-help) | AI-powered help |
 | [`isx completion`](#isx-completion) | Print shell completion script |
 
@@ -1263,7 +1296,7 @@ isx automation unmount \
 
 The device name must start with a lowercase letter and contain at most 63 lowercase letters, digits, or hyphens. Source and target must be absolute, contain no `..`, NUL, or newline; the source must identify an existing physical path, and the target cannot be `/`. An existing instance-owned device is accepted only when its complete unexpanded Incus map exactly matches the translated source, target, access, and disk type; extra fields, malformed devices, and read-only/read-write changes are conflicts. A repeated exact mount and a repeated absent unmount are unchanged. Unmount rechecks the full expected map in the same Incus read-modify-write that removes the device, rather than deleting by name alone.
 
-On named macOS pools, the physical source is canonicalized through the running VM's fingerprint-checked `VmHostExports` plan. Read-write attachment is limited to the declared workspace export; workspace leaves may be downgraded to read-only, while runtime and reference exports remain read-only. Symlink escapes, undeclared paths, and leaf aliases resolving to an export root fail closed. Incus receives the exact translated leaf, not the enclosing workspace root, and an inner `readonly=true` for read-only requests. Legacy macOS pools support read-only attachment only because the appliance mounts their whole-home share read-only; unlike named-pool read-only exports, that legacy restriction is not VZ-enforced.
+On named macOS pools, the physical source is canonicalized through the running VM's fingerprint-checked `VmHostExports` plan. Static-pool read-write attachment is limited to workspace; a materialized pool also permits its descriptor-bound direct export. Workspace and direct leaves may be read-write, while runtime and reference exports remain read-only. Symlink escapes, undeclared paths, and aliases resolving to an export root fail closed. The one root-level exception is the exact materialized direct root requested read-write, proven by translation metadata rather than its `/host/direct` spelling. Incus receives the exact translated path and an inner `readonly=true` for read-only requests. Legacy macOS pools support read-only attachment only because the appliance mounts their whole-home share read-only; unlike named-pool read-only exports, that legacy restriction is not VZ-enforced.
 
 `exec` accepts argv and environment as JSON rather than a shell command:
 
@@ -1319,6 +1352,8 @@ All subcommands accept these options:
 | `--dry-run` | Show what would be deleted without deleting |
 | `--skip-confirmation` | Skip the confirmation prompt |
 
+`clean pool` additionally accepts `--require-complete`, which exits unsuccessfully if any targeted failed build, unused image, or build-cache volume remains. This is intended for preparation before sealing a seed.
+
 ### `isx vm`
 
 Manage the incus-spawn VM appliance. macOS only.
@@ -1334,6 +1369,8 @@ Manage the incus-spawn VM appliance. macOS only.
 | `resize` | Grow the VM data disk that backs the storage pool |
 | `console` | Follow VM serial console output |
 | `check-version` | Check whether the running appliance matches the installed version |
+
+For a materialized pool selected with the internal `ISX_MATERIALIZED_POOL_MAINTENANCE=1` marker, `vm start --without-direct` omits only the user-owned Direct export. This maintenance mode exists so orchestration can delete owned container state after the source has moved or disappeared; automation permits deletion only, and the appliance must stop before returning to normal use.
 
 #### `isx vm restart`
 
@@ -1354,6 +1391,20 @@ Size must be larger than the current disk (grow-only), e.g. `100G`.
 | Option | Description |
 |--------|-------------|
 | `-y`, `--yes` | Skip the confirmation prompt |
+
+### `isx pool`
+
+Inspect or seal a stopped static named pool, or materialize an identity-bound direct pool. macOS only. All subcommands emit one line of versioned JSON.
+
+    ISX_POOL=<seed> isx pool <subcommand> [options]
+
+| Subcommand | Description |
+|------------|-------------|
+| `inspect` | Report whether the selected static seed is stopped and has a valid sealed generation |
+| `seal` | Seal root, data, and kernel from the selected stopped static pool |
+| `materialize` | Clone a sealed generation into a new direct pool with fresh sparse swap |
+
+`materialize` requires `--name` and `--direct-root`. `--generation` and `--generation-identity` are optional only as a pair; omitting both selects the latest sealed generation.
 
 ### `isx help`
 

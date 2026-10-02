@@ -31,7 +31,9 @@ public final class VmNetwork {
      * the legacy process keeps its historical address byte-for-byte.
      */
     public static String selectedMac() {
-        return macForPool(WorkerPoolSelection.current().name().orElse(null));
+        var selection = WorkerPoolSelection.current();
+        if (selection.isLegacy()) return ISX_VM_MAC;
+        return macForIdentity(selection.networkIdentity().orElseThrow());
     }
 
     public static String macForPool(String poolName) {
@@ -39,9 +41,13 @@ public final class VmNetwork {
         if (!WorkerPoolConfig.isSafeName(poolName)) {
             throw new IllegalArgumentException("Unsafe worker pool name for MAC derivation: " + poolName);
         }
+        return macForIdentity(poolName);
+    }
+
+    private static String macForIdentity(String identity) {
         try {
             var digest = MessageDigest.getInstance("SHA-256")
-                    .digest(("incus-spawn-worker-pool\0" + poolName).getBytes(StandardCharsets.UTF_8));
+                    .digest(("incus-spawn-worker-pool\0" + identity).getBytes(StandardCharsets.UTF_8));
             // 02 is unicast (low bit clear) and locally administered (next bit set), and cannot
             // collide with the legacy address whose first octet is 4a.
             return "02:%02x:%02x:%02x:%02x:%02x".formatted(

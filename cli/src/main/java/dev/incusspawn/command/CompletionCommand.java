@@ -28,10 +28,10 @@ public class CompletionCommand extends BaseCommand {
             return CommandResult.SUCCESS;
         }
         var script = rawScript(shell);
-        // The `vm` appliance command only exists on macOS (Incus runs natively on Linux), so it is
-        // not registered in the Linux command tree — keep the completion script in step with that.
+        // The `vm` and `pool` appliance commands only exist on macOS (Incus runs natively on
+        // Linux), so they are not registered in the Linux tree. Keep completions in step.
         if (!Platform.isMacOS()) {
-            script = stripVmCommand(script, shell);
+            script = stripMacApplianceCommands(script, shell);
         }
         System.out.println(script);
         return CommandResult.SUCCESS;
@@ -47,29 +47,24 @@ public class CompletionCommand extends BaseCommand {
     }
 
     /**
-     * Remove the macOS-only {@code vm} command from a generated completion script so it is not
-     * offered on Linux, matching the platform-specific command tree in {@code IncusSpawn}.
-     * Removes the top-level {@code vm} suggestion, drops {@code vm} from the recognized
-     * subcommand lists, and deletes the now-unreachable per-{@code vm} dispatch blocks
-     * (the zsh {@code _isx_vm} function and the bash {@code vm)} case) so no dead code remains.
+     * Remove the macOS-only {@code vm} and {@code pool} commands from a generated completion
+     * script so they are not offered on Linux, matching the platform-specific command tree.
      */
-    static String stripVmCommand(String script, Shell shell) {
+    static String stripMacApplianceCommands(String script, Shell shell) {
         return switch (shell) {
             case zsh -> script
-                    .replaceAll("(?m)^\\s*'vm:manage the incus-spawn VM appliance'\\R", "")
-                    .replaceAll("(?m)^\\s*vm\\)\\s*_isx_vm ;;\\R", "")
-                    // Drop the unreachable _isx_vm() function (ends at the first standalone brace).
-                    .replaceAll("(?sm)^[ \\t]*_isx_vm\\(\\) \\{.*?^[ \\t]*\\}\\R", "");
+                    .replaceAll("(?m)^\\s*'(vm:manage the incus-spawn VM appliance|pool:seal and materialize dedicated worker pools)'\\R", "")
+                    .replaceAll("(?m)^\\s*(vm\\)\\s*_isx_vm|pool\\)\\s*_isx_pool) ;;\\R", "")
+                    .replaceAll("(?sm)^[ \\t]*_isx_(vm|pool)\\(\\) \\{.*?^[ \\t]*\\}\\R", "");
             case bash -> script
-                    .replace("instances vm git-remote-helper", "instances git-remote-helper")
-                    .replace("instances|vm|git-remote-helper", "instances|git-remote-helper")
-                    // Drop the unreachable vm) case (ends at the first standalone ";;").
-                    .replaceAll("(?sm)^[ \\t]*vm\\)\\R.*?^[ \\t]*;;\\R", "");
+                    .replace("instances vm pool git-remote-helper", "instances git-remote-helper")
+                    .replace("instances|vm|pool|git-remote-helper", "instances|git-remote-helper")
+                    .replaceAll("(?sm)^[ \\t]*(vm|pool)\\)\\R.*?^[ \\t]*;;\\R", "");
             case fish -> script
-                    .replace("instances|vm|git-remote-helper", "instances|git-remote-helper")
-                    .replaceAll("(?m)^.*-n __isx_no_subcommand -a vm .*\\R", "")
-                    .replaceAll("(?m)^\\s*# ── vm ─.*\\R", "")
-                    .replaceAll("(?m)^.*__isx_using_subcommand vm.*\\R", "");
+                    .replace("instances|vm|pool|git-remote-helper", "instances|git-remote-helper")
+                    .replaceAll("(?m)^.*-n __isx_no_subcommand -a (vm|pool) .*\\R", "")
+                    .replaceAll("(?m)^\\s*# ── (vm|pool) ─.*\\R", "")
+                    .replaceAll("(?m)^.*__isx_using_subcommand (vm|pool).*\\R", "");
         };
     }
 
@@ -364,6 +359,30 @@ public class CompletionCommand extends BaseCommand {
               esac
             }
 
+            _isx_pool() {
+              local state line; typeset -A opt_args
+              _arguments -C \
+                '(-h --help)'{-h,--help}'[Show help]' \
+                '1: :->subcmd' \
+                '*:: :->args'
+
+              local -a _pool_subcmds
+              _pool_subcmds=(
+                'inspect:inspect the selected static seed pool'
+                'seal:seal the stopped selected static named pool'
+                'materialize:materialize an immutable direct pool'
+              )
+
+              case $state in
+                subcmd) _describe -t subcmds 'pool subcommand' _pool_subcmds ;;
+                args)
+                  case $line[1] in
+                    inspect|seal) _arguments '(-h --help)'{-h,--help}'[Show help]' ;;
+                    materialize) _arguments '--name=[Materialized pool name]:name' '--direct-root=[Canonical project directory]:directory:_files -/' '--generation=[Exact sealed generation]:generation' '--generation-identity=[Full sealed generation SHA-256 identity]:digest' ;;
+                  esac ;;
+              esac
+            }
+
             _isx_update_base() {
               _arguments \\
                 '(-h --help)'{-h,--help}'[Show help]' \\
@@ -411,6 +430,7 @@ public class CompletionCommand extends BaseCommand {
                     'git-remote-helper:git remote helper for isx:// URLs (used by git)'
                     'ssh-proxy:SSH ProxyCommand that tunnels through Incus exec API'
                     'vm:manage the incus-spawn VM appliance'
+                    'pool:seal and materialize dedicated worker pools'
                     'update-base:check for and install base image updates'
                     'doctor:run health checks and offer to fix problems'
                     'help:AI-powered help — ask any question about incus-spawn'
@@ -439,6 +459,7 @@ public class CompletionCommand extends BaseCommand {
                     git-remote-helper) _arguments '(-h --help)'{-h,--help}'[Show help]' '1:instance' '2:service' '3:path' ;;
                     ssh-proxy) _arguments '(-h --help)'{-h,--help}'[Show help]' '1:instance:_isx_instances' ;;
                     vm)         _isx_vm ;;
+                    pool)       _isx_pool ;;
                     update-base) _isx_update_base ;;
                   esac ;;
               esac
@@ -464,14 +485,14 @@ public class CompletionCommand extends BaseCommand {
               local cur prev words cword
               _init_completion || return
 
-              local commands="init build clean project branch shell run list destroy update-all update-base proxy automation completion templates instances vm git-remote-helper ssh-proxy doctor help"
+              local commands="init build clean project branch shell run list destroy update-all update-base proxy automation completion templates instances vm pool git-remote-helper ssh-proxy doctor help"
 
               # Determine which subcommand is active
               local cmd=""
               local i
               for (( i=1; i < cword; i++ )); do
                 case "${words[i]}" in
-                  init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|automation|completion|templates|instances|vm|git-remote-helper|ssh-proxy|doctor|help)
+                  init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|automation|completion|templates|instances|vm|pool|git-remote-helper|ssh-proxy|doctor|help)
                     cmd="${words[i]}"
                     break ;;
                 esac
@@ -687,6 +708,23 @@ public class CompletionCommand extends BaseCommand {
                     COMPREPLY=( $(compgen -W "--help" -- "$cur") )
                   fi
                   ;;
+                pool)
+                  local pool_subcmds="inspect seal materialize"
+                  local pool_cmd=""
+                  local j
+                  for (( j=i+1; j < cword; j++ )); do
+                    case "${words[j]}" in
+                      inspect|seal|materialize) pool_cmd="${words[j]}"; break ;;
+                    esac
+                  done
+                  if [[ -z "$pool_cmd" ]]; then
+                    COMPREPLY=( $(compgen -W "$pool_subcmds --help" -- "$cur") )
+                  elif [[ "$pool_cmd" == "materialize" ]]; then
+                    COMPREPLY=( $(compgen -W "--help --name --direct-root --generation --generation-identity" -- "$cur") )
+                  else
+                    COMPREPLY=( $(compgen -W "--help" -- "$cur") )
+                  fi
+                  ;;
                 update-base)
                   COMPREPLY=( $(compgen -W "--help --list --latest" -- "$cur") )
                   ;;
@@ -722,7 +760,7 @@ public class CompletionCommand extends BaseCommand {
 
             # Helper: true when no subcommand has been typed yet
             function __isx_no_subcommand
-              not string match -qr -- '^(init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|automation|completion|templates|instances|vm|git-remote-helper|ssh-proxy|doctor|help)$' (commandline -opc)[2..-1]
+              not string match -qr -- '^(init|build|clean|project|branch|shell|run|list|destroy|update-all|update-base|proxy|automation|completion|templates|instances|vm|pool|git-remote-helper|ssh-proxy|doctor|help)$' (commandline -opc)[2..-1]
             end
 
             # Helper: true when a specific subcommand is active
@@ -750,6 +788,7 @@ public class CompletionCommand extends BaseCommand {
             complete -c isx -f -n __isx_no_subcommand -a git-remote-helper -d 'Git remote helper for isx:// URLs (used by git)'
             complete -c isx -f -n __isx_no_subcommand -a ssh-proxy       -d 'SSH ProxyCommand that tunnels through Incus exec API'
             complete -c isx -f -n __isx_no_subcommand -a vm              -d 'Manage the incus-spawn VM appliance'
+            complete -c isx -f -n __isx_no_subcommand -a pool            -d 'Seal and materialize dedicated worker pools'
             complete -c isx -f -n __isx_no_subcommand -a update-base     -d 'Check for and install base image updates'
             complete -c isx -f -n __isx_no_subcommand -a doctor          -d 'Run health checks and offer to fix problems'
             complete -c isx -f -n __isx_no_subcommand -a help            -d 'AI-powered help — ask any question about incus-spawn'
@@ -888,6 +927,16 @@ public class CompletionCommand extends BaseCommand {
             complete -c isx -f -n '__isx_using_subcommand vm; and not string match -qr -- "\\b(start|stop|restart|status|resize|console)\\b" (commandline -opc)' -a status  -d 'Show VM status and system diagnostics'
             complete -c isx -f -n '__isx_using_subcommand vm; and not string match -qr -- "\\b(start|stop|restart|status|resize|console)\\b" (commandline -opc)' -a resize  -d 'Grow the VM data disk that backs the storage pool'
             complete -c isx -f -n '__isx_using_subcommand vm; and not string match -qr -- "\\b(start|stop|restart|status|resize|console)\\b" (commandline -opc)' -a console -d 'Follow VM serial console output'
+
+            # ── pool ────────────────────────────────────────────────────────────────────
+
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(inspect|seal|materialize)\\b" (commandline -opc)' -a inspect -d 'Inspect the selected static seed pool'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(inspect|seal|materialize)\\b" (commandline -opc)' -a seal -d 'Seal the stopped selected static named pool'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(inspect|seal|materialize)\\b" (commandline -opc)' -a materialize -d 'Materialize an immutable direct pool'
+            complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l name -d 'Materialized pool name'
+            complete -c isx -F -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l direct-root -d 'Canonical project directory'
+            complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l generation -d 'Exact sealed generation'
+            complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l generation-identity -d 'Full sealed generation SHA-256 identity'
 
             # ── update-base ─────────────────────────────────────────────────────────────
 

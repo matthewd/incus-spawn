@@ -35,6 +35,13 @@ if grep -q 'isx.host_exports=named' /proc/cmdline; then
         echo "incus-spawn: ERROR: failed to mount isx-workspace" >&2
         exit 1
     fi
+    if grep -q 'isx.direct_root=1' /proc/cmdline; then
+        mkdir -p /host/direct
+        if ! mount -t virtiofs isx-direct /host/direct 2>/dev/null; then
+            echo "incus-spawn: ERROR: failed to mount isx-direct" >&2
+            exit 1
+        fi
+    fi
 
     REFERENCE_NAMES=$(sed -En 's/.*isx\.reference_names=([^ ]*).*/\1/p' /proc/cmdline)
     OLD_IFS=$IFS

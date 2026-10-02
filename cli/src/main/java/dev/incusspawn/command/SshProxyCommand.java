@@ -1,5 +1,6 @@
 package dev.incusspawn.command;
 
+import dev.incusspawn.config.WorkerPoolSelection;
 import org.aesh.command.CommandDefinition;
 import org.aesh.command.CommandResult;
 import org.aesh.command.option.Argument;
@@ -20,6 +21,10 @@ public class SshProxyCommand extends BaseCommand {
 
     @Override
     protected CommandResult doExecute() throws Exception {
+        if (WorkerPoolSelection.current().isMaterializedMaintenance()) {
+            System.err.println("Error: SSH proxying is unavailable during materialized cleanup.");
+            return CommandResult.valueOf(1);
+        }
         var incus = dev.incusspawn.RuntimeServices.incus();
 
         if (!checkInstanceRunning(incus) || !checkOwnership(incus)) {

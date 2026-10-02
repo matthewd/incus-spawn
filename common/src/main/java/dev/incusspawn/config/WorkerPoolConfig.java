@@ -20,7 +20,8 @@ import java.util.regex.Pattern;
  * Strict configuration for one named worker pool.
  *
  * <p>Export roots are typed by access mode so runtime/reference data cannot accidentally be
- * attached read-write while the workspace remains the single read-write export.
+ * attached read-write. Static YAML has one writable workspace; a validated materialized
+ * descriptor may additionally carry one writable direct root.
  */
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = false)
@@ -112,10 +113,64 @@ public final class WorkerPoolConfig {
             String swap,
             ReadOnlyExport runtimeRoot,
             ReadWriteExport workspaceRoot,
-            Map<String, ReadOnlyExport> referenceRoots) {
+            Map<String, ReadOnlyExport> referenceRoots,
+            ReadWriteExport directRoot) {
         public Selected {
             referenceRoots = Map.copyOf(referenceRoots);
         }
+
+        /** Static named pools have no direct export. */
+        public Selected(
+                int cpus,
+                int memoryMib,
+                String swap,
+                ReadOnlyExport runtimeRoot,
+                ReadWriteExport workspaceRoot,
+                Map<String, ReadOnlyExport> referenceRoots) {
+            this(cpus, memoryMib, swap, runtimeRoot, workspaceRoot, referenceRoots, null);
+        }
+    }
+
+    /**
+     * Validate the frozen configuration of a materialized pool. Direct-root is intentionally not
+     * part of the global YAML schema, so a static named pool cannot acquire this export by typo or
+     * configuration drift.
+     */
+    public static Selected validateMaterialized(
+            String poolName,
+            int cpus,
+            int memoryMib,
+            String swap,
+            String runtimeRoot,
+            String workspaceRoot,
+            Map<String, String> referenceRoots,
+            String directRoot,
+            Path home) {
+        var candidate = new WorkerPoolConfig();
+        candidate.setCpus(cpus);
+        candidate.setMemoryMib(memoryMib);
+        candidate.setSwap(swap);
+        candidate.setRuntimeRoot(new ReadOnlyExport(runtimeRoot));
+        candidate.setWorkspaceRoot(new ReadWriteExport(workspaceRoot));
+        var references = new LinkedHashMap<String, ReadOnlyExport>();
+        if (referenceRoots != null) {
+            referenceRoots.forEach((name, path) -> references.put(name, new ReadOnlyExport(path)));
+        }
+        candidate.setReferenceRoots(references);
+        var base = candidate.validateAndFreeze(poolName, home);
+        if (directRoot == null || directRoot.isBlank()) {
+            throw invalid(poolName, "direct-root", "path is required");
+        }
+
+        var roots = new ArrayList<NamedRoot>();
+        roots.add(validateRoot(poolName, "runtime-root", base.runtimeRoot().path(), home));
+        roots.add(validateRoot(poolName, "workspace-root", base.workspaceRoot().path(), home));
+        base.referenceRoots().forEach((name, export) -> roots.add(validateRoot(
+                poolName, "reference-roots." + name, export.path(), home)));
+        roots.add(validateRoot(poolName, "direct-root", directRoot, home));
+        rejectOverlaps(poolName, roots);
+        return new Selected(base.cpus(), base.memoryMib(), base.swap(), base.runtimeRoot(),
+                base.workspaceRoot(), base.referenceRoots(), new ReadWriteExport(directRoot));
     }
 
     public Selected validateAndFreeze(String poolName, Path home) {

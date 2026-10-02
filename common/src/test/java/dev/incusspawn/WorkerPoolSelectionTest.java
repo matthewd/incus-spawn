@@ -16,14 +16,21 @@ class WorkerPoolSelectionTest {
     @TempDir Path tempDir;
 
     @Test
-    void unsetSelectionPreservesEveryLegacyStateRoot() {
+    void unsetSelectionPreservesLegacyVmStateAndUsesStableLifecycleLocks() {
         var legacy = WorkerPoolSelection.legacy();
         var globalState = tempDir.resolve(".local/state/incus-spawn");
-        var legacyLocks = tempDir.resolve(".cache/incus-spawn/locks");
+        var lifecycleLocks = tempDir.resolve(".local/state/incus-spawn-locks");
 
         assertTrue(legacy.isLegacy());
+        var applianceKernel = tempDir.resolve("appliance/vmlinuz");
         assertEquals(globalState, legacy.vmStateDir(globalState));
-        assertEquals(legacyLocks, legacy.instanceLockDir(globalState, legacyLocks));
+        assertEquals(applianceKernel, legacy.vmKernelImage(globalState, applianceKernel));
+        assertEquals(globalState.resolve("vm.incus.sock"), legacy.vmVsockSocket(globalState));
+        assertEquals(globalState.resolve("vm.agent.sock"), legacy.vmAgentSocket(globalState));
+        assertEquals(lifecycleLocks.resolve("legacy/instances"),
+                legacy.instanceLockDir(lifecycleLocks));
+        assertEquals(lifecycleLocks.resolve("legacy/vm.lock"),
+                legacy.vmLockFile(lifecycleLocks));
 
         // The public accessors retain the historical locations when ISX_POOL is unset.
         if (System.getenv(WorkerPoolSelection.ENVIRONMENT_VARIABLE) == null) {
@@ -40,7 +47,10 @@ class WorkerPoolSelectionTest {
                 assertEquals(globalState.resolve("data.img"), Environment.vmDataImage());
                 assertEquals(globalState.resolve("swap.img"), Environment.vmSwapImage());
                 assertEquals(globalState.resolve("incus-spawn-vm.app"), Environment.vfkitAppBundle());
-                assertEquals(legacyLocks, Environment.lockDir());
+                assertEquals(lifecycleLocks.resolve("legacy/instances"), Environment.lockDir());
+                assertEquals(lifecycleLocks.resolve("legacy/vm.lock"), Environment.vmLockFile());
+                assertEquals(lifecycleLocks.resolve("pool-management.lock"),
+                        Environment.poolManagementLockFile());
                 assertEquals(globalState.resolve("proxy.log"), Environment.proxyLogFile());
                 assertEquals(globalState.resolve("proxy-service.log"), Environment.proxyServiceLogFile());
                 assertEquals(globalState.resolve("proxy-gateway-ip"), Environment.proxyGatewayFile());
@@ -65,21 +75,27 @@ class WorkerPoolSelectionTest {
                 """);
         var selected = WorkerPoolSelection.select("compile", config);
         var globalState = tempDir.resolve(".local/state/incus-spawn");
-        var legacyLocks = tempDir.resolve(".cache/incus-spawn/locks");
+        var lifecycleLocks = tempDir.resolve(".local/state/incus-spawn-locks");
         var poolState = globalState.resolve("pools/compile");
 
         assertFalse(selected.isLegacy());
         assertEquals("compile", selected.name().orElseThrow());
         assertEquals(poolState, selected.vmStateDir(globalState));
-        assertEquals(poolState.resolve("locks"),
-                selected.instanceLockDir(globalState, legacyLocks));
+        assertEquals(tempDir.resolve("appliance/vmlinuz"), selected.vmKernelImage(
+                globalState, tempDir.resolve("appliance/vmlinuz")),
+                "static pools must retain the shared appliance kernel");
+        assertEquals(lifecycleLocks.resolve("static-compile/instances"),
+                selected.instanceLockDir(lifecycleLocks));
+        assertEquals(lifecycleLocks.resolve("static-compile/vm.lock"),
+                selected.vmLockFile(lifecycleLocks));
+        assertFalse(selected.vmLockFile(lifecycleLocks).startsWith(poolState));
 
         // Every VM-owned path is relative to vmStateDir(), so the files cannot collide with the
         // legacy VM or a sibling named pool. Global config, caches and proxy paths do not use it.
         assertEquals(poolState.resolve("vm.pid"), selected.vmStateDir(globalState).resolve("vm.pid"));
         assertEquals(poolState.resolve("disk.img"), selected.vmStateDir(globalState).resolve("disk.img"));
-        assertEquals(poolState.resolve("vm.incus.sock"),
-                selected.vmStateDir(globalState).resolve("vm.incus.sock"));
+        assertEquals(poolState.resolve("vm.incus.sock"), selected.vmVsockSocket(globalState));
+        assertEquals(poolState.resolve("vm.agent.sock"), selected.vmAgentSocket(globalState));
         assertEquals(poolState.resolve("incus-spawn-vm.app"),
                 selected.vmStateDir(globalState).resolve("incus-spawn-vm.app"));
     }

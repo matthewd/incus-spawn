@@ -6,6 +6,7 @@ import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.incus.ResourceLimits;
 import dev.incusspawn.tool.DownloadCache;
+import dev.incusspawn.util.BoundedFileLock;
 import dev.incusspawn.util.BuildOutput;
 import dev.incusspawn.util.CpuInfo;
 import dev.incusspawn.Platform;
@@ -18,9 +19,9 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -32,6 +33,7 @@ import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntPredicate;
 import java.util.function.IntSupplier;
+import java.util.function.LongPredicate;
 import java.util.function.Supplier;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -45,6 +47,8 @@ public final class VmManager {
     private VmManager() {}
 
     public enum Backend { VFKIT, QEMU }
+
+    public enum DirectMaintenanceStart { READY, NORMAL_RUNNING, FAILED }
 
     /** Where forwarder streams are leaking, inferred from host vs in-guest connection counts. */
     public enum LeakLayer {
@@ -111,6 +115,7 @@ public final class VmManager {
     private static final int GA_VSOCK_PORT = 1024;
     private static final int AGENT_VSOCK_PORT = 1025;
     private static final int INCUS_VSOCK_PORT = 8443;
+    private static final int MACOS_UNIX_SOCKET_PATH_MAX_BYTES = 103;
 
     private static final String LATEST_KNOWN_RELEASE = "0.2.2";
     private static volatile String resolvedApplianceVersion;
@@ -291,69 +296,113 @@ public final class VmManager {
 
     // --- VM lifecycle lock ---
 
-    private static class VmLockHolder implements AutoCloseable {
-        private final FileChannel channel;
-        private final FileLock lock;
-        VmLockHolder(FileChannel channel, FileLock lock) {
-            this.channel = channel;
-            this.lock = lock;
-        }
-        @Override public void close() {
-            try { lock.release(); } catch (IOException ignored) {}
-            try { channel.close(); } catch (IOException ignored) {}
-        }
+    @FunctionalInterface
+    public interface LifecycleOperation<T, E extends Exception> {
+        T run() throws E;
     }
 
-    private static final int VM_LOCK_TIMEOUT_SECONDS = 30;
+    private static final ThreadLocal<Integer> VM_LOCK_DEPTH =
+            ThreadLocal.withInitial(() -> 0);
+    private static final long MAX_PID_FILE_BYTES = 32;
 
-    private static VmLockHolder acquireVmLock() {
-        try {
-            Files.createDirectories(Environment.vmStateDir());
-            var path = Environment.vmStateDir().resolve("vm.lock");
-            var channel = FileChannel.open(path,
-                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-            var lock = channel.tryLock();
-            if (lock != null) return new VmLockHolder(channel, lock);
-
-            System.err.println("Another isx process is managing the VM — waiting...");
-            long deadline = System.nanoTime() + VM_LOCK_TIMEOUT_SECONDS * 1_000_000_000L;
-            while (System.nanoTime() < deadline) {
-                try { Thread.sleep(500); } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-                lock = channel.tryLock();
-                if (lock != null) return new VmLockHolder(channel, lock);
+    /**
+     * Run one complete VM-state transaction under the process-external lifecycle lock. Nested
+     * calls on the owning thread reuse the lock so command-level transactions can call start/stop.
+     */
+    public static <T, E extends Exception> T withLifecycleLock(
+            LifecycleOperation<T, E> operation) throws E {
+        var depth = VM_LOCK_DEPTH.get();
+        if (depth > 0) {
+            VM_LOCK_DEPTH.set(depth + 1);
+            try {
+                return operation.run();
+            } finally {
+                VM_LOCK_DEPTH.set(depth);
             }
-            channel.close();
-            throw new VmException("Timed out waiting for another isx process to finish managing the VM.");
+        }
+
+        final BoundedFileLock managementLock;
+        final BoundedFileLock vmLock;
+        try {
+            managementLock = BoundedFileLock.acquire(
+                    Environment.poolManagementLockFile(), Duration.ofSeconds(30),
+                    "Another isx process is managing worker-pool state — waiting...",
+                    "Timed out waiting for another isx process to finish managing worker-pool state.");
+            try {
+                vmLock = BoundedFileLock.acquire(Environment.vmLockFile(), Duration.ofSeconds(30),
+                        "Another isx process is managing the VM — waiting...",
+                        "Timed out waiting for another isx process to finish managing the VM.");
+            } catch (IOException | RuntimeException e) {
+                managementLock.close();
+                throw e;
+            }
         } catch (IOException e) {
             throw new VmException("Failed to acquire VM lock: " + e.getMessage());
+        }
+        VM_LOCK_DEPTH.set(1);
+        try (managementLock; vmLock) {
+            return operation.run();
+        } finally {
+            VM_LOCK_DEPTH.remove();
         }
     }
 
     // --- Process lifecycle ---
 
     public static boolean isRunning() {
-        var pidFile = Environment.vmPidFile();
-        if (!Files.exists(pidFile)) return false;
+        return pidFileMatches(Environment.vmPidFile(), VmManager::isVmProcessRunning);
+    }
+
+    /** True if the legacy VM or any static/materialized worker-pool VM is running. */
+    public static boolean anyVmRunning() {
+        return anyVmRunning(Environment.stateDir(), VmManager::isVmProcessRunning);
+    }
+
+    static boolean anyVmRunning(Path globalStateDir, LongPredicate runningPid) {
+        if (pidFileMatches(globalStateDir.resolve("vm.pid"), runningPid)) return true;
         try {
-            long pid = Long.parseLong(Files.readString(pidFile).strip());
-            var handle = ProcessHandle.of(pid);
-            if (handle.isEmpty() || !handle.get().isAlive()) {
-                cleanupStaleFiles();
-                return false;
+            if (childVmRunning(globalStateDir.resolve("pools"), runningPid)) return true;
+            return childVmRunning(globalStateDir.resolve("direct-pools/pools"), runningPid);
+        } catch (IOException e) {
+            throw new VmException("Could not inspect worker-pool VM state: " + e.getMessage());
+        }
+    }
+
+    private static boolean childVmRunning(Path parent, LongPredicate runningPid)
+            throws IOException {
+        if (!Files.isDirectory(parent, LinkOption.NOFOLLOW_LINKS)) return false;
+        try (var children = Files.list(parent)) {
+            var iterator = children.iterator();
+            while (iterator.hasNext()) {
+                var child = iterator.next();
+                if (Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS)
+                        && pidFileMatches(child.resolve("vm.pid"), runningPid)) {
+                    return true;
+                }
             }
-            var cmd = handle.get().info().command().orElse("");
-            if (!cmd.contains("vfkit") && !cmd.contains("qemu")) {
-                cleanupStaleFiles();
-                return false;
-            }
-            return true;
+        }
+        return false;
+    }
+
+    private static boolean pidFileMatches(Path pidFile, LongPredicate runningPid) {
+        if (!Files.isRegularFile(pidFile, LinkOption.NOFOLLOW_LINKS)) return false;
+        try {
+            var size = Files.size(pidFile);
+            if (size == 0 || size > MAX_PID_FILE_BYTES) return false;
+            var contents = Files.readString(pidFile);
+            if (contents.length() > MAX_PID_FILE_BYTES) return false;
+            return runningPid.test(Long.parseLong(contents.strip()));
         } catch (IOException | NumberFormatException e) {
-            cleanupStaleFiles();
             return false;
         }
+    }
+
+    private static boolean isVmProcessRunning(long pid) {
+        var handle = ProcessHandle.of(pid);
+        if (handle.isEmpty() || !handle.get().isAlive()) return false;
+        var info = handle.get().info();
+        var command = info.commandLine().orElseGet(() -> info.command().orElse(""));
+        return command.contains("vfkit") || command.contains("qemu");
     }
 
     static long readPid() {
@@ -365,8 +414,45 @@ public final class VmManager {
     }
 
     public static boolean start() {
-        try (var ignored = acquireVmLock()) {
-            return startLocked();
+        if (WorkerPoolSelection.current().isMaterializedMaintenance()) {
+            System.err.println("Error: a maintenance selection requires --without-direct.");
+            return false;
+        }
+        return start(true);
+    }
+
+    public static DirectMaintenanceStart startWithoutDirectExport() {
+        if (!WorkerPoolSelection.current().isMaterializedMaintenance()) {
+            System.err.println("Error: --without-direct requires a materialized maintenance selection.");
+            return DirectMaintenanceStart.FAILED;
+        }
+        try {
+            return withLifecycleLock(() -> {
+                if (isRunning()) {
+                    if (frozenExportPlanMatches(false)) {
+                        BuildOutput.note("VM already running without its Direct export (pid="
+                                + readPid() + ").");
+                        return DirectMaintenanceStart.READY;
+                    }
+                    if (frozenExportPlanMatches(true)) {
+                        BuildOutput.note("VM already running with its normal Direct export (pid="
+                                + readPid() + ").");
+                        return DirectMaintenanceStart.NORMAL_RUNNING;
+                    }
+                    throw new VmException("running materialized VM has an unknown export plan");
+                }
+                return startLocked(false)
+                        ? DirectMaintenanceStart.READY : DirectMaintenanceStart.FAILED;
+            });
+        } catch (VmException e) {
+            System.err.println("Error: " + e.getMessage());
+            return DirectMaintenanceStart.FAILED;
+        }
+    }
+
+    private static boolean start(boolean includeDirectRoot) {
+        try {
+            return withLifecycleLock(() -> startLocked(includeDirectRoot));
         } catch (VmException e) {
             System.err.println("Error: " + e.getMessage());
             return false;
@@ -374,13 +460,21 @@ public final class VmManager {
     }
 
     private static boolean startLocked() {
+        return startLocked(true);
+    }
+
+    private static boolean startLocked(boolean includeDirectRoot) {
+        if (includeDirectRoot && WorkerPoolSelection.current().isMaterializedMaintenance()) {
+            throw new VmException("materialized maintenance cannot launch the Direct export");
+        }
         if (isRunning()) {
-            requireRunningExportPlanCurrent();
+            requireRunningExportPlanCurrent(includeDirectRoot);
             BuildOutput.note("VM already running (pid=" + readPid() + ").");
             return true;
         }
+        cleanupStaleFiles();
         try {
-            checkArtifacts();
+            checkArtifacts(includeDirectRoot);
             ensureDisk();
             ensureDataDisk();
             ensureSwap();
@@ -392,7 +486,8 @@ public final class VmManager {
         var backend = detectBackend();
         int cpus = detectCpus();
         int memoryMiB = detectMemoryMiB();
-        VmHostExports hostExports = backend == Backend.VFKIT ? selectedHostExports() : null;
+        VmHostExports hostExports = backend == Backend.VFKIT
+                ? selectedHostExports(includeDirectRoot) : null;
 
         if (backend == Backend.VFKIT && !Files.exists(Environment.vmLogFile())) {
             System.out.println();
@@ -427,24 +522,31 @@ public final class VmManager {
      * Restart the VM, applying any pending appliance disk update via {@link #ensureDisk()}.
      */
     public static boolean restart() {
-        try (var ignored = acquireVmLock()) {
-            if (!isRunning()) {
-                BuildOutput.note("VM not running — starting.");
-            } else {
-                stopLocked();
-            }
-            return startLocked();
+        try {
+            return withLifecycleLock(() -> {
+                if (!isRunning()) {
+                    BuildOutput.note("VM not running — starting.");
+                } else {
+                    stopLocked();
+                }
+                return startLocked();
+            });
         } catch (VmException e) {
             System.err.println("Error: " + e.getMessage());
             return false;
         }
     }
 
-    public static void stop() {
-        try (var ignored = acquireVmLock()) {
-            stopLocked();
+    public static boolean stop() {
+        try {
+            withLifecycleLock(() -> {
+                stopLocked();
+                return null;
+            });
+            return true;
         } catch (VmException e) {
             System.err.println("Error: " + e.getMessage());
+            return false;
         }
     }
 
@@ -549,10 +651,14 @@ public final class VmManager {
             var running = runningApplianceVersion();
             if (running != null) {
                 sb.append("\n  Appliance: ").append(running);
-                var installed = applianceVersion();
-                if (!running.equals(installed)) {
-                    sb.append("  (installed: ").append(installed)
-                            .append(" — restart to apply)");
+                if (selection.isMaterialized()) {
+                    sb.append("  (sealed)");
+                } else {
+                    var installed = applianceVersion();
+                    if (!running.equals(installed)) {
+                        sb.append("  (installed: ").append(installed)
+                                .append(" — restart to apply)");
+                    }
                 }
             }
             int vsockConns = vsockForwarderConnectionCount();
@@ -564,7 +670,6 @@ public final class VmManager {
             }
             return sb.toString();
         }
-        cleanupStaleFiles();
         var sb = new StringBuilder("VM not running");
         appendPoolStatus(sb, selection);
         if (Files.exists(Environment.vmLaunchLogFile())) {
@@ -720,8 +825,8 @@ public final class VmManager {
      * restart cannot race between the isRunning() check and the start attempt.
      */
     public static boolean ensureRunning() {
-        try (var ignored = acquireVmLock()) {
-            return ensureRunningLocked();
+        try {
+            return withLifecycleLock(VmManager::ensureRunningLocked);
         } catch (VmException e) {
             System.err.println("Error: " + e.getMessage());
             return false;
@@ -730,7 +835,7 @@ public final class VmManager {
 
     private static boolean ensureRunningLocked() {
         if (isRunning()) {
-            requireRunningExportPlanCurrent();
+            requireRunningExportPlanCurrent(true);
             if (IncusClient.isReachable()) {
                 warnIfApplianceStale();
                 return true;
@@ -739,9 +844,10 @@ public final class VmManager {
             return recoverReachability();
         }
 
-        if (!Files.exists(Environment.applianceKernel())
+        if (!WorkerPoolSelection.current().isMaterialized()
+                && (!Files.exists(Environment.applianceKernel())
                 || (!Files.exists(Environment.applianceDiskImage())
-                    && !Files.exists(Environment.vmDiskImage()))) {
+                    && !Files.exists(Environment.vmDiskImage())))) {
             System.err.println("Downloading VM appliance artifacts...");
             try {
                 downloadArtifacts();
@@ -783,6 +889,7 @@ public final class VmManager {
     }
 
     private static void warnIfApplianceStale() {
+        if (WorkerPoolSelection.current().isMaterialized()) return;
         try {
             var running = runningApplianceVersion();
             if (running == null) return;
@@ -806,33 +913,67 @@ public final class VmManager {
     // --- Internal: vfkit ---
 
     private static VmHostExports selectedHostExports() {
+        return selectedHostExports(true);
+    }
+
+    private static VmHostExports selectedHostExports(boolean includeDirectRoot) {
         var selection = WorkerPoolSelection.current();
         if (selection.isLegacy()) return null;
         try {
+            var pool = selection.isMaterialized() && !includeDirectRoot
+                    ? selection.poolWithoutDirectRoot()
+                    : selection.pool().orElseThrow();
             return VmHostExports.create(selection.name().orElseThrow(),
-                    selection.pool().orElseThrow(), Environment.home());
+                    pool, Environment.home());
         } catch (IllegalStateException e) {
             throw new VmException("Invalid worker-pool host exports: " + e.getMessage());
         }
     }
 
-    /** Enforce the named export generation before any Incus API operation. */
+    /** Enforce the exact normal plan, or either exact plan for delete-only maintenance. */
     public static void requireExportPlanCurrentIfRunning() {
         if (!Platform.isMacOS() || WorkerPoolSelection.current().isLegacy() || !isRunning()) return;
         requireRunningExportPlanCurrent();
     }
 
     private static void requireRunningExportPlanCurrent() {
+        var selection = WorkerPoolSelection.current();
+        if (!selection.isMaterializedMaintenance()) {
+            requireRunningExportPlanCurrent(true);
+            return;
+        }
+
+        if (!frozenExportPlanMatches(true) && !frozenExportPlanMatches(false)) {
+            throw new VmException("running materialized VM has an unknown export plan");
+        }
+    }
+
+    private static boolean frozenExportPlanMatches(boolean includeDirectRoot) {
+        var selection = WorkerPoolSelection.current();
+        var pool = includeDirectRoot
+                ? selection.pool().orElseThrow()
+                : selection.poolWithoutDirectRoot();
+        try {
+            VmHostExports.createFrozen(selection.name().orElseThrow(), pool)
+                    .requirePersistedFingerprint(Environment.vmExportPlanFingerprint());
+            return true;
+        } catch (IllegalStateException e) {
+            return false;
+        }
+    }
+
+    private static void requireRunningExportPlanCurrent(boolean includeDirectRoot) {
         if (!Platform.isMacOS() || WorkerPoolSelection.current().isLegacy()) return;
         try {
-            selectedHostExports().requirePersistedFingerprint(Environment.vmExportPlanFingerprint());
+            selectedHostExports(includeDirectRoot).requirePersistedFingerprint(
+                    Environment.vmExportPlanFingerprint());
         } catch (IllegalStateException e) {
             throw new VmException(e.getMessage());
         } catch (VmException e) {
             var name = WorkerPoolSelection.current().name().orElseThrow();
             throw new VmException("Cannot resolve the exports configured for running worker pool '"
                     + name + "': " + e.getMessage() + " Fix the configuration, then run "
-                    + "'ISX_POOL=" + name + " isx vm restart'.");
+                    + "'isx vm restart' under the same worker-pool selection.");
         }
     }
 
@@ -911,7 +1052,7 @@ public final class VmManager {
         ensureDummyInitrd();
 
         var vfkitBin = ensureVfkitAppBundle();
-        var cmd = vfkitCommand(vfkitBin, cpus, memoryMiB, restPort, hostExports,
+        var cmd = vfkitCommand(vfkitBin, bootKernel(), cpus, memoryMiB, restPort, hostExports,
                 System.currentTimeMillis() / 1000);
 
         var launchLog = Environment.vmLaunchLogFile();
@@ -960,18 +1101,19 @@ public final class VmManager {
     /** Build the complete vfkit argv without requiring macOS, for launch-policy unit tests. */
     static List<String> vfkitCommand(
             String vfkitBin,
+            Path kernel,
             int cpus,
             int memoryMiB,
             int restPort,
             VmHostExports hostExports,
             long epochSeconds) {
-        validateVfkitDevicePaths(hostExports);
+        validateVfkitDevicePaths(kernel, hostExports);
 
         var cmd = new ArrayList<>(List.of(
                 vfkitBin,
                 "--cpus", String.valueOf(cpus),
                 "--memory", String.valueOf(memoryMiB),
-                "--kernel", Environment.applianceKernel().toString(),
+                "--kernel", kernel.toString(),
                 "--initrd", Environment.vmDummyInitrd().toString(),
                 "--kernel-cmdline", kernelCmdline("hvc0", hostExports, epochSeconds),
                 "--device", "virtio-blk,path=" + Environment.vmDiskImage(),
@@ -1002,18 +1144,29 @@ public final class VmManager {
         return List.copyOf(cmd);
     }
 
-    private static void validateVfkitDevicePaths(VmHostExports hostExports) {
+    private static void validateVfkitDevicePaths(Path kernel, VmHostExports hostExports) {
+        VmHostExports.requireVfkitSafePath(kernel.toString());
+        VmHostExports.requireVfkitSafePath(Environment.vmDummyInitrd().toString());
         VmHostExports.requireVfkitSafePath(Environment.vmDiskImage().toString());
         VmHostExports.requireVfkitSafePath(Environment.vmSwapImage().toString());
         VmHostExports.requireVfkitSafePath(Environment.vmDataImage().toString());
         VmHostExports.requireVfkitSafePath(Environment.vmLogFile().toString());
-        VmHostExports.requireVfkitSafePath(Environment.vmVsockSocket().toString());
-        VmHostExports.requireVfkitSafePath(Environment.vmAgentSocket().toString());
+        requireMacOsUnixSocketPath(Environment.vmVsockSocket());
+        requireMacOsUnixSocketPath(Environment.vmAgentSocket());
         if (hostExports == null) {
             VmHostExports.requireVfkitSafePath(System.getProperty("user.home"));
         } else {
             hostExports.exports().forEach(export ->
                     VmHostExports.requireVfkitSafePath(export.hostPath().toString()));
+        }
+    }
+
+    static void requireMacOsUnixSocketPath(Path path) {
+        VmHostExports.requireVfkitSafePath(path.toString());
+        if (path.toString().getBytes(StandardCharsets.UTF_8).length
+                > MACOS_UNIX_SOCKET_PATH_MAX_BYTES) {
+            throw new IllegalStateException("vfkit Unix socket path exceeds the macOS "
+                    + MACOS_UNIX_SOCKET_PATH_MAX_BYTES + "-byte limit: " + path);
         }
     }
 
@@ -1054,7 +1207,7 @@ public final class VmManager {
                 "-nographic",
                 "-nodefaults",
                 "-serial", "stdio",
-                "-kernel", Environment.applianceKernel().toString(),
+                "-kernel", bootKernel().toString(),
                 "-drive", "id=root,file=" + Environment.vmDiskImage() + ",format=raw,if=virtio",
                 "-drive", "id=swap,file=" + Environment.vmSwapImage() + ",format=raw,if=virtio",
                 "-drive", "id=data,file=" + Environment.vmDataImage() + ",format=raw,if=virtio",
@@ -1076,6 +1229,21 @@ public final class VmManager {
     // --- Internal: disk management ---
 
     static void checkArtifacts() {
+        checkArtifacts(true);
+    }
+
+    private static void checkArtifacts(boolean includeDirectRoot) {
+        var selection = WorkerPoolSelection.current();
+        if (selection.isMaterialized()) {
+            try {
+                selection.validateMaterializedForLaunch(
+                        Environment.stateDir(), Environment.home(), includeDirectRoot);
+            } catch (IllegalStateException e) {
+                throw new VmException("Materialized pool state failed launch validation at "
+                        + Environment.vmStateDir() + ": " + e.getMessage());
+            }
+            return;
+        }
         if (!Files.exists(Environment.applianceKernel())) {
             throw new VmException(Environment.applianceKernel() + " not found.\n"
                     + "Run 'isx init' to download appliance artifacts, or set ISX_APPLIANCE_DIR.");
@@ -1101,7 +1269,15 @@ public final class VmManager {
         }
     }
 
+    private static Path bootKernel() {
+        return WorkerPoolSelection.current().vmKernelImage(
+                Environment.stateDir(), Environment.applianceKernel());
+    }
+
     static void ensureDisk() {
+        // A materialized pool is pinned to the sealed seed generation. Appliance upgrades must not
+        // silently replace its cloned root disk.
+        if (WorkerPoolSelection.current().isMaterialized()) return;
         var currentVersion = applianceVersion();
         var versionFile = Environment.vmDiskVersion();
         var tmp = Environment.vmDiskImage().resolveSibling("disk.img.tmp");
@@ -1183,6 +1359,9 @@ public final class VmManager {
     static void ensureDataDisk() {
         var dataImage = Environment.vmDataImage();
         if (Files.exists(dataImage)) return;
+        if (WorkerPoolSelection.current().isMaterialized()) {
+            throw new VmException("Materialized pool data disk is missing at " + dataImage);
+        }
 
         BuildOutput.stepStart("Creating data disk (" + diskSize() + " sparse)...");
         try {
@@ -1225,6 +1404,10 @@ public final class VmManager {
      * @return the new size in bytes
      */
     public static long resizeDataDisk(String newSize) {
+        return withLifecycleLock(() -> resizeDataDiskLocked(newSize));
+    }
+
+    private static long resizeDataDiskLocked(String newSize) {
         var dataImage = Environment.vmDataImage();
         if (!Files.exists(dataImage)) {
             throw new VmException("No data disk found at " + dataImage
@@ -1255,6 +1438,9 @@ public final class VmManager {
     static void ensureSwap() {
         var swapImage = Environment.vmSwapImage();
         if (Files.exists(swapImage)) return;
+        if (WorkerPoolSelection.current().isMaterialized()) {
+            throw new VmException("Materialized pool swap image is missing at " + swapImage);
+        }
 
         try {
             Files.createDirectories(Environment.vmStateDir());
@@ -1369,6 +1555,9 @@ public final class VmManager {
         if (hostExports != null) {
             cmdline += " isx.host_exports=named isx.reference_names="
                     + String.join(",", hostExports.referenceNames());
+            if (hostExports.direct().isPresent()) {
+                cmdline += " isx.direct_root=1";
+            }
         }
         return cmdline;
     }

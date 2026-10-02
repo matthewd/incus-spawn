@@ -2,6 +2,7 @@ package dev.incusspawn.ssh;
 
 import dev.incusspawn.Environment;
 import dev.incusspawn.config.SpawnConfig;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.util.BuildOutput;
 
 import java.io.IOException;
@@ -204,12 +205,14 @@ public final class SshKeyManager {
             var blocks = parseWithoutHostBlocks(content, instanceName);
 
             var isxPath = resolveIsxPath();
-            var pool = System.getenv("ISX_POOL");
-            var proxyCommand = (pool == null || pool.isBlank()
-                    ? ""
-                    : "env ISX_POOL=" + shellQuote(pool) + " ")
-                    + shellQuote(isxPath) + " ssh-proxy " + shellQuote(instanceName)
-                    + (automationKey == null ? "" : " --key " + shellQuote(automationKey));
+            var pool = System.getenv(WorkerPoolSelection.ENVIRONMENT_VARIABLE);
+            var materializedPool = System.getenv(
+                    WorkerPoolSelection.MATERIALIZED_ENVIRONMENT_VARIABLE);
+            var materializedIdentity = System.getenv(
+                    WorkerPoolSelection.MATERIALIZED_IDENTITY_ENVIRONMENT_VARIABLE);
+            var proxyCommand = proxyCommand(
+                    isxPath, instanceName, automationKey,
+                    pool, materializedPool, materializedIdentity);
 
             blocks.add("");
             blocks.add("Host " + instanceName);
@@ -232,6 +235,35 @@ public final class SshKeyManager {
             System.err.println("  Warning: failed to update SSH config: " + e.getMessage());
             return false;
         }
+    }
+
+    static String proxyCommand(
+            String isxPath,
+            String instanceName,
+            String automationKey,
+            String pool,
+            String materializedPool,
+            String materializedIdentity) {
+        var environment = new ArrayList<>(List.of(
+                "-u " + WorkerPoolSelection.ENVIRONMENT_VARIABLE,
+                "-u " + WorkerPoolSelection.MATERIALIZED_ENVIRONMENT_VARIABLE,
+                "-u " + WorkerPoolSelection.MATERIALIZED_IDENTITY_ENVIRONMENT_VARIABLE,
+                "-u " + WorkerPoolSelection.MATERIALIZED_MAINTENANCE_ENVIRONMENT_VARIABLE));
+        if (pool != null && !pool.isBlank()) {
+            environment.add(WorkerPoolSelection.ENVIRONMENT_VARIABLE
+                    + "=" + shellQuote(pool));
+        }
+        if (materializedPool != null && !materializedPool.isBlank()) {
+            environment.add(WorkerPoolSelection.MATERIALIZED_ENVIRONMENT_VARIABLE
+                    + "=" + shellQuote(materializedPool));
+        }
+        if (materializedIdentity != null && !materializedIdentity.isBlank()) {
+            environment.add(WorkerPoolSelection.MATERIALIZED_IDENTITY_ENVIRONMENT_VARIABLE
+                    + "=" + shellQuote(materializedIdentity));
+        }
+        return "env " + String.join(" ", environment) + " "
+                + shellQuote(isxPath) + " ssh-proxy " + shellQuote(instanceName)
+                + (automationKey == null ? "" : " --key " + shellQuote(automationKey));
     }
 
     /**

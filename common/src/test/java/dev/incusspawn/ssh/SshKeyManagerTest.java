@@ -94,6 +94,30 @@ class SshKeyManagerTest {
     }
 
     @Test
+    void proxyCommandsClearForeignPoolSelectorsBeforePinningTheirOwn() {
+        var staticCommand = SshKeyManager.proxyCommand(
+                "/opt/isx", "static-instance", null,
+                "compile", null, null);
+        assertTrue(staticCommand.startsWith(
+                "env -u ISX_POOL -u ISX_MATERIALIZED_POOL "
+                        + "-u ISX_MATERIALIZED_POOL_IDENTITY "
+                        + "-u ISX_MATERIALIZED_POOL_MAINTENANCE ISX_POOL='compile' "));
+        assertFalse(staticCommand.contains("ISX_MATERIALIZED_POOL='"));
+
+        var materializedCommand = SshKeyManager.proxyCommand(
+                "/opt/isx", "direct-instance", "thread/key",
+                null, "direct-one", "a".repeat(64));
+        assertTrue(materializedCommand.startsWith(
+                "env -u ISX_POOL -u ISX_MATERIALIZED_POOL "
+                        + "-u ISX_MATERIALIZED_POOL_IDENTITY "
+                        + "-u ISX_MATERIALIZED_POOL_MAINTENANCE "
+                        + "ISX_MATERIALIZED_POOL='direct-one' "
+                        + "ISX_MATERIALIZED_POOL_IDENTITY='" + "a".repeat(64) + "' "));
+        assertTrue(materializedCommand.endsWith(
+                "'/opt/isx' ssh-proxy 'direct-instance' --key 'thread/key'"));
+    }
+
+    @Test
     void addHostEntryWithHostname() {
         SshKeyManager.addHostEntry("test-instance", "10.0.0.42");
 

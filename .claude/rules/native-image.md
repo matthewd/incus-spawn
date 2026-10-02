@@ -21,7 +21,7 @@ every user's run then fails on a directory they cannot even stat.
 
 **Two classes may hold eagerly resolved host state, and both are on the flag:**
 
-- `RuntimeConstants` (`common`) — the immutable `ISX_POOL` selection, `DOWNLOAD_CACHE_DIR`,
+- `RuntimeConstants` (`common`) — the immutable static/materialized worker-pool selection, `DOWNLOAD_CACHE_DIR`,
   `SKILLS_CACHE_DIR`, and `CDI_TOOLS` (the Java tool setups, which hold a `DownloadCache`).
 - `RuntimeServices` (`cli`) — Incus client, background tasks, pool-aware lock manager, tool-def
   loader.

@@ -9,6 +9,7 @@ import dev.incusspawn.config.ImageDef;
 import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.incus.Metadata;
 import dev.incusspawn.tool.ToolDef;
+import dev.incusspawn.vm.VmHostExports;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -202,6 +203,52 @@ class IncusAutomationTransportTest {
                     () -> transport.inspectMount(request(AutomationTransport.MountAccess.READ_ONLY)));
             assertEquals("source_not_exported", error.code());
         }
+    }
+
+    @Test
+    void permitsOnlyExactDirectExportRootReadWrite() {
+        var incus = new FakeIncusClient();
+        var transport = new IncusAutomationTransport(incus,
+                (source, access) -> new VmHostExports.Translation(
+                        "/host/direct",
+                        access == AutomationTransport.MountAccess.READ_WRITE
+                                ? dev.incusspawn.config.WorkerPoolConfig.AccessMode.READ_WRITE
+                                : dev.incusspawn.config.WorkerPoolConfig.AccessMode.READ_ONLY,
+                        dev.incusspawn.config.WorkerPoolConfig.AccessMode.READ_WRITE,
+                        VmHostExports.ExportKind.DIRECT,
+                        true), true);
+
+        var writable = request(AutomationTransport.MountAccess.READ_WRITE);
+        transport.mount(writable);
+        assertEquals("/host/direct", incus.lastAdded.get("source"));
+        assertFalse(incus.lastAdded.containsKey("readonly"));
+
+        var readOnly = assertThrows(AutomationException.class,
+                () -> transport.inspectMount(request(AutomationTransport.MountAccess.READ_ONLY)));
+        assertEquals("source_not_exported", readOnly.code());
+
+        var unproven = new IncusAutomationTransport(new FakeIncusClient(),
+                (source, access) -> new VmHostExports.Translation(
+                        "/host/direct",
+                        dev.incusspawn.config.WorkerPoolConfig.AccessMode.READ_WRITE,
+                        dev.incusspawn.config.WorkerPoolConfig.AccessMode.READ_WRITE,
+                        VmHostExports.ExportKind.DIRECT,
+                        false), true);
+        var forged = assertThrows(AutomationException.class,
+                () -> unproven.inspectMount(writable));
+        assertEquals("source_not_exported", forged.code());
+    }
+
+    @Test
+    void legacyTranslationMayUseAnOrdinaryLeafNamedDirect() {
+        var incus = new FakeIncusClient();
+        var transport = new IncusAutomationTransport(incus,
+                (source, access) -> "/host/direct");
+
+        transport.mount(request(AutomationTransport.MountAccess.READ_ONLY));
+
+        assertEquals("/host/direct", incus.lastAdded.get("source"));
+        assertEquals("true", incus.lastAdded.get("readonly"));
     }
 
     @Test

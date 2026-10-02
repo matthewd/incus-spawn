@@ -9,6 +9,7 @@ import dev.incusspawn.config.HostResourceSetup;
 import dev.incusspawn.config.WorkerPoolConfig;
 import dev.incusspawn.incus.IncusClient;
 import dev.incusspawn.incus.Metadata;
+import dev.incusspawn.vm.VmHostExports;
 import dev.incusspawn.lifecycle.InstanceLifecycle;
 import dev.incusspawn.ssh.SshKeyManager;
 
@@ -32,14 +33,31 @@ public final class IncusAutomationTransport implements AutomationTransport {
         String translate(String source, MountAccess access);
     }
 
-    private final IncusClient incus;
-    private final SourceTranslator sourceTranslator;
-
-    public IncusAutomationTransport(IncusClient incus) {
-        this(incus, IncusAutomationTransport::translateSource);
+    @FunctionalInterface
+    interface DetailedSourceTranslator {
+        VmHostExports.Translation translate(String source, MountAccess access);
     }
 
+    private final IncusClient incus;
+    private final DetailedSourceTranslator sourceTranslator;
+
+    public IncusAutomationTransport(IncusClient incus) {
+        this(incus, IncusAutomationTransport::translateSource, true);
+    }
+
+    /** Compatibility seam for existing leaf-translation tests. */
     IncusAutomationTransport(IncusClient incus, SourceTranslator sourceTranslator) {
+        this(incus, (source, access) -> {
+            var requested = access == MountAccess.READ_ONLY
+                    ? WorkerPoolConfig.AccessMode.READ_ONLY
+                    : WorkerPoolConfig.AccessMode.READ_WRITE;
+            return new VmHostExports.Translation(
+                    sourceTranslator.translate(source, access), requested, requested);
+        }, true);
+    }
+
+    IncusAutomationTransport(
+            IncusClient incus, DetailedSourceTranslator sourceTranslator, boolean detailed) {
         this.incus = incus;
         this.sourceTranslator = sourceTranslator;
     }
@@ -204,8 +222,15 @@ public final class IncusAutomationTransport implements AutomationTransport {
     private PreparedMount prepare(MountRequest request) {
         final String translated;
         try {
-            translated = sourceTranslator.translate(request.source(), request.access());
-            if (isExportRoot(translated)) {
+            var translation = sourceTranslator.translate(request.source(), request.access());
+            translated = translation.appliancePath();
+            var exactWritableDirectRoot = translation.exactDirectRoot()
+                    && request.access() == MountAccess.READ_WRITE;
+            var protectedRoot = translation.exactExportRoot()
+                    || isProtectedExportRoot(translated)
+                    || (translation.exportKind() == VmHostExports.ExportKind.DIRECT
+                    && translated.equals(VmHostExports.DIRECT_GUEST_PATH.toString()));
+            if (protectedRoot && !exactWritableDirectRoot) {
                 throw new AutomationException("source_not_exported",
                         "source must be a leaf beneath a declared host export");
             }
@@ -236,24 +261,25 @@ public final class IncusAutomationTransport implements AutomationTransport {
         }
     }
 
-    private static boolean isExportRoot(String translated) {
+    private static boolean isProtectedExportRoot(String translated) {
         return translated.equals("/host/runtime")
                 || translated.equals("/host/workspace")
                 || translated.matches("^/host/references/[a-z][a-z0-9-]{0,21}$");
     }
 
-    private static String translateSource(String source, MountAccess access) {
+    private static VmHostExports.Translation translateSource(String source, MountAccess access) {
         var requested = access == MountAccess.READ_ONLY
                 ? WorkerPoolConfig.AccessMode.READ_ONLY
                 : WorkerPoolConfig.AccessMode.READ_WRITE;
         if (!Platform.isMacOS()) {
             try {
-                return Path.of(source).toRealPath().toString();
+                return new VmHostExports.Translation(Path.of(source).toRealPath().toString(),
+                        requested, requested);
             } catch (IOException e) {
                 throw new IllegalStateException("source must identify an existing physical path", e);
             }
         }
-        return HostResourceSetup.translateForVm(source, requested).appliancePath();
+        return HostResourceSetup.translateForVm(source, requested);
     }
 
     private static void requireState(MountRequest request, MountState actual,

@@ -3,8 +3,10 @@ package dev.incusspawn.command;
 import dev.incusspawn.RuntimeServices;
 import dev.incusspawn.automation.AutomationProtocol;
 import dev.incusspawn.automation.AutomationService;
+import dev.incusspawn.automation.AutomationService.AutomationException;
 import dev.incusspawn.automation.AutomationTransport;
 import dev.incusspawn.automation.IncusAutomationTransport;
+import dev.incusspawn.config.WorkerPoolSelection;
 import org.aesh.command.CommandDefinition;
 import org.aesh.command.CommandResult;
 import org.aesh.command.option.Option;
@@ -42,8 +44,21 @@ public class AutomationCommand extends BaseCommand {
         AutomationService.LifecycleResult run();
     }
 
+    static boolean operationAllowedInMaintenance(String operation) {
+        return "delete".equals(operation);
+    }
+
+    private static void requireOperationAllowed(String operation) {
+        if (WorkerPoolSelection.current().isMaterializedMaintenance()
+                && !operationAllowedInMaintenance(operation)) {
+            throw new AutomationException(
+                    "invalid_state", "materialized maintenance selection permits delete only");
+        }
+    }
+
     private static CommandResult lifecycle(String operation, LifecycleCall call) {
         try {
+            requireOperationAllowed(operation);
             System.out.println(AutomationProtocol.lifecycleLine(call.run()));
             return CommandResult.SUCCESS;
         } catch (Exception e) {
@@ -228,6 +243,7 @@ public class AutomationCommand extends BaseCommand {
             var shutdownHook = new Thread(cancellation::request, "isx-automation-exec-cancel");
             Runtime.getRuntime().addShutdownHook(shutdownHook);
             try {
+                requireOperationAllowed("exec");
                 var argv = AutomationProtocol.parseArgv(argvJson);
                 var environment = AutomationProtocol.parseEnvironment(environmentJson);
                 var outcome = service().exec(name, key, argv, environment, uid, gid, cwd,

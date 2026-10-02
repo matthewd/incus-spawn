@@ -2,6 +2,7 @@ package dev.incusspawn.command;
 
 import dev.incusspawn.Environment;
 import dev.incusspawn.RuntimeServices;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.util.BuildOutput;
 import dev.incusspawn.vm.VmManager;
 import org.aesh.command.CommandDefinition;
@@ -55,9 +56,23 @@ public class VmCommand extends BaseCommand {
             generateHelp = true
     )
     public static class Start extends BaseCommand {
+        @Option(name = "without-direct", hasValue = false,
+                description = "Omit a materialized pool's Direct export for cleanup")
+        boolean withoutDirect;
+
         @Override
         protected CommandResult doExecute() throws Exception {
             BuildOutput.header("Starting VM");
+            if (withoutDirect) {
+                var result = VmManager.startWithoutDirectExport();
+                if (result == VmManager.DirectMaintenanceStart.FAILED) {
+                    return CommandResult.valueOf(1);
+                }
+                if (result == VmManager.DirectMaintenanceStart.NORMAL_RUNNING) {
+                    return CommandResult.valueOf(2);
+                }
+                return waitForIncus();
+            }
             if (!VmManager.start()) return CommandResult.valueOf(1);
             return waitForIncus();
         }
@@ -72,8 +87,7 @@ public class VmCommand extends BaseCommand {
         @Override
         protected CommandResult doExecute() throws Exception {
             BuildOutput.header("Stopping VM");
-            VmManager.stop();
-            return CommandResult.SUCCESS;
+            return VmManager.stop() ? CommandResult.SUCCESS : CommandResult.valueOf(1);
         }
     }
 
@@ -93,10 +107,12 @@ public class VmCommand extends BaseCommand {
                 System.out.println("VM is not running. Use 'isx vm start' to start it.");
                 return CommandResult.SUCCESS;
             }
-            var running = VmManager.runningApplianceVersion();
-            var installed = VmManager.applianceVersion();
-            if (running != null && !running.equals(installed)) {
-                System.out.println("Appliance update pending (" + running + " → " + installed + ").");
+            if (!WorkerPoolSelection.current().isMaterialized()) {
+                var running = VmManager.runningApplianceVersion();
+                var installed = VmManager.applianceVersion();
+                if (running != null && !running.equals(installed)) {
+                    System.out.println("Appliance update pending (" + running + " → " + installed + ").");
+                }
             }
             System.out.println("Running containers will be stopped.");
             if (!CleanCommand.confirm("Restart the VM?", yes)) {
@@ -148,8 +164,12 @@ public class VmCommand extends BaseCommand {
 
         @Override
         protected CommandResult doExecute() throws Exception {
-            // Validate the requested size and read the current disk size before touching anything.
             long target = VmManager.parseDiskSize(size);
+            return VmManager.withLifecycleLock(() -> resizeLocked(target));
+        }
+
+        private CommandResult resizeLocked(long target) throws Exception {
+            // Read and validate the current state only after owning the complete resize transaction.
             long current = VmManager.dataDiskSizeBytes();
             if (current < 0) {
                 System.err.println("No data disk found. Run 'isx vm start' once to create it before resizing.");
@@ -188,8 +208,8 @@ public class VmCommand extends BaseCommand {
             var targetH = VmManager.humanSize(target);
             BuildOutput.header("Resizing VM data disk", currentH + " → " + targetH);
 
-            if (wasRunning) {
-                VmManager.stop();
+            if (wasRunning && !VmManager.stop()) {
+                return CommandResult.valueOf(1);
             }
 
             BuildOutput.stepStart("Growing disk image to " + targetH + " (sparse)...");
@@ -237,11 +257,9 @@ public class VmCommand extends BaseCommand {
                 // Best-effort: the resize already succeeded, so a stop failure must not mask it.
                 if (!wasRunning) {
                     BuildOutput.note("VM was stopped before the resize — stopping it again.");
-                    try {
-                        VmManager.stop();
-                    } catch (Exception e) {
-                        System.err.println("Note: could not stop the VM again (" + e.getMessage()
-                                + "). The resize succeeded; stop it manually with 'isx vm stop'.");
+                    if (!VmManager.stop()) {
+                        System.err.println("Note: could not stop the VM again. The resize succeeded; "
+                                + "stop it manually with 'isx vm stop'.");
                     }
                 }
             }
@@ -281,7 +299,10 @@ public class VmCommand extends BaseCommand {
     public static class CheckVersion extends BaseCommand {
         @Override
         protected CommandResult doExecute() throws Exception {
-            if (!VmManager.isRunning()) return CommandResult.SUCCESS;
+            if (!VmManager.isRunning()
+                    || WorkerPoolSelection.current().isMaterialized()) {
+                return CommandResult.SUCCESS;
+            }
             var running = VmManager.runningApplianceVersion();
             if (running == null) return CommandResult.SUCCESS;
             var installed = VmManager.applianceVersion();

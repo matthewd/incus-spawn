@@ -77,6 +77,38 @@ class VmManagerTest {
     }
 
     @Test
+    void anyVmRunningFindsStaticNamedPoolState() throws Exception {
+        var state = tempHome.resolve("state");
+        var pool = Files.createDirectories(state.resolve("pools/compile"));
+        Files.writeString(pool.resolve("vm.pid"), "1234\n");
+
+        assertTrue(VmManager.anyVmRunning(state, pid -> pid == 1234));
+    }
+
+    @Test
+    void anyVmRunningFindsMaterializedPoolState() throws Exception {
+        var state = tempHome.resolve("state");
+        var pool = Files.createDirectories(state.resolve("direct-pools/pools/job-one"));
+        Files.writeString(pool.resolve("vm.pid"), "5678\n");
+
+        assertTrue(VmManager.anyVmRunning(state, pid -> pid == 5678));
+    }
+
+    @Test
+    void anyVmRunningBoundsPidFileReads() throws Exception {
+        var state = tempHome.resolve("state");
+        var pool = Files.createDirectories(state.resolve("pools/compile"));
+        Files.writeString(pool.resolve("vm.pid"), "9".repeat(1_000_000));
+        var processProbeCalled = new java.util.concurrent.atomic.AtomicBoolean();
+
+        assertFalse(VmManager.anyVmRunning(state, pid -> {
+            processProbeCalled.set(true);
+            return true;
+        }));
+        assertFalse(processProbeCalled.get());
+    }
+
+    @Test
     void awaitProcessExitReportsTimeoutUntilProcessActuallyExits() throws Exception {
         var process = new ProcessBuilder("sleep", "30").start();
         try {
@@ -244,13 +276,55 @@ class VmManagerTest {
         assertTrue(ex.getMessage().contains("larger"));
     }
 
+    @Test
+    void resizeWaitsForTheVmLifecycleLock() throws Exception {
+        VmManager.ensureDataDisk();
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var holder = executor.submit(() -> VmManager.withLifecycleLock(() -> {
+                entered.countDown();
+                release.await();
+                return null;
+            }));
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+            var target = VmManager.dataDiskSizeBytes() + 1024 * 1024;
+            var resize = executor.submit(() -> VmManager.resizeDataDisk(Long.toString(target)));
+            Thread.sleep(100);
+            assertFalse(resize.isDone(), "resize must not inspect or mutate an unlocked disk");
+
+            release.countDown();
+            holder.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals(target, resize.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void runningProbeDoesNotDeleteStaleStateWithoutTheLifecycleLock() throws Exception {
+        Files.createDirectories(Environment.vmStateDir());
+        Files.writeString(Environment.vmPidFile(), "999999999");
+        Files.writeString(Environment.vmRestUriFile(), "stale");
+
+        assertFalse(VmManager.isRunning());
+        assertTrue(Files.exists(Environment.vmPidFile()));
+        assertTrue(Files.exists(Environment.vmRestUriFile()));
+    }
+
     // --- vfkit command construction ---
 
     @Test
     void legacyVfkitCommandRetainsTheSingleWholeHomeExport() {
         var command = VmManager.vfkitCommand(
-                "/usr/local/bin/vfkit", 4, 4096, 12345, null, 1000);
+                "/usr/local/bin/vfkit", Environment.applianceKernel(),
+                4, 4096, 12345, null, 1000);
 
+        assertEquals(Environment.applianceKernel().toString(),
+                command.get(command.indexOf("--kernel") + 1));
         assertTrue(command.contains("virtio-fs,sharedDir=" + tempHome + ",mountTag=hostfs"));
         assertEquals(1, command.stream().filter(arg -> arg.startsWith("virtio-fs,")).count());
         var cmdline = command.get(command.indexOf("--kernel-cmdline") + 1);
@@ -276,7 +350,8 @@ class VmManagerTest {
         var exports = VmHostExports.create("compile", selected, tempHome);
 
         var command = VmManager.vfkitCommand(
-                "/usr/local/bin/vfkit", 4, 4096, 12345, exports, 1000);
+                "/usr/local/bin/vfkit", Environment.applianceKernel(),
+                4, 4096, 12345, exports, 1000);
         var devices = command.stream().filter(arg -> arg.startsWith("virtio-")).toList();
 
         assertEquals(java.util.List.of(
@@ -304,11 +379,57 @@ class VmManagerTest {
     }
 
     @Test
+    void materializedVfkitCommandUsesPoolKernelAndAddsStaticDirectShare() throws Exception {
+        var direct = Files.createDirectories(tempHome.resolve("direct-project"));
+        var selected = new dev.incusspawn.config.WorkerPoolConfig.Selected(
+                4, 4096, "8G",
+                new dev.incusspawn.config.WorkerPoolConfig.ReadOnlyExport(
+                        tempHome.resolve("runtime").toString()),
+                new dev.incusspawn.config.WorkerPoolConfig.ReadWriteExport(
+                        tempHome.resolve("workspace").toString()),
+                java.util.Map.of(),
+                new dev.incusspawn.config.WorkerPoolConfig.ReadWriteExport(direct.toString()));
+        var exports = VmHostExports.create("job-one", selected, tempHome);
+
+        var poolKernel = tempHome.resolve("materialized/vmlinuz");
+        var command = VmManager.vfkitCommand(
+                "/usr/local/bin/vfkit", poolKernel,
+                4, 4096, 12345, exports, 1000);
+
+        assertEquals(poolKernel.toString(), command.get(command.indexOf("--kernel") + 1));
+        assertNotEquals(Environment.applianceKernel().toString(),
+                command.get(command.indexOf("--kernel") + 1));
+        assertTrue(command.contains("virtio-fs,sharedDir=" + direct.toRealPath()
+                + ",mountTag=isx-direct"));
+        assertFalse(command.contains("virtio-fs,sharedDir=" + direct.toRealPath()
+                + ",mountTag=isx-direct,readonly"));
+        var cmdline = command.get(command.indexOf("--kernel-cmdline") + 1);
+        assertTrue(cmdline.contains(" isx.direct_root=1"));
+    }
+
+    @Test
+    void macOsUnixSocketPathsAreBoundedByUtf8Bytes() {
+        assertDoesNotThrow(() -> VmManager.requireMacOsUnixSocketPath(
+                Path.of("/" + "a".repeat(102))));
+
+        var error = assertThrows(IllegalStateException.class,
+                () -> VmManager.requireMacOsUnixSocketPath(
+                        Path.of("/" + "a".repeat(103))));
+        assertTrue(error.getMessage().contains("103-byte limit"));
+
+        var multibyte = assertThrows(IllegalStateException.class,
+                () -> VmManager.requireMacOsUnixSocketPath(
+                        Path.of("/" + "é".repeat(52))));
+        assertTrue(multibyte.getMessage().contains("103-byte limit"));
+    }
+
+    @Test
     void vfkitCommandRejectsUnencodableStatePathsBeforeReturningArguments() {
         System.setProperty("user.home", tempHome + "/unsafe,home");
 
         var error = assertThrows(IllegalStateException.class, () -> VmManager.vfkitCommand(
-                "/usr/local/bin/vfkit", 4, 4096, 12345, null, 1000));
+                "/usr/local/bin/vfkit", Environment.applianceKernel(),
+                4, 4096, 12345, null, 1000));
 
         assertTrue(error.getMessage().contains("comma-separated device syntax"));
     }

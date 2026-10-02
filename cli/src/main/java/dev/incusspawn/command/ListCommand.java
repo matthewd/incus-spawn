@@ -9,6 +9,7 @@ import dev.incusspawn.config.BuildSource;
 import dev.incusspawn.config.HostResourceSetup;
 import dev.incusspawn.config.NetworkMode;
 import dev.incusspawn.config.SpawnConfig;
+import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.git.AutoRemoteService;
 import dev.incusspawn.git.GitRemoteUtils;
 import dev.incusspawn.incus.BridgeSubnetCheck;
@@ -707,7 +708,10 @@ public class ListCommand extends BaseCommand {
     }
 
     private void refreshApplianceSkew() {
-        if (!Platform.isMacOS()) { applianceSkewMessage = null; return; }
+        if (!Platform.isMacOS() || WorkerPoolSelection.current().isMaterialized()) {
+            applianceSkewMessage = null;
+            return;
+        }
         if (applianceSkewFirstLoad) { applianceSkewFirstLoad = false; return; }
         try {
             var running = VmManager.runningApplianceVersion();
