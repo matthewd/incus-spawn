@@ -160,12 +160,18 @@ public final class PoolState {
 
         /** Descriptor-bound selection that deliberately performs no host-root filesystem access. */
         public WorkerPoolConfig.Selected selectedWithoutRootValidation() {
+            return selectedWithoutRootValidation(config.cpus(), config.memoryMib());
+        }
+
+        /** Replace only launch-time CPU and memory while retaining every frozen pool artifact. */
+        public WorkerPoolConfig.Selected selectedWithoutRootValidation(
+                int cpus, int memoryMib) {
             var references = new LinkedHashMap<String, WorkerPoolConfig.ReadOnlyExport>();
             config.referenceRoots().forEach((referenceName, referencePath) ->
                     references.put(referenceName,
                             new WorkerPoolConfig.ReadOnlyExport(referencePath)));
             return new WorkerPoolConfig.Selected(
-                    config.cpus(), config.memoryMib(), config.swap(),
+                    cpus, memoryMib, config.swap(),
                     new WorkerPoolConfig.ReadOnlyExport(config.runtimeRoot()),
                     new WorkerPoolConfig.ReadWriteExport(config.workspaceRoot()),
                     references,

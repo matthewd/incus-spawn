@@ -281,8 +281,10 @@ public final class PoolStore {
                 var finalWorkspace = target.resolve("workspace").toAbsolutePath().normalize();
                 var references = referencesOutsideDirectRoot(
                         seed.config().referenceRoots(), canonicalDirect);
+                var launchResources = selection.pool().orElseThrow()
+                        .resourcesForDirectRoot(canonicalDirect.toString());
                 var config = new PoolState.FrozenConfig(
-                        seed.config().cpus(), seed.config().memoryMib(), seed.config().swap(),
+                        launchResources.cpus(), launchResources.memoryMib(), seed.config().swap(),
                         seed.config().runtimeRoot(), finalWorkspace.toString(), references);
                 WorkerPoolConfig.validateMaterialized(name, config.cpus(), config.memoryMib(),
                         config.swap(), config.runtimeRoot(), config.workspaceRoot(),

@@ -939,9 +939,15 @@ worker-pools:
     reference-roots:
       maven: ~/.m2
       sources: ~/src-reference
+    direct-resources:
+      ~/src/large-project:
+        cpus: 12
+        memory-mib: 24576
 ```
 
-Every field is required; `reference-roots` may be `{}`. Export paths must be absolute or start with `~/`, and roots may not duplicate, contain, or be contained by another root after canonicalization. The runtime and workspace roots are created when the pool is prepared; reference roots must already exist as directories. `runtime-root` and every reference root are read-only exports, while `workspace-root` is read-write. Paths containing a comma, newline, or NUL cannot be represented by vfkit's device syntax and are rejected.
+Every field except `direct-resources` is required; `reference-roots` may be `{}`. Export paths must be absolute or start with `~/`, and roots may not duplicate, contain, or be contained by another root after canonicalization. The runtime and workspace roots are created when the pool is prepared; reference roots must already exist as directories. `runtime-root` and every reference root are read-only exports, while `workspace-root` is read-write. Paths containing a comma, newline, or NUL cannot be represented by vfkit's device syntax and are rejected.
+
+A materialized pool reads `cpus` and `memory-mib` from its current seed entry whenever an `isx` process selects it. An optional `direct-resources` map overrides either value for one Direct root; each key may be absolute or start with `~/` and is normalized and canonicalized before exact matching. An omitted field inherits the seed default. A stopped materialized VM therefore picks up CPU or memory edits on its next start without resealing or rematerializing. Its swap image and descriptor-bound runtime, workspace, reference, and Direct roots remain frozen; changing those seed fields does not mutate an existing materialized pool.
 
 ```shell
 ISX_POOL=compile isx vm start
@@ -971,7 +977,7 @@ On macOS, a stopped static named pool can be sealed as an owner-protected seed g
 ISX_POOL=compile isx pool seal
 ```
 
-Materialization must run with the same static seed selected. It validates and APFS-clones the sealed root, data, and kernel into a new pool, validates each destination, creates a pool-local workspace and a fresh sparse swap image, and freezes one pre-existing canonical project directory as the direct root. A direct root is rejected if it overlaps in either direction with ISX configuration, state, cache, appliance, registry, or pool-workspace roots, or if vfkit cannot encode it safely. A seed reference equal to or nested beneath the direct root is omitted from the materialized export plan because the direct export already covers it; a direct root nested beneath a broader seed reference remains rejected. Omitting both generation options selects the seed's current `latest` pointer; supplying either requires the exact pair returned by `seal`.
+Materialization must run with the same static seed selected. It validates and APFS-clones the sealed root, data, and kernel into a new pool, validates each destination, creates a pool-local workspace and a fresh sparse swap image, and freezes one pre-existing canonical project directory as the direct root. The initial descriptor records CPU and memory from the seed's current defaults or matching `direct-resources` entry, while every later selection resolves those two launch values from the same current entry. A direct root is rejected if it overlaps in either direction with ISX configuration, state, cache, appliance, registry, or pool-workspace roots, or if vfkit cannot encode it safely. A seed reference equal to or nested beneath the direct root is omitted from the materialized export plan because the direct export already covers it; a direct root nested beneath a broader seed reference remains rejected. Omitting both generation options selects the seed's current `latest` pointer; supplying either requires the exact pair returned by `seal`.
 
 ```shell
 ISX_POOL=compile isx pool materialize \
@@ -981,7 +987,7 @@ ISX_POOL=compile isx pool materialize \
   --generation-identity <64-lowercase-hex-digest>
 ```
 
-The materialize response contains the materialized pool's full identity. Selection is deliberately separate from `ISX_POOL` and requires both values; a missing value, an unsafe name, a changed descriptor, unsafe state ownership or permissions, or missing pool artifact fails before command dispatch. Canonical export roots are revalidated before VM launch and host-path translation, while management commands against an already-running VM can still remove owned state after the user-controlled direct root has moved or disappeared. Static and materialized selectors cannot be combined. The internal `ISX_MATERIALIZED_POOL_MAINTENANCE=1` marker permits only automation deletion and the matching no-Direct VM maintenance launch; ordinary materialized operation uses neither.
+The materialize response contains the materialized pool's full identity. Selection is deliberately separate from `ISX_POOL` and requires both values; a missing value, an unsafe name, a changed descriptor, unsafe state ownership or permissions, a missing current seed configuration, or a missing pool artifact fails before command dispatch. Selection reloads only CPU and memory from the named seed; canonical export roots remain descriptor-bound and are revalidated before VM launch and host-path translation, while management commands against an already-running VM can still remove owned state after the user-controlled direct root has moved or disappeared. Static and materialized selectors cannot be combined. The internal `ISX_MATERIALIZED_POOL_MAINTENANCE=1` marker permits only automation deletion and the matching no-Direct VM maintenance launch; ordinary materialized operation uses neither.
 
 ```shell
 ISX_MATERIALIZED_POOL=job-17 \

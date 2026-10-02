@@ -39,6 +39,7 @@ public final class WorkerPoolConfig {
     private ReadOnlyExport runtimeRoot;
     private ReadWriteExport workspaceRoot;
     private Map<String, ReadOnlyExport> referenceRoots;
+    private Map<String, DirectResourceOverride> directResources = Map.of();
 
     public Integer getCpus() { return cpus; }
     public void setCpus(Integer cpus) { this.cpus = cpus; }
@@ -68,7 +69,22 @@ public final class WorkerPoolConfig {
         this.referenceRoots = referenceRoots;
     }
 
+    @JsonProperty("direct-resources")
+    public Map<String, DirectResourceOverride> getDirectResources() { return directResources; }
+    @JsonProperty("direct-resources")
+    public void setDirectResources(Map<String, DirectResourceOverride> directResources) {
+        this.directResources = directResources;
+    }
+
     public enum AccessMode { READ_ONLY, READ_WRITE }
+
+    @RegisterForReflection
+    @JsonIgnoreProperties(ignoreUnknown = false)
+    public record DirectResourceOverride(
+            Integer cpus,
+            @JsonProperty("memory-mib") Integer memoryMib) {}
+
+    public record LaunchResources(int cpus, int memoryMib) {}
 
     public sealed interface HostExport permits ReadOnlyExport, ReadWriteExport {
         String path();
@@ -114,9 +130,11 @@ public final class WorkerPoolConfig {
             ReadOnlyExport runtimeRoot,
             ReadWriteExport workspaceRoot,
             Map<String, ReadOnlyExport> referenceRoots,
-            ReadWriteExport directRoot) {
+            ReadWriteExport directRoot,
+            Map<String, DirectResourceOverride> directResources) {
         public Selected {
             referenceRoots = Map.copyOf(referenceRoots);
+            directResources = Map.copyOf(directResources);
         }
 
         /** Static named pools have no direct export. */
@@ -127,7 +145,30 @@ public final class WorkerPoolConfig {
                 ReadOnlyExport runtimeRoot,
                 ReadWriteExport workspaceRoot,
                 Map<String, ReadOnlyExport> referenceRoots) {
-            this(cpus, memoryMib, swap, runtimeRoot, workspaceRoot, referenceRoots, null);
+            this(cpus, memoryMib, swap, runtimeRoot, workspaceRoot, referenceRoots,
+                    null, Map.of());
+        }
+
+        /** Materialized descriptor selections do not carry mutable static-pool overrides. */
+        public Selected(
+                int cpus,
+                int memoryMib,
+                String swap,
+                ReadOnlyExport runtimeRoot,
+                ReadWriteExport workspaceRoot,
+                Map<String, ReadOnlyExport> referenceRoots,
+                ReadWriteExport directRoot) {
+            this(cpus, memoryMib, swap, runtimeRoot, workspaceRoot, referenceRoots,
+                    directRoot, Map.of());
+        }
+
+        public LaunchResources resourcesForDirectRoot(String root) {
+            var override = directResources.get(root);
+            return override == null
+                    ? new LaunchResources(cpus, memoryMib)
+                    : new LaunchResources(
+                            override.cpus() == null ? cpus : override.cpus(),
+                            override.memoryMib() == null ? memoryMib : override.memoryMib());
         }
     }
 
@@ -226,7 +267,34 @@ public final class WorkerPoolConfig {
         }
         rejectOverlaps(poolName, roots);
 
-        return new Selected(cpus, memoryMib, swap, runtimeRoot, workspaceRoot, references);
+        if (directResources == null) {
+            throw invalid(poolName, "direct-resources", "must be a map when set");
+        }
+        var directResourceOverrides = new LinkedHashMap<String, DirectResourceOverride>();
+        for (var entry : directResources.entrySet()) {
+            var field = "direct-resources." + entry.getKey();
+            var root = validateDirectResourceRoot(poolName, field, entry.getKey(), home);
+            var override = entry.getValue();
+            if (override == null) {
+                throw invalid(poolName, field, "resource override is required");
+            }
+            if (override.cpus() == null && override.memoryMib() == null) {
+                throw invalid(poolName, field, "must set cpus or memory-mib");
+            }
+            if (override.cpus() != null && override.cpus() < 1) {
+                throw invalid(poolName, field + ".cpus", "must be at least 1");
+            }
+            if (override.memoryMib() != null && override.memoryMib() < 2048) {
+                throw invalid(poolName, field + ".memory-mib", "must be at least 2048");
+            }
+            if (directResourceOverrides.put(root, override) != null) {
+                throw invalid(poolName, "direct-resources",
+                        "contains duplicate roots after normalization");
+            }
+        }
+
+        return new Selected(cpus, memoryMib, swap, runtimeRoot, workspaceRoot, references,
+                null, directResourceOverrides);
     }
 
     public static boolean isSafeName(String name) {
@@ -257,6 +325,14 @@ public final class WorkerPoolConfig {
         } catch (NumberFormatException | ArithmeticException e) {
             throw invalid(poolName, "swap", "is too large");
         }
+    }
+
+    private static String validateDirectResourceRoot(
+            String poolName, String field, String value, Path home) {
+        if (value == null || value.isBlank() || value.contains("\n") || value.contains("\r")) {
+            throw invalid(poolName, field, "must name a safe absolute Direct root");
+        }
+        return validateRoot(poolName, field, value, home).path().toString();
     }
 
     private static NamedRoot validateRoot(String poolName, String exportName, String value, Path home) {

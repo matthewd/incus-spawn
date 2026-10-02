@@ -70,25 +70,57 @@ public final class WorkerPoolSelection {
                 Kind.STATIC, requestedName, frozen, null, false, null);
     }
 
-    /** Strict, testable materialized selection from protected ISX state. */
+    /** Strict, testable materialized selection from protected state alone. */
     public static WorkerPoolSelection selectMaterialized(
             String requestedName, String expectedIdentity, Path globalStateDir, Path home) {
+        var descriptor = loadMaterializedDescriptor(
+                requestedName, expectedIdentity, globalStateDir, home);
+        return materializedSelection(requestedName, descriptor,
+                descriptor.selectedWithoutRootValidation(), false);
+    }
+
+    /** Resolve current seed CPU/memory without changing the descriptor-bound export plan. */
+    public static WorkerPoolSelection selectMaterialized(
+            String requestedName, String expectedIdentity, Path globalStateDir, Path home,
+            Path configFile) {
         return selectMaterialized(
-                requestedName, expectedIdentity, globalStateDir, home, false);
+                requestedName, expectedIdentity, globalStateDir, home, configFile, false);
     }
 
     static WorkerPoolSelection selectMaterialized(
             String requestedName, String expectedIdentity, Path globalStateDir, Path home,
-            boolean maintenance) {
+            Path configFile, boolean maintenance) {
+        var descriptor = loadMaterializedDescriptor(
+                requestedName, expectedIdentity, globalStateDir, home);
+        var config = SpawnConfig.loadStrict(configFile);
+        var seed = config.getWorkerPools().get(descriptor.seedPool());
+        if (seed == null) {
+            throw new IllegalStateException("worker pool '" + descriptor.seedPool()
+                    + "' used by materialized pool '" + requestedName
+                    + "' is not defined in " + configFile);
+        }
+        var selectedSeed = seed.validateAndFreeze(descriptor.seedPool(), home);
+        var resources = selectedSeed.resourcesForDirectRoot(descriptor.directRoot());
+        return materializedSelection(requestedName, descriptor,
+                descriptor.selectedWithoutRootValidation(
+                        resources.cpus(), resources.memoryMib()), maintenance);
+    }
+
+    private static PoolState.MaterializedDescriptor loadMaterializedDescriptor(
+            String requestedName, String expectedIdentity, Path globalStateDir, Path home) {
         if (!WorkerPoolConfig.isSafeName(requestedName)) {
             throw new IllegalStateException(MATERIALIZED_ENVIRONMENT_VARIABLE
                     + " has unsafe worker pool name '" + requestedName + "'");
         }
-        var descriptor = PoolState.loadMaterialized(
+        return PoolState.loadMaterialized(
                 globalStateDir, home, requestedName, expectedIdentity);
+    }
+
+    private static WorkerPoolSelection materializedSelection(
+            String requestedName, PoolState.MaterializedDescriptor descriptor,
+            WorkerPoolConfig.Selected pool, boolean maintenance) {
         return new WorkerPoolSelection(Kind.MATERIALIZED, requestedName,
-                descriptor.selectedWithoutRootValidation(), descriptor.identity(),
-                maintenance, null);
+                pool, descriptor.identity(), maintenance, null);
     }
 
     /** Called only from the run-time-initialized {@link RuntimeConstants} holder. */
@@ -145,7 +177,7 @@ public final class WorkerPoolSelection {
         }
         return selectMaterialized(
                 requestedMaterialized, expectedIdentity, globalStateDir, home,
-                requestedMaintenance != null);
+                configFile, requestedMaintenance != null);
     }
 
     /** The immutable process selection. There is intentionally no setter or reset hook. */

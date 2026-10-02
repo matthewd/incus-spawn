@@ -40,6 +40,115 @@ class WorkerPoolConfigTest {
     }
 
     @Test
+    void directResourcesOverrideCurrentPoolDefaultsByCanonicalRoot() throws Exception {
+        var largeProject = tempDir.resolve("large-project");
+        var cpuProject = tempDir.resolve("cpu-project");
+        var tildeProject = tempDir.resolve("tilde-project");
+        var config = writeConfig("""
+                worker-pools:
+                  compile:
+                    cpus: 4
+                    memory-mib: 4096
+                    swap: 8G
+                    runtime-root: /runtime
+                    workspace-root: /workspace
+                    reference-roots: {}
+                    direct-resources:
+                      %s:
+                        cpus: 10
+                        memory-mib: 24576
+                      %s:
+                        cpus: 6
+                      ~/tilde-project:
+                        memory-mib: 12288
+                """.formatted(largeProject, cpuProject));
+
+        var pool = SpawnConfig.loadStrict(config).getWorkerPools().get("compile")
+                .validateAndFreeze("compile", tempDir);
+
+        assertEquals(new WorkerPoolConfig.LaunchResources(10, 24576),
+                pool.resourcesForDirectRoot(largeProject.toString()));
+        assertEquals(new WorkerPoolConfig.LaunchResources(6, 4096),
+                pool.resourcesForDirectRoot(cpuProject.toString()));
+        assertEquals(new WorkerPoolConfig.LaunchResources(4, 12288),
+                pool.resourcesForDirectRoot(tildeProject.toString()));
+        assertEquals(new WorkerPoolConfig.LaunchResources(4, 4096),
+                pool.resourcesForDirectRoot(tempDir.resolve("ordinary-project").toString()));
+    }
+
+    @Test
+    void directResourcesRejectInvalidOrEmptyOverrides() throws Exception {
+        var empty = writeConfig("""
+                worker-pools:
+                  compile:
+                    cpus: 4
+                    memory-mib: 4096
+                    swap: 8G
+                    runtime-root: /runtime
+                    workspace-root: /workspace
+                    reference-roots: {}
+                    direct-resources:
+                      /project: {}
+                """);
+        assertTrue(assertThrows(IllegalStateException.class,
+                () -> SpawnConfig.loadStrict(empty)).getMessage().contains("must set"));
+
+        var invalid = writeConfig("""
+                worker-pools:
+                  compile:
+                    cpus: 4
+                    memory-mib: 4096
+                    swap: 8G
+                    runtime-root: /runtime
+                    workspace-root: /workspace
+                    reference-roots: {}
+                    direct-resources:
+                      /project:
+                        cpus: 0
+                        memory-mib: 1024
+                """);
+        assertTrue(assertThrows(IllegalStateException.class,
+                () -> SpawnConfig.loadStrict(invalid)).getMessage().contains("cpus"));
+
+        var unknown = writeConfig("""
+                worker-pools:
+                  compile:
+                    cpus: 4
+                    memory-mib: 4096
+                    swap: 8G
+                    runtime-root: /runtime
+                    workspace-root: /workspace
+                    reference-roots: {}
+                    direct-resources:
+                      /project:
+                        cpus: 2
+                        typo-memory: 8192
+                """);
+        assertTrue(assertThrows(IllegalStateException.class,
+                () -> SpawnConfig.loadStrict(unknown)).getMessage().contains("typo-memory"));
+
+        var project = tempDir.resolve("project");
+        var duplicate = writeConfig("""
+                worker-pools:
+                  compile:
+                    cpus: 4
+                    memory-mib: 4096
+                    swap: 8G
+                    runtime-root: /runtime
+                    workspace-root: /workspace
+                    reference-roots: {}
+                    direct-resources:
+                      %s:
+                        cpus: 2
+                      %s/.:
+                        memory-mib: 8192
+                """.formatted(project, project));
+        assertTrue(assertThrows(IllegalStateException.class,
+                () -> SpawnConfig.loadStrict(duplicate)).getMessage()
+                .contains("duplicate roots"));
+    }
+
+    @Test
     void strictLoadRejectsUnknownPoolFields() throws Exception {
         var config = writeConfig("""
                 worker-pools:

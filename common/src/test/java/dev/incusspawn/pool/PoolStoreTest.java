@@ -30,6 +30,7 @@ class PoolStoreTest {
     private Path direct;
     private Path applianceKernel;
     private Path applianceVersionFile;
+    private Path config;
     private FakeOperations operations;
     private WorkerPoolSelection seedSelection;
 
@@ -40,7 +41,7 @@ class PoolStoreTest {
         var runtime = Files.createDirectory(home.resolve("runtime"));
         var workspace = Files.createDirectory(home.resolve("seed-workspace"));
         var reference = Files.createDirectory(home.resolve("reference"));
-        var config = home.resolve("config.yaml");
+        config = home.resolve("config.yaml");
         Files.writeString(config, """
                 worker-pools:
                   seed:
@@ -165,6 +166,114 @@ class PoolStoreTest {
         assertFalse(retry.changed());
         assertEquals(materialized.identity(), retry.identity());
         assertEquals(6, operations.cloneCount, "an exact retry must not clone again");
+    }
+
+    @Test
+    void materializedCpuAndMemoryFollowCurrentSeedConfigAndDirectRootOverride() throws Exception {
+        var store = store();
+        var seal = store.seal();
+        Files.writeString(config, """
+                worker-pools:
+                  seed:
+                    cpus: 5
+                    memory-mib: 8192
+                    swap: 16M
+                    runtime-root: %s
+                    workspace-root: %s
+                    reference-roots:
+                      source: %s
+                    direct-resources:
+                      %s:
+                        cpus: 9
+                        memory-mib: 16384
+                """.formatted(home.resolve("runtime"), home.resolve("seed-workspace"),
+                        home.resolve("reference"), direct));
+        var currentSeed = WorkerPoolSelection.select("seed", config);
+        var currentStore = new PoolStore(
+                state, home, applianceKernel, applianceVersionFile, "1.2.3",
+                currentSeed, operations, new SecureRandom());
+
+        var materialized = currentStore.materialize(
+                "job-current", direct.toString(), seal.generation(), seal.identity());
+        var frozen = WorkerPoolSelection.selectMaterialized(
+                "job-current", materialized.identity(), state, home).pool().orElseThrow();
+        assertEquals(9, frozen.cpus());
+        assertEquals(16384, frozen.memoryMib());
+        assertEquals("8M", frozen.swap(), "swap remains bound to the sealed generation");
+
+        Files.writeString(config, """
+                worker-pools:
+                  seed:
+                    cpus: 6
+                    memory-mib: 12288
+                    swap: 32M
+                    runtime-root: %s
+                    workspace-root: %s
+                    reference-roots:
+                      current: %s
+                    direct-resources:
+                      %s:
+                        memory-mib: 24576
+                """.formatted(home.resolve("current-runtime"),
+                        home.resolve("current-workspace"), home.resolve("current-reference"),
+                        direct));
+        var refreshed = WorkerPoolSelection.selectMaterialized(
+                "job-current", materialized.identity(), state, home, config)
+                .pool().orElseThrow();
+
+        assertEquals(6, refreshed.cpus());
+        assertEquals(24576, refreshed.memoryMib());
+        assertEquals("8M", refreshed.swap());
+        assertEquals(frozen.runtimeRoot(), refreshed.runtimeRoot());
+        assertEquals(frozen.workspaceRoot(), refreshed.workspaceRoot());
+        assertEquals(frozen.referenceRoots(), refreshed.referenceRoots());
+        assertEquals(frozen.directRoot(), refreshed.directRoot());
+    }
+
+    @Test
+    void materializedCurrentResourcesFailClosedForMissingOrInvalidSeedConfig() {
+        var store = store();
+        var seal = store.seal();
+        var materialized = store.materialize(
+                "job-current", direct.toString(), seal.generation(), seal.identity());
+
+        assertDoesNotThrow(() -> Files.delete(config));
+        assertThrows(IllegalStateException.class, () -> WorkerPoolSelection.selectMaterialized(
+                "job-current", materialized.identity(), state, home, config));
+
+        assertDoesNotThrow(() -> Files.writeString(config, "worker-pools: [invalid]\n"));
+        assertThrows(IllegalStateException.class, () -> WorkerPoolSelection.selectMaterialized(
+                "job-current", materialized.identity(), state, home, config));
+
+        assertDoesNotThrow(() -> Files.writeString(config, """
+                worker-pools:
+                  other:
+                    cpus: 3
+                    memory-mib: 4096
+                    swap: 8M
+                    runtime-root: %s
+                    workspace-root: %s
+                    reference-roots: {}
+                """.formatted(home.resolve("runtime"), home.resolve("seed-workspace"))));
+        var missingSeed = assertThrows(IllegalStateException.class,
+                () -> WorkerPoolSelection.selectMaterialized(
+                        "job-current", materialized.identity(), state, home, config));
+        assertTrue(missingSeed.getMessage().contains("seed"));
+
+        assertDoesNotThrow(() -> Files.writeString(config, """
+                worker-pools:
+                  seed:
+                    cpus: 3
+                    memory-mib: 4096
+                    swap: 8M
+                    runtime-root: %s
+                    workspace-root: %s
+                    reference-roots: {}
+                    direct-resources:
+                      %s: {}
+                """.formatted(home.resolve("runtime"), home.resolve("seed-workspace"), direct)));
+        assertThrows(IllegalStateException.class, () -> WorkerPoolSelection.selectMaterialized(
+                "job-current", materialized.identity(), state, home, config));
     }
 
     @Test
