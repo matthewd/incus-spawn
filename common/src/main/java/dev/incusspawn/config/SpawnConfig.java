@@ -43,8 +43,6 @@ public class SpawnConfig {
     private String incusBridgeGateway = "";
     @JsonProperty("auto-clone-repos")
     private String autoCloneRepos = "";
-    @JsonProperty("worker-pools")
-    private Map<String, WorkerPoolConfig> workerPools = Map.of();
     private Map<String, Object> extras = new LinkedHashMap<>();
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -192,10 +190,6 @@ public class SpawnConfig {
     public void setIncusBridgeGateway(String incusBridgeGateway) { this.incusBridgeGateway = incusBridgeGateway == null ? "" : incusBridgeGateway; }
     public String getAutoCloneRepos() { return autoCloneRepos; }
     public void setAutoCloneRepos(String autoCloneRepos) { this.autoCloneRepos = autoCloneRepos == null ? "" : autoCloneRepos; }
-    public Map<String, WorkerPoolConfig> getWorkerPools() { return workerPools; }
-    public void setWorkerPools(Map<String, WorkerPoolConfig> workerPools) {
-        this.workerPools = workerPools == null ? Map.of() : workerPools;
-    }
     @JsonAnySetter
     public void setExtra(String key, Object value) { extras.put(key, value); }
 
@@ -314,12 +308,6 @@ public class SpawnConfig {
             throw new IllegalStateException("Cannot specify both 'host-path' and 'host-paths' in config.yaml");
         }
         ssh.validate();
-        for (var entry : workerPools.entrySet()) {
-            if (entry.getValue() == null) {
-                throw new IllegalStateException("worker pool '" + entry.getKey() + "' definition is required");
-            }
-            entry.getValue().validateAndFreeze(entry.getKey(), Environment.home());
-        }
     }
 
     public void save() {

@@ -41,17 +41,16 @@ class PoolStoreTest {
         var runtime = Files.createDirectory(home.resolve("runtime"));
         var workspace = Files.createDirectory(home.resolve("seed-workspace"));
         var reference = Files.createDirectory(home.resolve("reference"));
-        config = home.resolve("config.yaml");
+        config = home.resolve("worker-pools.yaml");
         Files.writeString(config, """
-                worker-pools:
-                  seed:
-                    cpus: 3
-                    memory-mib: 4096
-                    swap: 8M
-                    runtime-root: %s
-                    workspace-root: %s
-                    reference-roots:
-                      source: %s
+                seed:
+                  cpus: 3
+                  memory-mib: 4096
+                  swap: 8M
+                  runtime-root: %s
+                  workspace-root: %s
+                  reference-roots:
+                    source: %s
                 """.formatted(runtime, workspace, reference));
         seedSelection = WorkerPoolSelection.select("seed", config);
 
@@ -173,19 +172,18 @@ class PoolStoreTest {
         var store = store();
         var seal = store.seal();
         Files.writeString(config, """
-                worker-pools:
-                  seed:
-                    cpus: 5
-                    memory-mib: 8192
-                    swap: 16M
-                    runtime-root: %s
-                    workspace-root: %s
-                    reference-roots:
-                      source: %s
-                    direct-resources:
-                      %s:
-                        cpus: 9
-                        memory-mib: 16384
+                seed:
+                  cpus: 5
+                  memory-mib: 8192
+                  swap: 16M
+                  runtime-root: %s
+                  workspace-root: %s
+                  reference-roots:
+                    source: %s
+                  direct-resources:
+                    %s:
+                      cpus: 9
+                      memory-mib: 16384
                 """.formatted(home.resolve("runtime"), home.resolve("seed-workspace"),
                         home.resolve("reference"), direct));
         var currentSeed = WorkerPoolSelection.select("seed", config);
@@ -202,18 +200,17 @@ class PoolStoreTest {
         assertEquals("8M", frozen.swap(), "swap remains bound to the sealed generation");
 
         Files.writeString(config, """
-                worker-pools:
-                  seed:
-                    cpus: 6
-                    memory-mib: 12288
-                    swap: 32M
-                    runtime-root: %s
-                    workspace-root: %s
-                    reference-roots:
-                      current: %s
-                    direct-resources:
-                      %s:
-                        memory-mib: 24576
+                seed:
+                  cpus: 6
+                  memory-mib: 12288
+                  swap: 32M
+                  runtime-root: %s
+                  workspace-root: %s
+                  reference-roots:
+                    current: %s
+                  direct-resources:
+                    %s:
+                      memory-mib: 24576
                 """.formatted(home.resolve("current-runtime"),
                         home.resolve("current-workspace"), home.resolve("current-reference"),
                         direct));
@@ -241,19 +238,18 @@ class PoolStoreTest {
         assertThrows(IllegalStateException.class, () -> WorkerPoolSelection.selectMaterialized(
                 "job-current", materialized.identity(), state, home, config));
 
-        assertDoesNotThrow(() -> Files.writeString(config, "worker-pools: [invalid]\n"));
+        assertDoesNotThrow(() -> Files.writeString(config, "[invalid]\n"));
         assertThrows(IllegalStateException.class, () -> WorkerPoolSelection.selectMaterialized(
                 "job-current", materialized.identity(), state, home, config));
 
         assertDoesNotThrow(() -> Files.writeString(config, """
-                worker-pools:
-                  other:
-                    cpus: 3
-                    memory-mib: 4096
-                    swap: 8M
-                    runtime-root: %s
-                    workspace-root: %s
-                    reference-roots: {}
+                other:
+                  cpus: 3
+                  memory-mib: 4096
+                  swap: 8M
+                  runtime-root: %s
+                  workspace-root: %s
+                  reference-roots: {}
                 """.formatted(home.resolve("runtime"), home.resolve("seed-workspace"))));
         var missingSeed = assertThrows(IllegalStateException.class,
                 () -> WorkerPoolSelection.selectMaterialized(
@@ -261,16 +257,15 @@ class PoolStoreTest {
         assertTrue(missingSeed.getMessage().contains("seed"));
 
         assertDoesNotThrow(() -> Files.writeString(config, """
-                worker-pools:
-                  seed:
-                    cpus: 3
-                    memory-mib: 4096
-                    swap: 8M
-                    runtime-root: %s
-                    workspace-root: %s
-                    reference-roots: {}
-                    direct-resources:
-                      %s: {}
+                seed:
+                  cpus: 3
+                  memory-mib: 4096
+                  swap: 8M
+                  runtime-root: %s
+                  workspace-root: %s
+                  reference-roots: {}
+                  direct-resources:
+                    %s: {}
                 """.formatted(home.resolve("runtime"), home.resolve("seed-workspace"), direct)));
         assertThrows(IllegalStateException.class, () -> WorkerPoolSelection.selectMaterialized(
                 "job-current", materialized.identity(), state, home, config));
@@ -475,15 +470,14 @@ class PoolStoreTest {
         var nestedReference = Files.createDirectory(parentProject.resolve("reference"));
         var nestedConfig = home.resolve("nested-reference-config.yaml");
         Files.writeString(nestedConfig, """
-                worker-pools:
-                  nested-seed:
-                    cpus: 3
-                    memory-mib: 4096
-                    swap: 8M
-                    runtime-root: %s
-                    workspace-root: %s
-                    reference-roots:
-                      nested: %s
+                nested-seed:
+                  cpus: 3
+                  memory-mib: 4096
+                  swap: 8M
+                  runtime-root: %s
+                  workspace-root: %s
+                  reference-roots:
+                    nested: %s
                 """.formatted(home.resolve("runtime"), home.resolve("seed-workspace"), nestedReference));
         var nestedSelection = WorkerPoolSelection.select("nested-seed", nestedConfig);
         var nestedState = nestedSelection.vmStateDir(state);
@@ -552,14 +546,13 @@ class PoolStoreTest {
         var nested = Files.createDirectory(tildeWorkspace.resolve("project"));
         var config = home.resolve("tilde-config.yaml");
         Files.writeString(config, """
-                worker-pools:
-                  tilde-seed:
-                    cpus: 3
-                    memory-mib: 4096
-                    swap: 8M
-                    runtime-root: ~/runtime
-                    workspace-root: ~/tilde-workspace
-                    reference-roots: {}
+                tilde-seed:
+                  cpus: 3
+                  memory-mib: 4096
+                  swap: 8M
+                  runtime-root: ~/runtime
+                  workspace-root: ~/tilde-workspace
+                  reference-roots: {}
                 """);
         var tildeSelection = WorkerPoolSelection.select("tilde-seed", config);
         var tildeStore = new PoolStore(

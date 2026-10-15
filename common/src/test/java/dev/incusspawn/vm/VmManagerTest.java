@@ -559,14 +559,13 @@ class VmManagerTest {
             throws Exception {
         var config = tempHome.resolve("config-" + name + ".yaml");
         Files.writeString(config, """
-                worker-pools:
-                  %s:
-                    cpus: %d
-                    memory-mib: %d
-                    swap: %s
-                    runtime-root: /opt/isx/runtime
-                    workspace-root: /opt/isx/workspace
-                    reference-roots: {}
+                %s:
+                  cpus: %d
+                  memory-mib: %d
+                  swap: %s
+                  runtime-root: /opt/isx/runtime
+                  workspace-root: /opt/isx/workspace
+                  reference-roots: {}
                 """.formatted(name, cpus, memoryMib, swap));
         return WorkerPoolSelection.select(name, config);
     }

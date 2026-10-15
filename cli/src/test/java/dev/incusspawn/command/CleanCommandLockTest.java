@@ -55,16 +55,15 @@ class CleanCommandLockTest {
     void namedStateCleanupRetainsSelectedPoolBehavior() throws Exception {
         var runtime = Files.createDirectory(home.resolve("runtime"));
         var workspace = Files.createDirectory(home.resolve("workspace"));
-        var config = home.resolve("config.yaml");
+        var config = home.resolve("worker-pools.yaml");
         Files.writeString(config, """
-                worker-pools:
-                  compile:
-                    cpus: 2
-                    memory-mib: 4096
-                    swap: 8G
-                    runtime-root: %s
-                    workspace-root: %s
-                    reference-roots: {}
+                compile:
+                  cpus: 2
+                  memory-mib: 4096
+                  swap: 8G
+                  runtime-root: %s
+                  workspace-root: %s
+                  reference-roots: {}
                 """.formatted(runtime, workspace));
         var anyProbeCalled = new AtomicBoolean();
 

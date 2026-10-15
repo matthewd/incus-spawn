@@ -926,26 +926,25 @@ Resolution order (later sources override earlier ones with the same name):
 
 ### Worker pools
 
-A process can select a named worker pool with `ISX_POOL`. Pool selection is fixed for the life of the process; unset preserves the original single-VM behavior and every legacy path. A set value must name a valid entry in `config.yaml`, or the command exits before doing any work. Pool and reference names use lowercase letters, digits, and hyphens and must start with a letter; reference names are limited to 22 characters so `isx-reference-<name>` fits the virtio-fs tag limit.
+A process can select a named worker pool with `ISX_POOL`. Pool selection is fixed for the life of the process; unset preserves the original single-VM behavior and every legacy path. A set value must name a valid entry in `~/.config/incus-spawn/worker-pools.yaml`, or the command exits before doing any work. That file maps each pool name to its definition; it is kept apart from `config.yaml` so that provisioning pools never needs to touch the file holding proxy credentials. Pool and reference names use lowercase letters, digits, and hyphens and must start with a letter; reference names are limited to 22 characters so `isx-reference-<name>` fits the virtio-fs tag limit.
 
 ```yaml
-worker-pools:
-  compile:
-    cpus: 8
-    memory-mib: 12288
-    swap: 16G
-    runtime-root: ~/isx/runtime
-    workspace-root: ~/isx/workspaces
-    reference-roots:
-      maven: ~/.m2
-      sources: ~/src-reference
-    direct-resources:
-      ~/src/large-project:
-        cpus: 12
-        memory-mib: 24576
+compile:
+  cpus: 8
+  memory-mib: 12288
+  swap: 16G
+  runtime-root: ~/isx/runtime
+  workspace-root: ~/isx/workspaces
+  reference-roots:
+    maven: ~/.m2
+    sources: ~/src-reference
+  direct-resources:
+    ~/src/large-project:
+      cpus: 12
+      memory-mib: 24576
 ```
 
-Every field except `direct-resources` is required; `reference-roots` may be `{}`. Export paths must be absolute or start with `~/`, and roots may not duplicate, contain, or be contained by another root after canonicalization. The runtime and workspace roots are created when the pool is prepared; reference roots must already exist as directories. `runtime-root` and every reference root are read-only exports, while `workspace-root` is read-write. Paths containing a comma, newline, or NUL cannot be represented by vfkit's device syntax and are rejected.
+Every field except `direct-resources` is required; `reference-roots` may be `{}`. A missing or empty `worker-pools.yaml` declares no pools. Export paths must be absolute or start with `~/`, and roots may not duplicate, contain, or be contained by another root after canonicalization. The runtime and workspace roots are created when the pool is prepared; reference roots must already exist as directories. `runtime-root` and every reference root are read-only exports, while `workspace-root` is read-write. Paths containing a comma, newline, or NUL cannot be represented by vfkit's device syntax and are rejected.
 
 A materialized pool reads `cpus` and `memory-mib` from its current seed entry whenever an `isx` process selects it. An optional `direct-resources` map overrides either value for one Direct root; each key may be absolute or start with `~/` and is normalized and canonicalized before exact matching. An omitted field inherits the seed default. A stopped materialized VM therefore picks up CPU or memory edits on its next start without resealing or rematerializing. Its swap image and descriptor-bound runtime, workspace, reference, and Direct roots remain frozen; changing those seed fields does not mutate an existing materialized pool.
 

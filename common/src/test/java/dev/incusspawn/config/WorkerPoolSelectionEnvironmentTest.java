@@ -15,7 +15,7 @@ class WorkerPoolSelectionEnvironmentTest {
     @Test
     void unsetSelectorsRemainLegacy() {
         var selection = WorkerPoolSelection.selectEnvironment(
-                null, null, null, home.resolve("config.yaml"), home.resolve("state"), home);
+                null, null, null, home.resolve("worker-pools.yaml"), home.resolve("state"), home);
 
         assertTrue(selection.isLegacy());
     }
@@ -24,13 +24,13 @@ class WorkerPoolSelectionEnvironmentTest {
     void materializedNameAndIdentityAreAnIndivisiblePair() {
         var missingIdentity = assertThrows(IllegalStateException.class,
                 () -> WorkerPoolSelection.selectEnvironment(
-                        null, "job-one", null, home.resolve("config.yaml"),
+                        null, "job-one", null, home.resolve("worker-pools.yaml"),
                         home.resolve("state"), home));
         assertTrue(missingIdentity.getMessage().contains("must be set together"));
 
         var missingName = assertThrows(IllegalStateException.class,
                 () -> WorkerPoolSelection.selectEnvironment(
-                        null, null, "a".repeat(64), home.resolve("config.yaml"),
+                        null, null, "a".repeat(64), home.resolve("worker-pools.yaml"),
                         home.resolve("state"), home));
         assertTrue(missingName.getMessage().contains("must be set together"));
     }
@@ -39,14 +39,14 @@ class WorkerPoolSelectionEnvironmentTest {
     void maintenanceRequiresAnExactMaterializedSelection() {
         var missingSelection = assertThrows(IllegalStateException.class,
                 () -> WorkerPoolSelection.selectEnvironment(
-                        null, null, null, "1", home.resolve("config.yaml"),
+                        null, null, null, "1", home.resolve("worker-pools.yaml"),
                         home.resolve("state"), home));
         assertTrue(missingSelection.getMessage().contains("requires a materialized"));
 
         var invalidValue = assertThrows(IllegalStateException.class,
                 () -> WorkerPoolSelection.selectEnvironment(
                         null, "job-one", "a".repeat(64), "true",
-                        home.resolve("config.yaml"), home.resolve("state"), home));
+                        home.resolve("worker-pools.yaml"), home.resolve("state"), home));
         assertTrue(invalidValue.getMessage().contains("must be exactly '1'"));
     }
 
@@ -54,7 +54,7 @@ class WorkerPoolSelectionEnvironmentTest {
     void staticAndMaterializedSelectorsCannotBeCombined() {
         var failure = assertThrows(IllegalStateException.class,
                 () -> WorkerPoolSelection.selectEnvironment(
-                        "seed", "job-one", "a".repeat(64), home.resolve("config.yaml"),
+                        "seed", "job-one", "a".repeat(64), home.resolve("worker-pools.yaml"),
                         home.resolve("state"), home));
 
         assertTrue(failure.getMessage().contains("cannot be combined"));

@@ -62,16 +62,15 @@ class WorkerPoolSelectionTest {
 
     @Test
     void namedSelectionIsolatesVmStateAndInstanceLocks() throws Exception {
-        var config = tempDir.resolve("config.yaml");
+        var config = tempDir.resolve("worker-pools.yaml");
         Files.writeString(config, """
-                worker-pools:
-                  compile:
-                    cpus: 8
-                    memory-mib: 12288
-                    swap: 16G
-                    runtime-root: /opt/isx/runtime
-                    workspace-root: /opt/isx/workspace
-                    reference-roots: {}
+                compile:
+                  cpus: 8
+                  memory-mib: 12288
+                  swap: 16G
+                  runtime-root: /opt/isx/runtime
+                  workspace-root: /opt/isx/workspace
+                  reference-roots: {}
                 """);
         var selected = WorkerPoolSelection.select("compile", config);
         var globalState = tempDir.resolve(".local/state/incus-spawn");

@@ -48,8 +48,8 @@ public final class WorkerPoolSelection {
         return new WorkerPoolSelection(Kind.LEGACY, null, null, null, false, null);
     }
 
-    /** Strict, testable static selection from an explicit environment value and config file. */
-    public static WorkerPoolSelection select(String requestedName, Path configFile) {
+    /** Strict, testable static selection from an explicit environment value and pools file. */
+    public static WorkerPoolSelection select(String requestedName, Path poolsFile) {
         if (requestedName == null) return legacy();
         if (!WorkerPoolConfig.isSafeName(requestedName)) {
             throw new IllegalStateException(ENVIRONMENT_VARIABLE + " has unsafe worker pool name '"
@@ -57,11 +57,10 @@ public final class WorkerPoolSelection {
                     + "' (use lowercase letters, digits, and hyphens; start with a letter)");
         }
 
-        var config = SpawnConfig.loadStrict(configFile);
-        var selected = config.getWorkerPools().get(requestedName);
+        var selected = WorkerPoolsFile.loadStrict(poolsFile).get(requestedName);
         if (selected == null) {
             throw new IllegalStateException("worker pool '" + requestedName
-                    + "' selected by " + ENVIRONMENT_VARIABLE + " is not defined in " + configFile);
+                    + "' selected by " + ENVIRONMENT_VARIABLE + " is not defined in " + poolsFile);
         }
         // loadStrict validated every pool. Freeze again only to make this method safe if that
         // implementation changes; it also gives the selection its own immutable map.
@@ -82,22 +81,21 @@ public final class WorkerPoolSelection {
     /** Resolve current seed CPU/memory without changing the descriptor-bound export plan. */
     public static WorkerPoolSelection selectMaterialized(
             String requestedName, String expectedIdentity, Path globalStateDir, Path home,
-            Path configFile) {
+            Path poolsFile) {
         return selectMaterialized(
-                requestedName, expectedIdentity, globalStateDir, home, configFile, false);
+                requestedName, expectedIdentity, globalStateDir, home, poolsFile, false);
     }
 
     static WorkerPoolSelection selectMaterialized(
             String requestedName, String expectedIdentity, Path globalStateDir, Path home,
-            Path configFile, boolean maintenance) {
+            Path poolsFile, boolean maintenance) {
         var descriptor = loadMaterializedDescriptor(
                 requestedName, expectedIdentity, globalStateDir, home);
-        var config = SpawnConfig.loadStrict(configFile);
-        var seed = config.getWorkerPools().get(descriptor.seedPool());
+        var seed = WorkerPoolsFile.loadStrict(poolsFile).get(descriptor.seedPool());
         if (seed == null) {
             throw new IllegalStateException("worker pool '" + descriptor.seedPool()
                     + "' used by materialized pool '" + requestedName
-                    + "' is not defined in " + configFile);
+                    + "' is not defined in " + poolsFile);
         }
         var selectedSeed = seed.validateAndFreeze(descriptor.seedPool(), home);
         var resources = selectedSeed.resourcesForDirectRoot(descriptor.directRoot());
@@ -133,7 +131,7 @@ public final class WorkerPoolSelection {
         try {
             return selectEnvironment(
                     requestedStatic, requestedMaterialized, expectedIdentity,
-                    requestedMaintenance, Environment.configDir().resolve("config.yaml"),
+                    requestedMaintenance, WorkerPoolsFile.defaultPath(),
                     Environment.stateDir(), Environment.home());
         } catch (IllegalStateException e) {
             // Static-initializer exceptions are wrapped in ExceptionInInitializerError and lose the
@@ -147,15 +145,15 @@ public final class WorkerPoolSelection {
 
     static WorkerPoolSelection selectEnvironment(
             String requestedStatic, String requestedMaterialized, String expectedIdentity,
-            Path configFile, Path globalStateDir, Path home) {
+            Path poolsFile, Path globalStateDir, Path home) {
         return selectEnvironment(
                 requestedStatic, requestedMaterialized, expectedIdentity, null,
-                configFile, globalStateDir, home);
+                poolsFile, globalStateDir, home);
     }
 
     static WorkerPoolSelection selectEnvironment(
             String requestedStatic, String requestedMaterialized, String expectedIdentity,
-            String requestedMaintenance, Path configFile, Path globalStateDir, Path home) {
+            String requestedMaintenance, Path poolsFile, Path globalStateDir, Path home) {
         if (requestedMaintenance != null && !"1".equals(requestedMaintenance)) {
             throw new IllegalStateException(MATERIALIZED_MAINTENANCE_ENVIRONMENT_VARIABLE
                     + " must be exactly '1' when set");
@@ -165,7 +163,7 @@ public final class WorkerPoolSelection {
                 throw new IllegalStateException(MATERIALIZED_MAINTENANCE_ENVIRONMENT_VARIABLE
                         + " requires a materialized pool selection");
             }
-            return requestedStatic == null ? legacy() : select(requestedStatic, configFile);
+            return requestedStatic == null ? legacy() : select(requestedStatic, poolsFile);
         }
         if (requestedMaterialized == null || expectedIdentity == null) {
             throw new IllegalStateException(MATERIALIZED_ENVIRONMENT_VARIABLE + " and "
@@ -177,7 +175,7 @@ public final class WorkerPoolSelection {
         }
         return selectMaterialized(
                 requestedMaterialized, expectedIdentity, globalStateDir, home,
-                configFile, requestedMaintenance != null);
+                poolsFile, requestedMaintenance != null);
     }
 
     /** The immutable process selection. There is intentionally no setter or reset hook. */
