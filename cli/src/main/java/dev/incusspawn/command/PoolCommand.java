@@ -1,5 +1,7 @@
 package dev.incusspawn.command;
 
+import dev.incusspawn.Environment;
+import dev.incusspawn.config.WorkerPoolsFile;
 import dev.incusspawn.pool.PoolProtocol;
 import dev.incusspawn.pool.PoolStore;
 import org.aesh.command.CommandDefinition;
@@ -9,9 +11,10 @@ import org.aesh.command.option.Option;
 /** Versioned, non-interactive management API for macOS direct worker pools. */
 @CommandDefinition(
         name = "pool",
-        description = "Inspect, seal, and materialize dedicated worker pools (macOS)",
+        description = "List, inspect, seal, and materialize dedicated worker pools (macOS)",
         generateHelp = true,
         groupCommands = {
+                PoolCommand.ListPools.class,
                 PoolCommand.Inspect.class,
                 PoolCommand.Seal.class,
                 PoolCommand.Materialize.class
@@ -22,6 +25,24 @@ public class PoolCommand extends BaseCommand {
     protected CommandResult doExecute() {
         System.out.println(commandInvocation.getHelpInfo());
         return CommandResult.SUCCESS;
+    }
+
+    @CommandDefinition(
+            name = "list",
+            description = "List declared static worker pools and their shared roots",
+            generateHelp = true)
+    public static class ListPools extends BaseCommand {
+        @Override
+        protected CommandResult doExecute() {
+            try {
+                System.out.println(PoolProtocol.listLine(PoolStore.listStatic(
+                        WorkerPoolsFile.defaultPath(), Environment.home())));
+                return CommandResult.SUCCESS;
+            } catch (Exception e) {
+                System.out.println(PoolProtocol.errorLine("list", e));
+                return CommandResult.valueOf(1);
+            }
+        }
     }
 
     @CommandDefinition(

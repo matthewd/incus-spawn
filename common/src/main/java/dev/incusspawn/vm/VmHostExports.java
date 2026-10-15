@@ -161,6 +161,27 @@ public final class VmHostExports {
         return new VmHostExports(poolName, exports);
     }
 
+    /** Canonical host paths of a static pool's workspace and reference exports. */
+    public record PlannedRoots(Path workspaceRoot, java.util.SortedMap<String, Path> referenceRoots) {}
+
+    /**
+     * Resolve the host paths {@link #create} would export for the workspace and reference roots,
+     * without creating or requiring any of them. A root that does not exist yet resolves through
+     * its longest existing ancestor, as it would before creation.
+     */
+    public static PlannedRoots plannedRoots(
+            String poolName, WorkerPoolConfig.Selected pool, Path home) {
+        var workspace = canonicalizeExistingAncestor(
+                expand(pool.workspaceRoot().path(), home, "workspace-root"),
+                poolName, "workspace-root");
+        var references = new java.util.TreeMap<String, Path>();
+        pool.referenceRoots().forEach((name, export) -> references.put(name,
+                canonicalizeExistingAncestor(
+                        expand(export.path(), home, "reference-roots." + name),
+                        poolName, "reference-roots." + name)));
+        return new PlannedRoots(workspace, java.util.Collections.unmodifiableSortedMap(references));
+    }
+
     /** Reconstruct a descriptor-bound export plan without consulting host-root filesystem state. */
     public static VmHostExports createFrozen(
             String poolName, WorkerPoolConfig.Selected pool) {

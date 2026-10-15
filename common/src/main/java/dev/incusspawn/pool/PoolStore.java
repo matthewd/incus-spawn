@@ -3,6 +3,7 @@ package dev.incusspawn.pool;
 import dev.incusspawn.Environment;
 import dev.incusspawn.config.WorkerPoolConfig;
 import dev.incusspawn.config.WorkerPoolSelection;
+import dev.incusspawn.config.WorkerPoolsFile;
 import dev.incusspawn.util.BoundedFileLock;
 import dev.incusspawn.vm.VmHostExports;
 import dev.incusspawn.vm.VmManager;
@@ -20,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /** Filesystem-backed sealing and APFS-clone materialization for direct worker pools. */
@@ -34,6 +36,10 @@ public final class PoolStore {
     public record InspectResult(
             String seedPool, boolean running, boolean sealed,
             String generation, String identity) {}
+
+    /** One declared static pool and the canonical host paths of its shared roots. */
+    public record ListedPool(
+            String name, Path workspaceRoot, Map<String, Path> referenceRoots) {}
 
     public record SealResult(
             boolean changed, String seedPool, String generation, String identity) {}
@@ -88,6 +94,24 @@ public final class PoolStore {
                 Environment.applianceKernel(), Environment.applianceDir().resolve("version"),
                 VmManager.applianceVersion(), WorkerPoolSelection.current(),
                 new SystemOperations(), new SecureRandom());
+    }
+
+    /**
+     * List every static pool declared in {@code poolsFile}, in declaration order. This reads
+     * configuration only: it takes no lock, needs no pool selection, and creates nothing.
+     */
+    public static List<ListedPool> listStatic(Path poolsFile, Path home) {
+        try {
+            var listed = new ArrayList<ListedPool>();
+            WorkerPoolsFile.loadStrict(poolsFile).forEach((name, config) -> {
+                var roots = VmHostExports.plannedRoots(
+                        name, config.validateAndFreeze(name, home), home);
+                listed.add(new ListedPool(name, roots.workspaceRoot(), roots.referenceRoots()));
+            });
+            return List.copyOf(listed);
+        } catch (IllegalStateException e) {
+            throw new PoolException("list_failed", e.getMessage(), e);
+        }
     }
 
     /** Inspect whether the selected static named pool is stopped and has a valid latest seal. */

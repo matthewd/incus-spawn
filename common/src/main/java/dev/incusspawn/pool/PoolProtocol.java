@@ -6,7 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Version-one one-line JSON protocol for inspecting, sealing, and materializing worker pools. */
+/** Version-one one-line JSON protocol for listing, inspecting, sealing, and materializing worker pools. */
 public final class PoolProtocol {
 
     public static final String PROTOCOL = "isx-pool";
@@ -22,6 +22,22 @@ public final class PoolProtocol {
         response.put("sealed", result.sealed());
         response.put("generation", result.generation());
         response.put("generation_identity", result.identity());
+        return json(response);
+    }
+
+    public static String listLine(java.util.List<PoolStore.ListedPool> pools) {
+        var response = envelope("list", true);
+        var listed = new java.util.ArrayList<Map<String, Object>>();
+        for (var pool : pools) {
+            var entry = new LinkedHashMap<String, Object>();
+            entry.put("name", pool.name());
+            entry.put("workspace_root", pool.workspaceRoot().toString());
+            var references = new LinkedHashMap<String, Object>();
+            pool.referenceRoots().forEach((name, path) -> references.put(name, path.toString()));
+            entry.put("reference_roots", references);
+            listed.add(entry);
+        }
+        response.put("pools", listed);
         return json(response);
     }
 

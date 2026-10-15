@@ -1044,7 +1044,7 @@ Beyond security, a shared project directory is also **misleading**. The agent's 
 | [`isx doctor`](#isx-doctor) | Diagnose host, proxy, VM, and tunnel health |
 | [`isx clean`](#isx-clean) | Remove cached data, state, or configuration |
 | [`isx vm`](#isx-vm) | Manage the VM appliance (macOS only) |
-| [`isx pool`](#isx-pool) | Seal and materialize direct worker pools (macOS only) |
+| [`isx pool`](#isx-pool) | List, seal, and materialize worker pools (macOS only) |
 | [`isx help`](#isx-help) | AI-powered help |
 | [`isx completion`](#isx-completion) | Print shell completion script |
 
@@ -1399,12 +1399,13 @@ Size must be larger than the current disk (grow-only), e.g. `100G`.
 
 ### `isx pool`
 
-Inspect or seal a stopped static named pool, or materialize an identity-bound direct pool. macOS only. All subcommands emit one line of versioned JSON.
+List the declared static pools, inspect or seal a stopped static named pool, or materialize an identity-bound direct pool. macOS only. All subcommands emit one line of versioned JSON.
 
     ISX_POOL=<seed> isx pool <subcommand> [options]
 
 | Subcommand | Description |
 |------------|-------------|
+| `list` | Report every pool in `worker-pools.yaml` with its canonical workspace and named reference roots; needs no `ISX_POOL` |
 | `inspect` | Report whether the selected static seed is stopped and has a valid sealed generation |
 | `seal` | Seal root, data, and kernel from the selected stopped static pool |
 | `materialize` | Clone a sealed generation into a new direct pool with fresh sparse swap |

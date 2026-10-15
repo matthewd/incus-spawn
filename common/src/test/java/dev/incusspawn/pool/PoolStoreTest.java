@@ -541,6 +541,61 @@ class PoolStoreTest {
     }
 
     @Test
+    void listStaticReportsCanonicalRootsWithoutCreatingThem() throws Exception {
+        var realReferences = Files.createDirectory(home.resolve("real-references"));
+        Files.createSymbolicLink(home.resolve("linked-references"), realReferences);
+        var pools = home.resolve("list-pools.yaml");
+        Files.writeString(pools, """
+                routine:
+                  cpus: 2
+                  memory-mib: 2048
+                  swap: 8M
+                  runtime-root: ~/routine-runtime
+                  workspace-root: ~/not-yet/workspace
+                  reference-roots:
+                    git: ~/linked-references/git
+                    source: %s
+                seed:
+                  cpus: 2
+                  memory-mib: 2048
+                  swap: 8M
+                  runtime-root: ~/seed-runtime
+                  workspace-root: ~/seed-only
+                  reference-roots: {}
+                """.formatted(realReferences.resolve("source")));
+
+        var listed = PoolStore.listStatic(pools, home);
+
+        var canonicalHome = home.toRealPath();
+        assertEquals(java.util.List.of("routine", "seed"),
+                listed.stream().map(PoolStore.ListedPool::name).toList());
+        var routine = listed.get(0);
+        assertEquals(canonicalHome.resolve("not-yet/workspace"), routine.workspaceRoot());
+        assertEquals(java.util.Map.of(
+                "git", realReferences.toRealPath().resolve("git"),
+                "source", realReferences.toRealPath().resolve("source")),
+                routine.referenceRoots());
+        assertEquals(java.util.Map.of(), listed.get(1).referenceRoots());
+        assertFalse(Files.exists(home.resolve("not-yet")), "listing must not create roots");
+        assertFalse(Files.exists(home.resolve("routine-runtime")));
+    }
+
+    @Test
+    void listStaticReportsInvalidDeclarationsWithStableCode() throws Exception {
+        var pools = home.resolve("invalid-pools.yaml");
+        Files.writeString(pools, """
+                routine:
+                  cpus: 0
+                """);
+
+        var failure = assertThrows(PoolStore.PoolException.class,
+                () -> PoolStore.listStatic(pools, home));
+
+        assertEquals("list_failed", failure.code());
+        assertTrue(failure.getMessage().contains("routine"));
+    }
+
+    @Test
     void directRootCannotOverlapTildeExpandedSeedWorkspace() throws Exception {
         var tildeWorkspace = Files.createDirectories(home.resolve("tilde-workspace"));
         var nested = Files.createDirectory(tildeWorkspace.resolve("project"));

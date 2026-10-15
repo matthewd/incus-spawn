@@ -46,6 +46,40 @@ class PoolProtocolTest {
     }
 
     @Test
+    void listResponseCarriesEachPoolsSharedRoots() throws Exception {
+        var line = PoolProtocol.listLine(java.util.List.of(
+                new PoolStore.ListedPool("routine", java.nio.file.Path.of("/Users/me/bb"),
+                        new java.util.TreeMap<>(java.util.Map.of(
+                                "git", java.nio.file.Path.of("/Users/me/references/git"),
+                                "common", java.nio.file.Path.of("/Users/me/.common")))),
+                new PoolStore.ListedPool("seed", java.nio.file.Path.of("/Users/me/seed"),
+                        java.util.Map.of())));
+
+        var json = JSON.readTree(line);
+        assertEquals("isx-pool", json.path("protocol").asText());
+        assertEquals(1, json.path("version").asInt());
+        assertEquals("list", json.path("operation").asText());
+        assertTrue(json.path("ok").asBoolean());
+        var pools = json.path("pools");
+        assertEquals(2, pools.size());
+        assertEquals("routine", pools.get(0).path("name").asText());
+        assertEquals("/Users/me/bb", pools.get(0).path("workspace_root").asText());
+        assertEquals("/Users/me/references/git",
+                pools.get(0).path("reference_roots").path("git").asText());
+        assertEquals(java.util.List.of("common", "git"), iterable(
+                pools.get(0).path("reference_roots").fieldNames()));
+        assertEquals("seed", pools.get(1).path("name").asText());
+        assertTrue(pools.get(1).path("reference_roots").isObject());
+        assertEquals(0, pools.get(1).path("reference_roots").size());
+    }
+
+    private static java.util.List<String> iterable(java.util.Iterator<String> names) {
+        var list = new java.util.ArrayList<String>();
+        names.forEachRemaining(list::add);
+        return list;
+    }
+
+    @Test
     void knownFailureRetainsStableCode() throws Exception {
         var line = PoolProtocol.errorLine("seal",
                 new PoolStore.PoolException("seed_running", "seed must be stopped"));
