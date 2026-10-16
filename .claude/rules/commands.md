@@ -22,7 +22,7 @@ The comparison is `>=`, not equality: the sentinel is a monotonic floor, so a bi
 
 # Pool Commands
 
-`PoolCommand` is a macOS-only, one-line versioned JSON API. `inspect` verifies whether the selected static seed is stopped and has a valid latest sealed generation; `seal` requires that stopped seed and publishes a new generation; `materialize` requires the same seed selection plus name/direct-root and optionally an exact generation/identity pair. Keep filesystem/identity semantics in common's `PoolStore`/`PoolState`, not aesh fields. Materialized runtime selection is separate from the management invocation and requires `ISX_MATERIALIZED_POOL` plus `ISX_MATERIALIZED_POOL_IDENTITY`.
+`PoolCommand` is a macOS-only, one-line versioned JSON API. `inspect` verifies whether the selected static seed is stopped and has a valid latest sealed generation; `seal` requires that stopped seed and publishes a new generation; `materialize` requires the same seed selection plus name/direct-root and optionally an exact generation/identity pair. `list-materialized` needs no selection; `delete` requires the seed selection plus the pool's name and exact identity, and refuses a running pool. Keep filesystem/identity semantics in common's `PoolStore`/`PoolState`, not aesh fields. Materialized runtime selection is separate from the management invocation and requires `ISX_MATERIALIZED_POOL` plus `ISX_MATERIALIZED_POOL_IDENTITY`.
 
 # Automation Commands
 

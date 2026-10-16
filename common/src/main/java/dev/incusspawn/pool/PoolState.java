@@ -198,22 +198,11 @@ public final class PoolState {
     /** Strictly load a materialized descriptor and its provider-owned state. */
     public static MaterializedDescriptor loadMaterialized(
             Path globalStateDir, Path home, String name, String expectedIdentity) {
-        if (!WorkerPoolConfig.isSafeName(name)) {
-            throw invalid("unsafe materialized pool name '" + name + "'");
-        }
         requireIdentity(expectedIdentity, "expected materialized pool identity");
-        var owner = ownerOf(home);
-        var root = root(globalStateDir);
-        var pools = materializedRoot(globalStateDir);
-        var pool = materializedPool(globalStateDir, name);
-        requireProtectedDirectory(root, owner);
-        requireProtectedDirectory(pools, owner);
-        requireProtectedDirectory(pool, owner);
-
-        var descriptor = readJson(pool.resolve(DESCRIPTOR_FILE), MaterializedDescriptor.class,
-                owner, READ_ONLY_FILE_PERMISSIONS);
-        if (descriptor == null) throw invalid("materialized pool descriptor is empty");
+        var descriptor = loadMaterializedDescriptor(globalStateDir, home, name);
         validateDescriptor(descriptor, name, expectedIdentity);
+        var owner = ownerOf(home);
+        var pool = materializedPool(globalStateDir, name);
         var rootDisk = pool.resolve(ROOT_DISK_FILE);
         var dataDisk = pool.resolve(DATA_DISK_FILE);
         var swap = pool.resolve(SWAP_FILE);
@@ -262,19 +251,30 @@ public final class PoolState {
 
     static MaterializedDescriptor loadMaterializedUncheckedIdentity(
             Path globalStateDir, Path home, String name) {
+        var descriptor = loadMaterializedDescriptor(globalStateDir, home, name);
+        return loadMaterializedForLaunch(
+                globalStateDir, home, name, descriptor.identity(), true);
+    }
+
+    /**
+     * Load a materialized pool's protected descriptor and verify its own digest, without
+     * inspecting the disks it describes; enough to identify the pool, not to launch it.
+     */
+    static MaterializedDescriptor loadMaterializedDescriptor(
+            Path globalStateDir, Path home, String name) {
+        if (!WorkerPoolConfig.isSafeName(name)) {
+            throw invalid("unsafe materialized pool name '" + name + "'");
+        }
         var owner = ownerOf(home);
-        var root = root(globalStateDir);
-        var pools = materializedRoot(globalStateDir);
         var pool = materializedPool(globalStateDir, name);
-        requireProtectedDirectory(root, owner);
-        requireProtectedDirectory(pools, owner);
+        requireProtectedDirectory(root(globalStateDir), owner);
+        requireProtectedDirectory(materializedRoot(globalStateDir), owner);
         requireProtectedDirectory(pool, owner);
         var descriptor = readJson(pool.resolve(DESCRIPTOR_FILE), MaterializedDescriptor.class,
                 owner, READ_ONLY_FILE_PERMISSIONS);
         if (descriptor == null) throw invalid("materialized pool descriptor is empty");
         validateDescriptor(descriptor, name, descriptor.identity());
-        return loadMaterializedForLaunch(
-                globalStateDir, home, name, descriptor.identity(), true);
+        return descriptor;
     }
 
     static SeedManifest loadSeed(

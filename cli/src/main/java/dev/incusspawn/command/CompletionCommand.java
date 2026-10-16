@@ -368,17 +368,21 @@ public class CompletionCommand extends BaseCommand {
 
               local -a _pool_subcmds
               _pool_subcmds=(
+                'list:list declared static worker pools'
+                'list-materialized:list materialized direct pools'
                 'inspect:inspect the selected static seed pool'
                 'seal:seal the stopped selected static named pool'
                 'materialize:materialize an immutable direct pool'
+                'delete:delete a stopped materialized direct pool'
               )
 
               case $state in
                 subcmd) _describe -t subcmds 'pool subcommand' _pool_subcmds ;;
                 args)
                   case $line[1] in
-                    inspect|seal) _arguments '(-h --help)'{-h,--help}'[Show help]' ;;
+                    list|list-materialized|inspect|seal) _arguments '(-h --help)'{-h,--help}'[Show help]' ;;
                     materialize) _arguments '--name=[Materialized pool name]:name' '--direct-root=[Canonical project directory]:directory:_files -/' '--generation=[Exact sealed generation]:generation' '--generation-identity=[Full sealed generation SHA-256 identity]:digest' ;;
+                    delete) _arguments '--name=[Materialized pool name]:name' '--identity=[Full materialized pool SHA-256 identity]:digest' ;;
                   esac ;;
               esac
             }
@@ -709,18 +713,20 @@ public class CompletionCommand extends BaseCommand {
                   fi
                   ;;
                 pool)
-                  local pool_subcmds="inspect seal materialize"
+                  local pool_subcmds="list list-materialized inspect seal materialize delete"
                   local pool_cmd=""
                   local j
                   for (( j=i+1; j < cword; j++ )); do
                     case "${words[j]}" in
-                      inspect|seal|materialize) pool_cmd="${words[j]}"; break ;;
+                      list|list-materialized|inspect|seal|materialize|delete) pool_cmd="${words[j]}"; break ;;
                     esac
                   done
                   if [[ -z "$pool_cmd" ]]; then
                     COMPREPLY=( $(compgen -W "$pool_subcmds --help" -- "$cur") )
                   elif [[ "$pool_cmd" == "materialize" ]]; then
                     COMPREPLY=( $(compgen -W "--help --name --direct-root --generation --generation-identity" -- "$cur") )
+                  elif [[ "$pool_cmd" == "delete" ]]; then
+                    COMPREPLY=( $(compgen -W "--help --name --identity" -- "$cur") )
                   else
                     COMPREPLY=( $(compgen -W "--help" -- "$cur") )
                   fi
@@ -930,13 +936,18 @@ public class CompletionCommand extends BaseCommand {
 
             # ── pool ────────────────────────────────────────────────────────────────────
 
-            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(inspect|seal|materialize)\\b" (commandline -opc)' -a inspect -d 'Inspect the selected static seed pool'
-            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(inspect|seal|materialize)\\b" (commandline -opc)' -a seal -d 'Seal the stopped selected static named pool'
-            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(inspect|seal|materialize)\\b" (commandline -opc)' -a materialize -d 'Materialize an immutable direct pool'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(list|list-materialized|inspect|seal|materialize|delete)\\b" (commandline -opc)' -a list -d 'List declared static worker pools'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(list|list-materialized|inspect|seal|materialize|delete)\\b" (commandline -opc)' -a list-materialized -d 'List materialized direct pools'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(list|list-materialized|inspect|seal|materialize|delete)\\b" (commandline -opc)' -a inspect -d 'Inspect the selected static seed pool'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(list|list-materialized|inspect|seal|materialize|delete)\\b" (commandline -opc)' -a seal -d 'Seal the stopped selected static named pool'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(list|list-materialized|inspect|seal|materialize|delete)\\b" (commandline -opc)' -a materialize -d 'Materialize an immutable direct pool'
+            complete -c isx -f -n '__isx_using_subcommand pool; and not string match -qr -- "\\b(list|list-materialized|inspect|seal|materialize|delete)\\b" (commandline -opc)' -a delete -d 'Delete a stopped materialized direct pool'
             complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l name -d 'Materialized pool name'
             complete -c isx -F -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l direct-root -d 'Canonical project directory'
             complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l generation -d 'Exact sealed generation'
             complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand materialize' -l generation-identity -d 'Full sealed generation SHA-256 identity'
+            complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand delete' -l name -d 'Materialized pool name'
+            complete -c isx -f -n '__isx_using_subcommand pool; and __isx_using_subcommand delete' -l identity -d 'Full materialized pool SHA-256 identity'
 
             # ── update-base ─────────────────────────────────────────────────────────────
 

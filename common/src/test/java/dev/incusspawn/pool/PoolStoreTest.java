@@ -868,6 +868,118 @@ class PoolStoreTest {
         assertEquals("pool_conflict", failure.code());
     }
 
+    @Test
+    void listMaterializedReportsEachPoolsSealGeneration() {
+        var store = store();
+        assertEquals(java.util.List.of(), store.listMaterialized(),
+                "an absent registry lists nothing");
+        var first = store.seal();
+        var one = store.materialize(
+                "job-one", direct.toString(), first.generation(), first.identity());
+        var second = store.seal();
+        var two = store.materialize(
+                "job-two", direct.toString(), second.generation(), second.identity());
+
+        var listed = store.listMaterialized();
+
+        assertEquals(java.util.List.of(
+                new PoolStore.ListedMaterializedPool("job-one", one.identity(), "seed",
+                        first.generation(), first.identity(), false),
+                new PoolStore.ListedMaterializedPool("job-two", two.identity(), "seed",
+                        second.generation(), second.identity(), false)), listed);
+    }
+
+    @Test
+    void deleteRemovesAStoppedPoolSoItsNameCanBeMaterializedAgain() throws Exception {
+        var store = store();
+        var seal = store.seal();
+        var materialized = store.materialize(
+                "job-one", direct.toString(), seal.generation(), seal.identity());
+        var vmLock = WorkerPoolSelection.selectMaterialized(
+                "job-one", materialized.identity(), state, home)
+                .vmLockFile(PoolStore.lockRoot(state));
+
+        var deleted = store.delete("job-one", materialized.identity());
+
+        assertEquals(new PoolStore.DeleteResult(
+                true, "job-one", materialized.identity(), "seed"), deleted);
+        assertFalse(Files.exists(PoolState.materializedPool(state, "job-one")));
+        try (var entries = Files.list(PoolState.materializedRoot(state))) {
+            assertEquals(0, entries.count(), "no staging remains after a complete delete");
+        }
+        assertEquals(java.util.List.of(), store.listMaterialized());
+        assertTrue(Files.exists(vmLock), "VM lock inode must not be unlinked after use");
+        assertFalse(store.delete("job-one", materialized.identity()).changed(),
+                "deleting an absent pool is already done");
+
+        var again = store.materialize(
+                "job-one", direct.toString(), seal.generation(), seal.identity());
+        assertTrue(again.changed());
+    }
+
+    @Test
+    void deleteRefusesARunningPoolOrADifferentIdentity() {
+        var store = store();
+        var seal = store.seal();
+        var materialized = store.materialize(
+                "job-one", direct.toString(), seal.generation(), seal.identity());
+        var poolState = PoolState.materializedPool(state, "job-one");
+
+        var conflict = assertThrows(PoolStore.PoolException.class,
+                () -> store.delete("job-one", "0".repeat(64)));
+        assertEquals("pool_conflict", conflict.code());
+
+        operations.running = true;
+        var running = assertThrows(PoolStore.PoolException.class,
+                () -> store.delete("job-one", materialized.identity()));
+        assertEquals("pool_running", running.code());
+        assertTrue(Files.isRegularFile(poolState.resolve(PoolState.DESCRIPTOR_FILE)));
+
+        var invalid = assertThrows(PoolStore.PoolException.class,
+                () -> store.delete("job-one", "not-an-identity"));
+        assertEquals("invalid_request", invalid.code());
+    }
+
+    @Test
+    void deleteWaitsForThePoolsOwnVmLock() throws Exception {
+        var store = store();
+        var seal = store.seal();
+        var materialized = store.materialize(
+                "job-one", direct.toString(), seal.generation(), seal.identity());
+        var vmLock = WorkerPoolSelection.selectMaterialized(
+                "job-one", materialized.identity(), state, home)
+                .vmLockFile(PoolStore.lockRoot(state));
+        var executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+        BoundedFileLock held = BoundedFileLock.acquire(vmLock, Duration.ofSeconds(1),
+                null, "test lock timed out");
+        try {
+            var deleting = executor.submit(
+                    () -> store.delete("job-one", materialized.identity()));
+            Thread.sleep(100);
+            assertFalse(deleting.isDone(), "delete must wait while the pool's VM lock is held");
+            held.close();
+            held = null;
+            assertTrue(deleting.get(5, java.util.concurrent.TimeUnit.SECONDS).changed());
+        } finally {
+            if (held != null) held.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void anInterruptedDeleteIsNeitherListedNorInTheWayOfTheNextOne() throws Exception {
+        var store = store();
+        var seal = store.seal();
+        var materialized = store.materialize(
+                "job-one", direct.toString(), seal.generation(), seal.identity());
+        var leftover = PoolState.materializedRoot(state).resolve(".staging-job-one-interrupted");
+        Files.move(PoolState.materializedPool(state, "job-one"), leftover);
+
+        assertEquals(java.util.List.of(), store.listMaterialized());
+        assertFalse(store.delete("job-one", materialized.identity()).changed());
+        assertFalse(Files.exists(leftover), "the next delete clears an interrupted one");
+    }
+
     private PoolStore store() {
         return new PoolStore(state, home, applianceKernel, applianceVersionFile, "1.2.3",
                 seedSelection, operations, new SecureRandom());

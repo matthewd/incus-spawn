@@ -302,9 +302,15 @@ public final class WorkerPoolSelection {
         return switch (kind) {
             case LEGACY -> globalLockRoot.resolve("legacy");
             case STATIC -> globalLockRoot.resolve("static-" + name);
-            case MATERIALIZED -> globalLockRoot.resolve("materialized-" + name + "-" + identity);
+            case MATERIALIZED -> materializedLifecycleLockDir(globalLockRoot, name, identity);
             case INVALID -> throw new IllegalStateException(error);
         };
+    }
+
+    /** The lifecycle lock namespace of a materialized pool, for callers that don't select it. */
+    public static Path materializedLifecycleLockDir(
+            Path globalLockRoot, String name, String identity) {
+        return globalLockRoot.resolve("materialized-" + name + "-" + identity);
     }
 
     public Path vmLockFile(Path globalLockRoot) {

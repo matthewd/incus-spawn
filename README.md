@@ -994,7 +994,13 @@ ISX_MATERIALIZED_POOL_IDENTITY=<identity-from-materialize> \
 isx automation create --help
 ```
 
-Materialized state lives under `~/.local/state/incus-spawn/direct-pools/pools/<name>/`. Its ephemeral vsock endpoints use compact identity-derived filenames directly under `~/.local/state/incus-spawn/` so generated pool names cannot exceed macOS's Unix-socket path limit. Bounded management, VM, and per-instance locks live separately under `~/.local/state/incus-spawn-locks/`, so recursive state cleanup cannot unlink a held lock; clean, resize, lifecycle, seal, and materialize operations serialize in management-then-VM order where both apply. Its boot root and kernel stay pinned to the sealed generation, while its cloned Incus data disk remains pool-local and mutable; ordinary appliance upgrades do not replace the pinned boot artifacts. Before every launch, ISX rechecks physical root/data/swap file types, disk-image shape, swap size, and the pool-local kernel digest. The owner-only directories, file modes, and digest-bound metadata detect accidental or out-of-band changes, but do not claim to make files unchangeable by the host user who owns them. The descriptor identity also scopes the deterministic VM MAC, so recreating a name from different material does not reuse the old network identity.
+`isx pool list-materialized` reports every materialized pool with its seed, sealed generation, and whether its VM is running; it identifies each by its verified descriptor without inspecting its disks, and needs no `ISX_POOL`. Deleting a pool runs under its seed, like materialization, and requires the pool's full identity and a stopped VM. It discards the pool's VM and every instance inside it, which only the caller can know is safe. The pool's state moves out of its published path before removal, so an interrupted deletion leaves only staging that the next deletion or materialization of that name clears; an absent pool reports `changed: false`.
+
+```shell
+ISX_POOL=compile isx pool delete --name job-17 --identity <identity-from-materialize>
+```
+
+Materialized state lives under `~/.local/state/incus-spawn/direct-pools/pools/<name>/`. Its ephemeral vsock endpoints use compact identity-derived filenames directly under `~/.local/state/incus-spawn/` so generated pool names cannot exceed macOS's Unix-socket path limit. Bounded management, VM, and per-instance locks live separately under `~/.local/state/incus-spawn-locks/`, so recursive state cleanup cannot unlink a held lock; clean, resize, lifecycle, seal, materialize, and delete operations serialize in management-then-VM order where both apply. Its boot root and kernel stay pinned to the sealed generation, while its cloned Incus data disk remains pool-local and mutable; ordinary appliance upgrades do not replace the pinned boot artifacts. Before every launch, ISX rechecks physical root/data/swap file types, disk-image shape, swap size, and the pool-local kernel digest. The owner-only directories, file modes, and digest-bound metadata detect accidental or out-of-band changes, but do not claim to make files unchangeable by the host user who owns them. The descriptor identity also scopes the deterministic VM MAC, so recreating a name from different material does not reuse the old network identity.
 
 A materialized VM adds exactly one launch-time `isx-direct` virtio-fs export at `/host/direct`, read-write, in addition to its frozen runtime and reference exports and its pool-local workspace. No static YAML field can add that export. Automation mounts retain the leaf-only rule for every normal export; the one exception is an exact, read-write mount of the descriptor's direct root. The export set remains fixed for the VM process and is still covered by the persisted launch fingerprint.
 
@@ -1399,7 +1405,7 @@ Size must be larger than the current disk (grow-only), e.g. `100G`.
 
 ### `isx pool`
 
-List the declared static pools, inspect or seal a stopped static named pool, or materialize an identity-bound direct pool. macOS only. All subcommands emit one line of versioned JSON.
+List the declared static or materialized pools, inspect or seal a stopped static named pool, or materialize or delete an identity-bound direct pool. macOS only. All subcommands emit one line of versioned JSON.
 
     ISX_POOL=<seed> isx pool <subcommand> [options]
 
@@ -1408,9 +1414,11 @@ List the declared static pools, inspect or seal a stopped static named pool, or 
 | `list` | Report every pool in `worker-pools.yaml` with its canonical workspace and named reference roots; needs no `ISX_POOL` |
 | `inspect` | Report whether the selected static seed is stopped and has a valid sealed generation |
 | `seal` | Seal root, data, and kernel from the selected stopped static pool |
+| `list-materialized` | Report every materialized pool with its seed and sealed generation; needs no `ISX_POOL` |
 | `materialize` | Clone a sealed generation into a new direct pool with fresh sparse swap |
+| `delete` | Delete a stopped materialized pool of the selected seed, with every instance inside it |
 
-`materialize` requires `--name` and `--direct-root`. `--generation` and `--generation-identity` are optional only as a pair; omitting both selects the latest sealed generation.
+`materialize` requires `--name` and `--direct-root`. `--generation` and `--generation-identity` are optional only as a pair; omitting both selects the latest sealed generation. `delete` requires `--name` and the pool's full `--identity`.
 
 ### `isx help`
 

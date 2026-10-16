@@ -48,6 +48,13 @@ public final class PoolStore {
             boolean changed, String name, String identity, String seedPool,
             String generation, String generationIdentity) {}
 
+    /** One materialized pool, identified by its descriptor alone. */
+    public record ListedMaterializedPool(
+            String name, String identity, String seedPool, String generation,
+            String generationIdentity, boolean running) {}
+
+    public record DeleteResult(boolean changed, String name, String identity, String seedPool) {}
+
     public static final class PoolException extends RuntimeException {
         private final String code;
 
@@ -360,6 +367,84 @@ public final class PoolStore {
         }
     }
 
+    /**
+     * List every materialized pool, whichever seed it came from. Each is identified by its
+     * verified descriptor; its disks aren't inspected, so a listed pool may still fail to launch.
+     */
+    public List<ListedMaterializedPool> listMaterialized() {
+        try (var registry = acquireManagementLock()) {
+            var poolsRoot = PoolState.materializedRoot(stateDirectory);
+            if (!Files.exists(poolsRoot, LinkOption.NOFOLLOW_LINKS)) return List.of();
+            var listed = new ArrayList<ListedMaterializedPool>();
+            try (var entries = Files.list(poolsRoot)) {
+                for (var entry : entries.sorted().toList()) {
+                    var name = entry.getFileName().toString();
+                    if (name.startsWith(".staging-")) continue;
+                    var descriptor = PoolState.loadMaterializedDescriptor(
+                            stateDirectory, home, name);
+                    listed.add(new ListedMaterializedPool(descriptor.name(),
+                            descriptor.identity(), descriptor.seedPool(),
+                            descriptor.generation(), descriptor.generationIdentity(),
+                            operations.vmRunning(entry)));
+                }
+            }
+            return List.copyOf(listed);
+        } catch (PoolException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new PoolException("list_failed",
+                    "could not list materialized worker pools: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Delete a stopped materialized pool of the selected seed, with every instance inside it.
+     * Only the caller can know that nothing still needs those instances. An absent pool is
+     * already deleted; one whose descriptor no longer matches {@code identity} is refused.
+     */
+    public DeleteResult delete(String name, String identity) {
+        var seedName = requireStaticSeed();
+        if (!WorkerPoolConfig.isSafeName(name)) {
+            throw new PoolException("invalid_request", "materialized pool name is unsafe");
+        }
+        try {
+            PoolState.requireIdentity(identity, "materialized pool identity");
+        } catch (IllegalStateException e) {
+            throw new PoolException("invalid_request", e.getMessage());
+        }
+
+        try (var registry = acquireManagementLock()) {
+            var poolsRoot = PoolState.materializedRoot(stateDirectory);
+            var target = PoolState.materializedPool(stateDirectory, name);
+            cleanStaging(poolsRoot, ".staging-" + name + "-");
+            if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                return new DeleteResult(false, name, identity, seedName);
+            }
+            var existing = PoolState.loadMaterializedDescriptor(stateDirectory, home, name);
+            if (!existing.identity().equals(identity) || !existing.seedPool().equals(seedName)) {
+                throw new PoolException("pool_conflict", "materialized pool '" + name
+                        + "' has a different published identity");
+            }
+            try (var vm = acquireMaterializedVmLock(name, identity)) {
+                if (operations.vmRunning(target)) {
+                    throw new PoolException("pool_running", "materialized pool '" + name
+                            + "' must be stopped before it is deleted");
+                }
+                // Out of the published path first, so a partial deletion can never be
+                // mistaken for the pool; the next delete or materialize clears the rest.
+                var staging = poolsRoot.resolve(".staging-" + name + "-" + randomSuffix());
+                moveDirectory(target, staging);
+                deleteTree(staging);
+            }
+            return new DeleteResult(true, name, identity, seedName);
+        } catch (PoolException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new PoolException("delete_failed", "could not delete materialized pool '"
+                    + name + "': " + e.getMessage(), e);
+        }
+    }
+
     private String requireStaticSeed() {
         selection.requireValid();
         if (selection.isLegacy() || selection.isMaterialized()) {
@@ -526,6 +611,16 @@ public final class PoolStore {
                 Duration.ofSeconds(30),
                 "Another isx process is managing the seed VM — waiting...",
                 "Timed out waiting for another isx process to finish managing the seed VM.");
+    }
+
+    private BoundedFileLock acquireMaterializedVmLock(String name, String identity)
+            throws IOException {
+        var lockFile = WorkerPoolSelection.materializedLifecycleLockDir(
+                lockRoot(stateDirectory), name, identity).resolve("vm.lock");
+        return BoundedFileLock.acquire(lockFile, Duration.ofSeconds(30),
+                "Another isx process is managing the materialized pool VM — waiting...",
+                "Timed out waiting for another isx process to finish managing the "
+                        + "materialized pool VM.");
     }
 
     private void ensureProtectedPath(Path directory) throws IOException {

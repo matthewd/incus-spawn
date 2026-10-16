@@ -11,13 +11,15 @@ import org.aesh.command.option.Option;
 /** Versioned, non-interactive management API for macOS direct worker pools. */
 @CommandDefinition(
         name = "pool",
-        description = "List, inspect, seal, and materialize dedicated worker pools (macOS)",
+        description = "List, inspect, seal, materialize, and delete dedicated worker pools (macOS)",
         generateHelp = true,
         groupCommands = {
                 PoolCommand.ListPools.class,
                 PoolCommand.Inspect.class,
+                PoolCommand.ListMaterialized.class,
                 PoolCommand.Seal.class,
-                PoolCommand.Materialize.class
+                PoolCommand.Materialize.class,
+                PoolCommand.Delete.class
         })
 public class PoolCommand extends BaseCommand {
 
@@ -40,6 +42,24 @@ public class PoolCommand extends BaseCommand {
                 return CommandResult.SUCCESS;
             } catch (Exception e) {
                 System.out.println(PoolProtocol.errorLine("list", e));
+                return CommandResult.valueOf(1);
+            }
+        }
+    }
+
+    @CommandDefinition(
+            name = "list-materialized",
+            description = "List materialized direct pools and the seal generation of each",
+            generateHelp = true)
+    public static class ListMaterialized extends BaseCommand {
+        @Override
+        protected CommandResult doExecute() {
+            try {
+                System.out.println(PoolProtocol.listMaterializedLine(
+                        PoolStore.system().listMaterialized()));
+                return CommandResult.SUCCESS;
+            } catch (Exception e) {
+                System.out.println(PoolProtocol.errorLine("list-materialized", e));
                 return CommandResult.valueOf(1);
             }
         }
@@ -107,6 +127,29 @@ public class PoolCommand extends BaseCommand {
                 return CommandResult.SUCCESS;
             } catch (Exception e) {
                 System.out.println(PoolProtocol.errorLine("materialize", e));
+                return CommandResult.valueOf(1);
+            }
+        }
+    }
+
+    @CommandDefinition(
+            name = "delete",
+            description = "Delete a stopped materialized pool of the selected seed, with its instances",
+            generateHelp = true)
+    public static class Delete extends BaseCommand {
+        @Option(name = "name", description = "Materialized pool name")
+        String name;
+
+        @Option(name = "identity", description = "Full SHA-256 identity of the materialized pool")
+        String identity;
+
+        @Override
+        protected CommandResult doExecute() {
+            try {
+                System.out.println(PoolProtocol.deleteLine(PoolStore.system().delete(name, identity)));
+                return CommandResult.SUCCESS;
+            } catch (Exception e) {
+                System.out.println(PoolProtocol.errorLine("delete", e));
                 return CommandResult.valueOf(1);
             }
         }

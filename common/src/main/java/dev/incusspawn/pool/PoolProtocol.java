@@ -6,7 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Version-one one-line JSON protocol for listing, inspecting, sealing, and materializing worker pools. */
+/** Version-one one-line JSON protocol for listing, inspecting, sealing, materializing, and deleting worker pools. */
 public final class PoolProtocol {
 
     public static final String PROTOCOL = "isx-pool";
@@ -58,6 +58,33 @@ public final class PoolProtocol {
         response.put("seed_pool", result.seedPool());
         response.put("generation", result.generation());
         response.put("generation_identity", result.generationIdentity());
+        return json(response);
+    }
+
+    public static String listMaterializedLine(
+            java.util.List<PoolStore.ListedMaterializedPool> pools) {
+        var response = envelope("list-materialized", true);
+        var listed = new java.util.ArrayList<Map<String, Object>>();
+        for (var pool : pools) {
+            var entry = new LinkedHashMap<String, Object>();
+            entry.put("name", pool.name());
+            entry.put("identity", pool.identity());
+            entry.put("seed_pool", pool.seedPool());
+            entry.put("generation", pool.generation());
+            entry.put("generation_identity", pool.generationIdentity());
+            entry.put("running", pool.running());
+            listed.add(entry);
+        }
+        response.put("pools", listed);
+        return json(response);
+    }
+
+    public static String deleteLine(PoolStore.DeleteResult result) {
+        var response = envelope("delete", true);
+        response.put("changed", result.changed());
+        response.put("pool", result.name());
+        response.put("identity", result.identity());
+        response.put("seed_pool", result.seedPool());
         return json(response);
     }
 

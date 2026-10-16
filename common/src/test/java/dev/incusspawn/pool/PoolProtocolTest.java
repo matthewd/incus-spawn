@@ -73,6 +73,44 @@ class PoolProtocolTest {
         assertEquals(0, pools.get(1).path("reference_roots").size());
     }
 
+    @Test
+    void listMaterializedResponseIdentifiesEachPoolAndItsSeal() throws Exception {
+        var identity = "a".repeat(64);
+        var generationIdentity = "b".repeat(64);
+        var line = PoolProtocol.listMaterializedLine(java.util.List.of(
+                new PoolStore.ListedMaterializedPool("job-one", identity, "seed",
+                        "g-" + "c".repeat(32), generationIdentity, true)));
+
+        var json = JSON.readTree(line);
+        assertEquals("isx-pool", json.path("protocol").asText());
+        assertEquals(1, json.path("version").asInt());
+        assertEquals("list-materialized", json.path("operation").asText());
+        assertTrue(json.path("ok").asBoolean());
+        var pool = json.path("pools").get(0);
+        assertEquals("job-one", pool.path("name").asText());
+        assertEquals(identity, pool.path("identity").asText());
+        assertEquals("seed", pool.path("seed_pool").asText());
+        assertEquals("g-" + "c".repeat(32), pool.path("generation").asText());
+        assertEquals(generationIdentity, pool.path("generation_identity").asText());
+        assertTrue(pool.path("running").asBoolean());
+        assertFalse(line.contains("direct"), "host paths are not protocol resources");
+    }
+
+    @Test
+    void deleteResponseCarriesTheDeletedSelection() throws Exception {
+        var identity = "a".repeat(64);
+        var line = PoolProtocol.deleteLine(
+                new PoolStore.DeleteResult(true, "job-one", identity, "seed"));
+
+        var json = JSON.readTree(line);
+        assertEquals("delete", json.path("operation").asText());
+        assertTrue(json.path("ok").asBoolean());
+        assertTrue(json.path("changed").asBoolean());
+        assertEquals("job-one", json.path("pool").asText());
+        assertEquals(identity, json.path("identity").asText());
+        assertEquals("seed", json.path("seed_pool").asText());
+    }
+
     private static java.util.List<String> iterable(java.util.Iterator<String> names) {
         var list = new java.util.ArrayList<String>();
         names.forEachRemaining(list::add);
