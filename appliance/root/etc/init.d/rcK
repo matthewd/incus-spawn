@@ -10,3 +10,4 @@ killall dbus-daemon 2>/dev/null || true
 killall chronyd 2>/dev/null || true
 
 sync
+echo "incus-spawn: disks synced"

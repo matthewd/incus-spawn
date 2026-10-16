@@ -145,6 +145,27 @@ probe_agent() {
     fi
 }
 
+# Verify the agent's orderly shutdown: init must run rcK (which syncs the disks) and the guest must
+# power off on its own, ending the vfkit process without any host-side stop.
+# $1 = agent socket, $2 = vfkit pid.
+probe_poweroff() {
+    local sock="$1" pid="$2" resp deadline
+    resp=$(printf 'poweroff\n' | nc -U -w 5 "$sock" 2>/dev/null | tr -d '\r\n') || resp=""
+    if [ "$resp" != "powering-off" ]; then
+        echo "ISX AGENT POWEROFF FAIL: '$resp'" >> "$VSOCK_RESULT"
+        return
+    fi
+    deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "ISX AGENT POWEROFF OK" >> "$VSOCK_RESULT"
+            return
+        fi
+        sleep 0.5
+    done
+    echo "ISX AGENT POWEROFF FAIL: VM still running after 30s" >> "$VSOCK_RESULT"
+}
+
 boot_vfkit() {
     BACKEND="vfkit"
     echo "  backend: vfkit (Apple Virtualization.framework)"
@@ -189,6 +210,7 @@ boot_vfkit() {
     # before readiness; the probe polls on its own).
     probe_vsock "$vsock_sock"
     probe_agent "$agent_sock" "$vsock_sock"
+    probe_poweroff "$agent_sock" "$pid"
     kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
     rm -f "$dummy_initrd"
 }
@@ -322,6 +344,8 @@ if [ "$BACKEND" = "vfkit" ]; then
     check_result "ISX AGENT BTRFS STATUS OK"   "btrfs-status resolved the cow pool's qgroup status"
     check_result "ISX AGENT RECOVER OK"        "no-reboot forwarder recovery restored the tunnel"
     check_result "ISX AGENT SURVIVED RECOVER OK" "control agent still up after forwarder recovery"
+    check_result "ISX AGENT POWEROFF OK"       "agent poweroff shut the guest down on its own"
+    check "incus-spawn: disks synced"          "guest shutdown synced the disks"
 else
     echo
     echo "-- Smoke test (isx.smoke_test=1) --"

@@ -149,6 +149,14 @@ case "$verb" in
             echo "error: $out"
         fi
         ;;
+    poweroff)
+        # Orderly shutdown through init, so rcK stops Incus and syncs the disks before power-off.
+        # vfkit's own stop request never reaches init on this appliance, and what follows it is a
+        # hard stop that loses every btrfs change since the last commit (commit=300). BusyBox
+        # poweroff only signals init and returns, so this replies at once; the host then waits
+        # for the VM process to exit.
+        if poweroff; then echo powering-off; else echo "error: poweroff failed"; fi
+        ;;
     *)
         echo "error: unknown verb"
         ;;

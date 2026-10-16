@@ -208,9 +208,9 @@ Lifecycle script with subcommands: `start`, `stop`, `status`, `console`.
 - `APPLIANCE_DIR` -- path to build artifacts (default: `appliance/build`)
 
 **Stop sequence** (graceful shutdown):
-1. Send stop request via REST API (vfkit only)
-2. Wait up to 5 seconds for process to exit
-3. `SIGTERM`, wait 1 second
+1. Ask the control agent to `poweroff` (vfkit only), and wait up to 30 seconds for the guest to power itself off. This is the only step that runs `rcK`, which stops Incus and syncs the disks; every later step is a hard stop that discards btrfs changes not yet committed (`commit=300`).
+2. Send stop request via REST API (vfkit only), and wait up to 5 seconds for process to exit. This is a power-button request, which the guest doesn't act on.
+3. `SIGTERM`, whose vfkit handler repeats that request before forcing a stop; wait up to 7 seconds
 4. `SIGKILL` as last resort
 
 ## First-Boot Initialization
@@ -234,7 +234,7 @@ The host reaches Incus through `host → vfkit vsock → in-VM socat forwarder �
 
 - **Inactivity backstop.** The forwarder runs with `socat -T 180`: any connection idle for 180 s is reaped. The floor sits above the Incus operation `/wait` long-poll (up to 120 s of legitimate silence) and the client request watchdog (150 s), and the host keepalive-pings every live exec fd, so `-T` only ever collects genuinely-dead connections. The forwarder launch lives in one place (`isx-start-vsock-forwarder`) so boot and recovery share the exact invocation.
 
-- **Allowlisted control agent (`isx-agent`).** A tiny POSIX-shell agent, fronted by `socat ... EXEC:` on its own vsock port (1025), dispatches a **fixed verb allowlist only** — `ping`, `version`, `socat-count`, `sshd-status`, `forwarder-restart`, `btrfs-usage`, `btrfs-status`, `btrfs-rescan` — never arbitrary input (the verb is matched against `case` arms, never `eval`'d). It's reached over an independent vsock channel, so it works even when the Incus tunnel is wedged. `forwarder-restart` `pkill`s the forwarder (freeing its leaked streams and the host fds vfkit pinned) and relaunches it via `isx-start-vsock-forwarder`, detached with `setsid` so the new forwarder doesn't inherit the agent connection's fds — recovering the tunnel **without rebooting the VM or stopping running containers**. Before confirming, the handler polls `pgrep` (4×0.5s) to verify the new forwarder process started; stderr goes to `/dev/console` (the virtio-serial feeding `vm.log`) so socat startup errors are visible. `socat-count` reports the in-VM forwarder child count, which `isx doctor` and the automatic recovery in `VmManager.recoverReachability()` compare against the host-side connection count to localize a leak (vfkit vs forwarder) — see DESIGN.md "Diagnosis and layer-aware recovery" for the decision tree. `appliance/test-boot.sh` asserts the agent answers and that the no-reboot recovery restores the tunnel.
+- **Allowlisted control agent (`isx-agent`).** A tiny POSIX-shell agent, fronted by `socat ... EXEC:` on its own vsock port (1025), dispatches a **fixed verb allowlist only** — `ping`, `version`, `socat-count`, `sshd-status`, `forwarder-restart`, `btrfs-usage`, `btrfs-status`, `btrfs-rescan`, `poweroff` — never arbitrary input (the verb is matched against `case` arms, never `eval`'d). It's reached over an independent vsock channel, so it works even when the Incus tunnel is wedged. `forwarder-restart` `pkill`s the forwarder (freeing its leaked streams and the host fds vfkit pinned) and relaunches it via `isx-start-vsock-forwarder`, detached with `setsid` so the new forwarder doesn't inherit the agent connection's fds — recovering the tunnel **without rebooting the VM or stopping running containers**. Before confirming, the handler polls `pgrep` (4×0.5s) to verify the new forwarder process started; stderr goes to `/dev/console` (the virtio-serial feeding `vm.log`) so socat startup errors are visible. `socat-count` reports the in-VM forwarder child count, which `isx doctor` and the automatic recovery in `VmManager.recoverReachability()` compare against the host-side connection count to localize a leak (vfkit vs forwarder) — see DESIGN.md "Diagnosis and layer-aware recovery" for the decision tree. `appliance/test-boot.sh` asserts the agent answers and that the no-reboot recovery restores the tunnel.
 
 ## Testing
 

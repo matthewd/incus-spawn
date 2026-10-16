@@ -550,6 +550,12 @@ public final class VmManager {
         }
     }
 
+    /**
+     * Upper bound for the guest's own shutdown: rcK allows Incus 10 seconds, then syncs. A guest
+     * that takes longer is treated as hung and stopped the hard way.
+     */
+    private static final Duration GUEST_POWEROFF_TIMEOUT = Duration.ofSeconds(30);
+
     private static void stopLocked() {
         if (!isRunning()) {
             BuildOutput.note("VM not running.");
@@ -566,9 +572,15 @@ public final class VmManager {
 
         BuildOutput.stepStart("Shutting down VM...");
 
-        // Attempt graceful shutdown via REST API (vfkit only)
+        // Only the guest's own shutdown stops Incus and syncs the disks; every path below it ends
+        // in a hard stop that discards the guest's uncommitted btrfs changes.
+        if (VmAgentClient.poweroff()) {
+            awaitProcessExit(handle.get(), GUEST_POWEROFF_TIMEOUT);
+        }
+
+        // Fallback for a guest whose agent can't shut it down: vfkit's REST stop request
         var restUriFile = Environment.vmRestUriFile();
-        if (Files.exists(restUriFile)) {
+        if (handle.get().isAlive() && Files.exists(restUriFile)) {
             try {
                 var uri = Files.readString(restUriFile).strip();
                 var client = HttpClient.newBuilder()

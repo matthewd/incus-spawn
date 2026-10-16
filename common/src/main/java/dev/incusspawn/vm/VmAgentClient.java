@@ -86,6 +86,15 @@ public final class VmAgentClient {
         return send("forwarder-restart").map("restarted"::equals).orElse(false);
     }
 
+    /**
+     * Ask the guest to shut down through init, whose shutdown script stops Incus and syncs the
+     * disks before powering off. True once init has been signalled; the VM process exits when
+     * the guest finishes.
+     */
+    public static boolean poweroff() {
+        return send("poweroff").map("powering-off"::equals).orElse(false);
+    }
+
     /** Whether the agent is reachable at all. */
     public static boolean ping() {
         return send("ping").map("ok"::equals).orElse(false);
