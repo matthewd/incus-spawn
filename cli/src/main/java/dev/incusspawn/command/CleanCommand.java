@@ -533,6 +533,10 @@ public class CleanCommand extends BaseCommand {
                 description = "Fail if any targeted pool artifact remains")
         boolean requireComplete;
 
+        @Option(name = "keep-dnf-cache", hasValue = false,
+                description = "Leave the DNF cache volume in place")
+        boolean keepDnfCache;
+
         @Override
         protected CommandResult doExecute() throws Exception {
             var incus = RuntimeServices.incus();
@@ -550,7 +554,9 @@ public class CleanCommand extends BaseCommand {
 
             found |= cleanFailedBuilds(incus, dryRun, skipConfirmation);
             found |= cleanUnusedImages(incus, dryRun, skipConfirmation);
-            found |= cleanDnfCacheFromPool(incus, pool, dryRun);
+            if (!keepDnfCache) {
+                found |= cleanDnfCacheFromPool(incus, pool, dryRun);
+            }
 
             if (!found) {
                 BuildOutput.step("Nothing to clean — no reclaimable artifacts found.");
@@ -564,9 +570,9 @@ public class CleanCommand extends BaseCommand {
             if (requireComplete && !dryRun) {
                 var failedBuilds = findFailedBuilds(incus);
                 var unusedImages = findUnusedImages(incus);
-                var dnfCacheExists = incus.storageVolumeExists(
+                var dnfCacheRemains = !keepDnfCache && incus.storageVolumeExists(
                         pool, BuildCommand.DNF_CACHE_VOLUME);
-                if (!poolCleanupComplete(failedBuilds, unusedImages, dnfCacheExists)) {
+                if (!poolCleanupComplete(failedBuilds, unusedImages, dnfCacheRemains)) {
                     System.err.println("Error: pool cleanup is incomplete; refusing to continue.");
                     return CommandResult.valueOf(1);
                 }

@@ -1357,7 +1357,7 @@ All subcommands accept these options:
 | `--dry-run` | Show what would be deleted without deleting |
 | `--skip-confirmation` | Skip the confirmation prompt |
 
-`clean pool` additionally accepts `--require-complete`, which exits unsuccessfully if any targeted failed build, unused image, or build-cache volume remains. This is intended for preparation before sealing a seed.
+`clean pool` additionally accepts `--require-complete`, which exits unsuccessfully if any targeted failed build, unused image, or build-cache volume remains, and `--keep-dnf-cache`, which leaves the DNF cache volume in place and out of that check. Together they are intended for preparation before sealing a seed, so the seed's later builds keep their package cache.
 
 ### `isx vm`
 
