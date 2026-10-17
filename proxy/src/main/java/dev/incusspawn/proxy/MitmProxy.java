@@ -608,6 +608,15 @@ public class MitmProxy {
         return Buffer.buffer(baos.toByteArray());
     }
 
+    // Validate declarations as well as resolved routes: enabling a competing tool must
+    // fail even when its credentials are still empty. Publish nothing on a collision.
+    void applyReloadedCredentials(ProxyCredentials newCredentials,
+                                  ToolProxyResolver.DeclaredRoutes declaredRoutes) {
+        commandCredentials.validateToolRoutes(declaredRoutes);
+        applyToolProxies(newCredentials.toolProxies());
+        credentials = newCredentials;
+    }
+
     /**
      * Reload configuration and certificates from disk. Re-reads {@code config.yaml}
      * for credential changes and re-loads the CA (re-minting leaf certs if the CA key
@@ -619,9 +628,9 @@ public class MitmProxy {
         ProxyLog.info("Reloading configuration and certificates");
         System.out.println("Reloading configuration...");
         try {
-            var newCreds = ProxyCredentials.fromConfig(dev.incusspawn.config.SpawnConfig.load());
-            applyToolProxies(newCreds.toolProxies());
-            credentials = newCreds;
+            var config = dev.incusspawn.config.SpawnConfig.load();
+            var newCreds = ProxyCredentials.fromConfig(config);
+            applyReloadedCredentials(newCreds, ToolProxyResolver.declaredRoutes(config));
             invalidateVertexToken();
             var jksBuffer = buildKeyStoreBuffer();
             if (mitmServer != null) {

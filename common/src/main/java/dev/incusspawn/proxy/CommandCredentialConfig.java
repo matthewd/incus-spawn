@@ -91,14 +91,25 @@ public final class CommandCredentialConfig {
         return SpawnConfig.configDir().resolve(FILE_NAME);
     }
 
-    /** Load the protected machine-local file and reject all built-in and tool route collisions. */
+    /** Load the protected file; disabled feature-gated tools do not reserve routes. */
     public static CommandCredentialConfig loadStrict() {
         var file = configFile();
         if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) return disabled();
-        var toolRoutes = ToolProxyResolver.declaredRoutes();
+        return loadStrict(file, ToolProxyResolver.declaredRoutes(SpawnConfig.load()));
+    }
+
+    static CommandCredentialConfig loadStrict(Path file, ToolProxyResolver.DeclaredRoutes toolRoutes) {
         var exact = new HashSet<>(ProxyConfig.builtinInterceptedDomains());
         exact.addAll(toolRoutes.exactDomains());
         return loadStrict(file, exact, toolRoutes.wildcardSuffixes());
+    }
+
+    /** Revalidate startup-loaded rules before publishing an ordinary configuration reload. */
+    public void validateToolRoutes(ToolProxyResolver.DeclaredRoutes toolRoutes) {
+        for (var rule : rules) {
+            rejectCollision(Path.of(FILE_NAME), rule.host(),
+                    toolRoutes.exactDomains(), toolRoutes.wildcardSuffixes());
+        }
     }
 
     static CommandCredentialConfig loadStrict(Path file, Set<String> exactRoutes,

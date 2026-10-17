@@ -82,11 +82,23 @@ public final class ToolProxyResolver {
                 .collect(Collectors.toUnmodifiableSet());
     }
 
-    /** All exact and wildcard routes declared by tool definitions, credentialed or not. */
-    public static DeclaredRoutes declaredRoutes() {
+    /** Enabled tools reserve their declared routes even before credentials are configured. */
+    public static DeclaredRoutes declaredRoutes(SpawnConfig config) {
+        var loader = new ToolDefLoader();
+        var filtered = filterByFeatureGate(config, loader.allToolSetups());
+        rejectProjectLocalProxy(loader.projectLocalToolNames(), filtered);
+        return collectDeclaredRoutes(filtered);
+    }
+
+    // Explicit tool sets keep feature-gate tests independent of machine-local tool/config files.
+    static DeclaredRoutes declaredRoutes(SpawnConfig config, Map<String, ToolSetup> tools) {
+        return collectDeclaredRoutes(filterByFeatureGate(config, tools));
+    }
+
+    private static DeclaredRoutes collectDeclaredRoutes(Map<String, ToolSetup> tools) {
         var exact = new java.util.LinkedHashSet<String>();
         var wildcardSuffixes = new java.util.LinkedHashSet<String>();
-        for (var tool : new ToolDefLoader().allToolSetups().values()) {
+        for (var tool : tools.values()) {
             var proxy = tool.proxy();
             if (proxy == null) continue;
             for (var auth : proxy.getAuth()) {

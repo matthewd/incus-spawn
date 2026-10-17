@@ -3,7 +3,10 @@ package dev.incusspawn.proxy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.incusspawn.tool.ToolDef;
-import dev.incusspawn.tool.ToolDefLoader;
+import dev.incusspawn.config.SpawnConfig;
+import dev.incusspawn.tool.CodexSetup;
+import dev.incusspawn.tool.GhSetup;
+import dev.incusspawn.tool.ToolSetup;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -16,11 +19,37 @@ class ToolProxyResolverTest {
 
     @Test
     void declaredRoutesIncludeBuiltInsWithoutConfiguredCredentials() {
-        var routes = ToolProxyResolver.declaredRoutes();
+        var routes = ToolProxyResolver.declaredRoutes(new SpawnConfig(), builtInTools());
 
         assertTrue(routes.exactDomains().contains("github.com"));
         assertTrue(routes.wildcardSuffixes().contains(".github.com"));
         assertTrue(routes.wildcardSuffixes().contains(".githubusercontent.com"));
+    }
+
+    @Test
+    void disabledOpenaiDoesNotReserveItsRoute() {
+        var routes = ToolProxyResolver.declaredRoutes(new SpawnConfig(), builtInTools());
+        assertFalse(routes.exactDomains().contains("api.openai.com"));
+    }
+
+    @Test
+    void explicitlyEnabledOpenaiReservesRouteEvenWithoutCredentials() {
+        var config = new SpawnConfig();
+        config.setFeatures(List.of("openai"));
+        var routes = ToolProxyResolver.declaredRoutes(config, builtInTools());
+        assertTrue(routes.exactDomains().contains("api.openai.com"));
+    }
+
+    @Test
+    void configuredKeyImplicitlyEnablesOpenaiRoute() {
+        var config = new SpawnConfig();
+        config.getOpenai().setApiKey("synthetic-test-key");
+        var routes = ToolProxyResolver.declaredRoutes(config, builtInTools());
+        assertTrue(routes.exactDomains().contains("api.openai.com"));
+    }
+
+    private static Map<String, ToolSetup> builtInTools() {
+        return Map.of("gh", new GhSetup(), "codex", new CodexSetup());
     }
 
     @Test

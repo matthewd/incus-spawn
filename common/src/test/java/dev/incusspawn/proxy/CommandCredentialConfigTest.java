@@ -1,5 +1,7 @@
 package dev.incusspawn.proxy;
 
+import dev.incusspawn.config.SpawnConfig;
+import dev.incusspawn.tool.CodexSetup;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -7,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -48,6 +51,48 @@ class CommandCredentialConfigTest {
         assertEquals(5, rule.failureTtlSeconds());
         assertEquals("Example credential gateway", rule.label());
         assertEquals("Repair host credential access", rule.remediation());
+    }
+
+    @Test
+    void openaiCommandRouteLoadsOnlyWhenCompetingFeatureIsDisabled() throws Exception {
+        var file = writeSecure(validRule().replace("credential.example.test", "api.openai.com"));
+        var config = new SpawnConfig();
+        var tools = Map.<String, dev.incusspawn.tool.ToolSetup>of("codex", new CodexSetup());
+        var routes = ToolProxyResolver.declaredRoutes(config, tools);
+        var command = CommandCredentialConfig.loadStrict(file, routes);
+        assertEquals(Set.of("api.openai.com"), command.hosts());
+
+        config.setFeatures(List.of("openai"));
+        var enabledRoutes = ToolProxyResolver.declaredRoutes(config, tools);
+        assertThrows(IllegalStateException.class,
+                () -> CommandCredentialConfig.loadStrict(file, enabledRoutes));
+        // Reload must reject newly enabled declarations even before credentials resolve.
+        assertThrows(IllegalStateException.class, () -> command.validateToolRoutes(enabledRoutes));
+
+        config.setFeatures(List.of());
+        config.getOpenai().setApiKey("synthetic-test-key");
+        var credentialedRoutes = ToolProxyResolver.declaredRoutes(config, tools);
+        assertThrows(IllegalStateException.class,
+                () -> CommandCredentialConfig.loadStrict(file, credentialedRoutes));
+        assertThrows(IllegalStateException.class, () -> command.validateToolRoutes(credentialedRoutes));
+    }
+
+    @Test
+    void reloadValidationRejectsExactAndWildcardCollisionsWithoutReplacingRules() throws Exception {
+        var command = CommandCredentialConfig.loadStrict(writeSecure(validRule()), Set.of(), List.of());
+        command.validateToolRoutes(new ToolProxyResolver.DeclaredRoutes(Set.of(), List.of()));
+        assertThrows(IllegalStateException.class, () -> command.validateToolRoutes(
+                new ToolProxyResolver.DeclaredRoutes(Set.of("credential.example.test"), List.of())));
+        assertThrows(IllegalStateException.class, () -> command.validateToolRoutes(
+                new ToolProxyResolver.DeclaredRoutes(Set.of(), List.of(".example.test"))));
+        assertEquals(Set.of("credential.example.test"), command.hosts());
+    }
+
+    @Test
+    void builtInRoutesRemainReserved() throws Exception {
+        var file = writeSecure(validRule().replace("credential.example.test", "api.anthropic.com"));
+        assertThrows(IllegalStateException.class, () -> CommandCredentialConfig.loadStrict(file,
+                new ToolProxyResolver.DeclaredRoutes(Set.of(), List.of())));
     }
 
     @Test
