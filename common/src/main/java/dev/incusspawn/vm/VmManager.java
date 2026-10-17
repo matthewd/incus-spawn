@@ -1,6 +1,5 @@
 package dev.incusspawn.vm;
 
-import dev.incusspawn.BuildInfo;
 import dev.incusspawn.Environment;
 import dev.incusspawn.config.WorkerPoolSelection;
 import dev.incusspawn.incus.IncusClient;
@@ -117,7 +116,8 @@ public final class VmManager {
     private static final int INCUS_VSOCK_PORT = 8443;
     private static final int MACOS_UNIX_SOCKET_PATH_MAX_BYTES = 103;
 
-    private static final String LATEST_KNOWN_RELEASE = "0.2.2";
+    // Last upstream release before this fork; local appliance builds override it below.
+    private static final String PINNED_APPLIANCE_RELEASE = "0.3.7";
     private static volatile String resolvedApplianceVersion;
 
     // --- Resource detection ---
@@ -230,47 +230,12 @@ public final class VmManager {
             return override;
         }
 
-        var build = BuildInfo.instance();
-        String result;
-        if (!build.isDev()) {
-            result = build.version();
-        } else {
-            var latest = queryLatestGitHubRelease();
-            if (latest != null) {
-                result = latest;
-            } else {
-                System.err.println("Warning: could not query latest release from GitHub, "
-                        + "using fallback version " + LATEST_KNOWN_RELEASE);
-                result = LATEST_KNOWN_RELEASE;
-            }
-        }
-        resolvedApplianceVersion = result;
-        return result;
+        resolvedApplianceVersion = PINNED_APPLIANCE_RELEASE;
+        return PINNED_APPLIANCE_RELEASE;
     }
 
     static boolean isSafeApplianceVersion(String value) {
         return value != null && value.matches("[A-Za-z0-9][A-Za-z0-9._+-]{0,127}");
-    }
-
-    private static String queryLatestGitHubRelease() {
-        try {
-            var client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(5))
-                    .followRedirects(HttpClient.Redirect.NEVER)
-                    .build();
-            var request = HttpRequest.newBuilder()
-                    .uri(URI.create("https://github.com/Sanne/incus-spawn/releases/latest"))
-                    .timeout(Duration.ofSeconds(10))
-                    .method("HEAD", HttpRequest.BodyPublishers.noBody())
-                    .build();
-            var response = client.send(request, HttpResponse.BodyHandlers.discarding());
-            var location = response.headers().firstValue("location").orElse(null);
-            if (location != null && location.contains("/tag/v")) {
-                var tag = location.substring(location.lastIndexOf("/tag/v") + 6);
-                if (!tag.isBlank()) return tag;
-            }
-        } catch (Exception ignored) {}
-        return null;
     }
 
     // --- Backend detection ---
@@ -1465,8 +1430,8 @@ public final class VmManager {
     }
 
     /**
-     * Download vmlinuz and disk.img.gz from the GitHub release matching
-     * the current isx version. Re-downloads when the version changes —
+     * Download vmlinuz and disk.img.gz from the pinned upstream GitHub release,
+     * unless ISX_APPLIANCE_VERSION overrides it. Re-downloads when the version changes —
      * a stale disk.img.gz would produce a disk.img missing features
      * added in newer releases.
      */
