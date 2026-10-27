@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.incusspawn.automation.AutomationService.AutomationException;
+import dev.incusspawn.vm.VmExportPlanChangedException;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -104,8 +105,19 @@ public final class AutomationProtocol {
         return response;
     }
 
+    static final String EXPORT_PLAN_CHANGED_MESSAGE = "The worker pool's host exports changed "
+            + "after its VM started; restart the pool to apply them";
+
     private static Map<String, Object> errorObject(Throwable failure) {
         var error = new LinkedHashMap<String, Object>();
+        // A known, detail-free condition the caller can act on, unlike other backend failures.
+        for (var cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof VmExportPlanChangedException) {
+                error.put("code", "export_plan_changed");
+                error.put("message", EXPORT_PLAN_CHANGED_MESSAGE);
+                return error;
+            }
+        }
         var automation = failure instanceof AutomationException known ? known : null;
         error.put("code", automation != null ? automation.code() : "backend_error");
         var message = automation != null ? automation.getMessage() : null;

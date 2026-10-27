@@ -80,6 +80,20 @@ class AutomationProtocolTest {
     }
 
     @Test
+    void reportsChangedExportsAsAnActionableCodeWithoutTheirPaths() throws Exception {
+        var line = AutomationProtocol.lifecycleErrorLine("start",
+                new RuntimeException("wrapped", new dev.incusspawn.vm.VmExportPlanChangedException(
+                        "worker pool 'routine' export configuration differs from the running VM "
+                                + "(state: /Users/example/.local/state/x)")));
+        var json = JSON.readTree(line);
+
+        assertEquals("export_plan_changed", json.path("error").path("code").asText());
+        assertEquals(AutomationProtocol.EXPORT_PLAN_CHANGED_MESSAGE,
+                json.path("error").path("message").asText());
+        assertFalse(line.contains("/Users/example"));
+    }
+
+    @Test
     void framesBinaryStreamsAsBase64AndEndsWithResult() throws Exception {
         var output = new ByteArrayOutputStream();
         var frames = new AutomationProtocol.FrameWriter(output);

@@ -945,7 +945,7 @@ public final class VmManager {
             selectedHostExports(includeDirectRoot).requirePersistedFingerprint(
                     Environment.vmExportPlanFingerprint());
         } catch (IllegalStateException e) {
-            throw new VmException(e.getMessage());
+            throw new VmExportPlanChangedException(e.getMessage());
         } catch (VmException e) {
             var name = WorkerPoolSelection.current().name().orElseThrow();
             throw new VmException("Cannot resolve the exports configured for running worker pool '"
