@@ -72,6 +72,19 @@ public class IncusClient {
         // A named VM must not serve requests under a process whose resolved host-export plan
         // differs from the generation it launched with. Stop/restart do not use this API path.
         VmManager.requireExportPlanCurrentIfRunning();
+        return connected();
+    }
+
+    /**
+     * The API without the export-plan check, for operations that never translate a host path:
+     * instance lookup, stop, and delete. A stale plan must not keep a caller from stopping or
+     * removing instances, or the appliance cannot be shut down cleanly to apply the new plan.
+     */
+    private IncusApi exportIndependentHttp() {
+        return connected();
+    }
+
+    private IncusApi connected() {
         var result = api();
         if (result == null) {
             throw new IncusException(IncusApi.diagnoseConnectionFailure());
@@ -1423,7 +1436,7 @@ public class IncusClient {
      * Stop a running container/VM.
      */
     public void stop(String name) {
-        var resp = http().requestAndWait("PUT", "/1.0/instances/" + name + "/state",
+        var resp = exportIndependentHttp().requestAndWait("PUT", "/1.0/instances/" + name + "/state",
                 Map.of("action", "stop", "timeout", 30, "force", false));
         if (!resp.isSuccess()) throw new IncusException("Failed to stop " + name);
     }
@@ -1432,7 +1445,7 @@ public class IncusClient {
      * Force-stop a container/VM, even if it is in an Error state.
      */
     public void forceStop(String name) {
-        var resp = http().requestAndWait("PUT", "/1.0/instances/" + name + "/state",
+        var resp = exportIndependentHttp().requestAndWait("PUT", "/1.0/instances/" + name + "/state",
                 Map.of("action", "stop", "timeout", 30, "force", true));
         if (!resp.isSuccess()) throw new IncusException("Failed to force-stop " + name);
     }
@@ -1451,7 +1464,7 @@ public class IncusClient {
      * If force is true, stops the instance first (REST API does not accept delete of a running instance).
      */
     public void delete(String name, boolean force) {
-        var http = http();
+        var http = exportIndependentHttp();
         if (force) {
             try {
                 http.requestAndWait("PUT", "/1.0/instances/" + name + "/state",
@@ -1493,15 +1506,16 @@ public class IncusClient {
 
     private void cleanupStaleVolumes(String instanceName) {
         try {
-            var pools = http().get("/1.0/storage-pools?recursion=1");
+            var http = exportIndependentHttp();
+            var pools = http.get("/1.0/storage-pools?recursion=1");
             if (!pools.isSuccess()) return;
             for (var pool : pools.body().path("metadata")) {
                 var poolName = pool.path("name").asText();
                 var volPath = "/1.0/storage-pools/" + poolName
                         + "/volumes/container/" + instanceName;
-                var volResp = http().get(volPath);
+                var volResp = http.get(volPath);
                 if (volResp.isSuccess()) {
-                    var delResp = http().requestAndWait("DELETE", volPath, null);
+                    var delResp = http.requestAndWait("DELETE", volPath, null);
                     if (!delResp.isSuccess()) {
                         System.err.println("Warning: failed to remove stale volume "
                                 + instanceName + " from pool " + poolName);
@@ -1611,7 +1625,7 @@ public class IncusClient {
      * create/delete result.
      */
     public Optional<JsonNode> findInstanceMetadata(String name) {
-        var response = http().get("/1.0/instances/" + name);
+        var response = exportIndependentHttp().get("/1.0/instances/" + name);
         if (response.statusCode() == 404) return Optional.empty();
         if (!response.isSuccess()) {
             throw failedOp(response, "Failed to inspect instance " + name);
@@ -1812,7 +1826,7 @@ public class IncusClient {
      * since it skips network state, memory usage, and disk usage.
      */
     public String listJsonConfig() {
-        var resp = http().get("/1.0/instances?recursion=1");
+        var resp = exportIndependentHttp().get("/1.0/instances?recursion=1");
         if (!resp.isSuccess()) {
             throw new IncusException("Failed to list instances: " + resp.body().path("error").asText());
         }
