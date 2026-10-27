@@ -22,6 +22,8 @@ import java.util.regex.Pattern;
  * Version-one automation lifecycle semantics, independent of command-line parsing and Incus I/O.
  */
 public final class AutomationService {
+    static final String BOOT_AUTOSTART = "boot.autostart";
+
 
     private static final Pattern INSTANCE_NAME =
             Pattern.compile("^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,61}[A-Za-z0-9])?$");
@@ -99,6 +101,9 @@ public final class AutomationService {
         metadata.put(Metadata.TYPE, Metadata.TYPE_CLONE);
         metadata.put(Metadata.PARENT, template);
         metadata.put(Metadata.CREATED, Metadata.now());
+        // The automation caller owns this instance's power state. Without this, Incus restarts an
+        // instance that was running when the appliance shut down, behind the caller's back.
+        metadata.put(BOOT_AUTOSTART, "false");
 
         try {
             transport.copyStopped(template, name, metadata);

@@ -149,6 +149,7 @@ class IncusAutomationTransportTest {
 
         assertEquals("", output.toString(StandardCharsets.UTF_8));
         assertTrue(incus.started);
+        assertEquals(Map.of(AutomationService.BOOT_AUTOSTART, "false"), incus.configSets);
         assertEquals(0, incus.nameOnlyRemoveCount);
         assertEquals("sh", incus.lastReadinessCommand[0]);
         assertEquals("-c", incus.lastReadinessCommand[1]);
@@ -280,6 +281,7 @@ class IncusAutomationTransportTest {
 
     private static final class FakeIncusClient extends IncusClient {
         private final ObjectNode metadata = JSON.createObjectNode();
+        private final Map<String, String> configSets = new java.util.HashMap<>();
         private Map<String, String> lastAdded;
         private Map<String, String> lastRemovalExpectation;
         private int addCount;
@@ -360,6 +362,12 @@ class IncusAutomationTransportTest {
             if (!allowHostResourceDevices) {
                 throw new AssertionError("automation must not use name-only device removal");
             }
+        }
+
+        @Override
+        public void configSet(String name, String key, String value) {
+            configSets.put(key, value);
+            metadata.withObject("config").put(key, value);
         }
 
         @Override

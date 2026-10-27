@@ -97,6 +97,10 @@ public final class IncusAutomationTransport implements AutomationTransport {
     public void start(String name) {
         var metadata = strictMetadata(name);
         var config = metadata.path("config");
+        // Instances created before automation disabled autostart gain it on their next start.
+        if (!"false".equals(config.path(AutomationService.BOOT_AUTOSTART).asText(""))) {
+            incus.configSet(name, AutomationService.BOOT_AUTOSTART, "false");
+        }
         var resources = HostResourceSetup.deserialize(
                 config.path(Metadata.HOST_RESOURCES).asText(""));
         if (!resources.isEmpty()) {

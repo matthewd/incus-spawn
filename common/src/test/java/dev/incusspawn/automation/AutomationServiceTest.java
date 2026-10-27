@@ -32,6 +32,7 @@ class AutomationServiceTest {
         assertEquals("tpl-bb", transport.lastAtomicConfig.get(Metadata.AUTOMATION_TEMPLATE));
         assertEquals(Metadata.TYPE_CLONE, transport.lastAtomicConfig.get(Metadata.TYPE));
         assertEquals("tpl-bb", transport.lastAtomicConfig.get(Metadata.PARENT));
+        assertEquals("false", transport.lastAtomicConfig.get(AutomationService.BOOT_AUTOSTART));
 
         var repeated = service.create("worker-1", "tpl-bb", "allocation-17");
         assertFalse(repeated.changed());
